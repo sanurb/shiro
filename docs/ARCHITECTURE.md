@@ -431,3 +431,8 @@ Any value that changes outputs must contribute to the appropriate fingerprint.
     * bounded resources where possible
     * output treated as untrusted; validated into IR invariants
 * No remote telemetry by default.
+
+## References
+
+- [CLI Reference](CLI.md) - Complete command documentation
+- [MCP Guide](MCP.md) - Agent usage patterns

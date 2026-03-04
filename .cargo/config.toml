@@ -2,3 +2,7 @@
 lint = "clippy --workspace --all-targets -- -D warnings"
 test-all = "test --workspace"
 check-all = "check --workspace"
+
+# macOS: Homebrew Rust needs the SDK library path for linking
+[env]
+LIBRARY_PATH = { value = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib", force = false }
