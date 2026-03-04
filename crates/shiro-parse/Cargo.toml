@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 shiro-core.workspace = true
-thiserror.workspace = true
-serde.workspace = true
+camino.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

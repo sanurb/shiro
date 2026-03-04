@@ -17,13 +17,18 @@ license = "MIT OR Apache-2.0"
 # core building blocks
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
 serde_json = "1"
+toml = "0.8"
+blake3 = "1"
+camino = { version = "1", features = ["serde1"] }
 
 # CLI + observability
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# testing
+proptest = "1"
 
 # internal crates
 shiro-core = { path = "crates/shiro-core" }
