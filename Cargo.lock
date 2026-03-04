@@ -1123,7 +1123,7 @@ dependencies = [
 
 [[package]]
 name = "shiro-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "clap",
@@ -1140,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "shiro-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "camino",
@@ -1152,7 +1152,7 @@ dependencies = [
 
 [[package]]
 name = "shiro-index"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "camino",
  "shiro-core",
@@ -1163,7 +1163,7 @@ dependencies = [
 
 [[package]]
 name = "shiro-parse"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "camino",
@@ -1174,7 +1174,7 @@ dependencies = [
 
 [[package]]
 name = "shiro-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "camino",
