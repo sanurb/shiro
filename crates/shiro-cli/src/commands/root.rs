@@ -1,83 +1,31 @@
-use std::fmt;
+//! Self-documenting root command (no subcommand).
 
-use serde::Serialize;
+use crate::envelope::{CmdOutput, NextAction};
+use shiro_core::ShiroError;
 
-use crate::envelope::{self, NextAction};
+pub fn run() -> Result<CmdOutput, ShiroError> {
+    let result = serde_json::json!({
+        "description": "shiro \u{2014} local-first PDF/Markdown knowledge engine",
+        "commands": [
+            { "name": "init", "usage": "shiro init" },
+            { "name": "add", "usage": "shiro add <path|url> [--enrich] [--tags <csv>] [--concepts <csv>] [--parser <baseline|premium>] [--fts-only] [--follow]" },
+            { "name": "ingest", "usage": "shiro ingest <dir...> [--glob <pattern>] [--enrich] [--tags <csv>] [--concepts <csv>] [--parser <baseline|premium>] [--max-files <n>] [--fts-only] [--follow]" },
+            { "name": "search", "usage": "shiro search <query> [--vector|--bm25|--hybrid] [--limit <n>] [--expand] [--tag <tag>] [--concept <id>] [--doc <doc_id>]" },
+            { "name": "read", "usage": "shiro read <doc_id|title> [--outline|--text|--blocks]" },
+            { "name": "explain", "usage": "shiro explain <result_id>" },
+            { "name": "list", "usage": "shiro list [--tag <tag>] [--concept <id>] [--limit <n>]" },
+            { "name": "remove", "usage": "shiro remove <doc_id|title> [--purge]" },
+            { "name": "config", "usage": "shiro config <show|get|set> ..." },
+            { "name": "doctor", "usage": "shiro doctor [--verify-vector] [--repair]" },
+            { "name": "mcp", "usage": "shiro mcp" },
+        ]
+    });
 
-#[derive(Serialize)]
-struct CommandInfo {
-    name: &'static str,
-    description: &'static str,
-    usage: &'static str,
-}
-
-#[derive(Serialize)]
-pub(crate) struct RootData {
-    description: &'static str,
-    version: &'static str,
-    commands: Vec<CommandInfo>,
-}
-
-impl fmt::Display for RootData {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "shiro v{}", self.version)?;
-        writeln!(f, "{}", self.description)?;
-        writeln!(f)?;
-        writeln!(f, "commands:")?;
-        for cmd in &self.commands {
-            writeln!(f, "  {:10} {}", cmd.name, cmd.description)?;
-        }
-        Ok(())
-    }
-}
-
-pub(crate) fn run(json: bool) -> i32 {
-    let data = RootData {
-        description: "local-first document knowledge engine",
-        version: env!("CARGO_PKG_VERSION"),
-        commands: vec![
-            CommandInfo {
-                name: "init",
-                description: "Initialize a shiro data directory",
-                usage: "shiro init",
-            },
-            CommandInfo {
-                name: "add",
-                description: "Add a file to the staging area",
-                usage: "shiro add <path>",
-            },
-            CommandInfo {
-                name: "ingest",
-                description: "Ingest staged documents",
-                usage: "shiro ingest",
-            },
-            CommandInfo {
-                name: "search",
-                description: "Search indexed documents",
-                usage: "shiro search <query>",
-            },
-            CommandInfo {
-                name: "doctor",
-                description: "Run diagnostic checks",
-                usage: "shiro doctor",
-            },
-            CommandInfo {
-                name: "config",
-                description: "Show or manage configuration",
-                usage: "shiro config",
-            },
-            CommandInfo {
-                name: "status",
-                description: "Show system status",
-                usage: "shiro status",
-            },
+    Ok(CmdOutput {
+        result,
+        next_actions: vec![
+            NextAction::simple("shiro init", "Initialize a new library"),
+            NextAction::simple("shiro doctor", "Check library health"),
         ],
-    };
-
-    let next_actions = [NextAction {
-        command: "shiro init".into(),
-        description: "Get started by initializing a data directory".into(),
-    }];
-
-    envelope::print_success("shiro", &data, &next_actions, json)
+    })
 }

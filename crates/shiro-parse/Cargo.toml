@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 shiro-core.workspace = true
+blake3.workspace = true
 camino.workspace = true
 tracing.workspace = true
 

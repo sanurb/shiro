@@ -1,76 +1,93 @@
-// TODO: verify data_dir structure, index integrity, orphaned docs. Acceptance: detects and reports corruption.
+//! `shiro doctor` — consistency checks and diagnostics.
 
-use std::fmt;
+use crate::envelope::{CmdOutput, NextAction};
+use shiro_core::{ShiroError, ShiroHome};
+use shiro_index::FtsIndex;
+use shiro_store::Store;
 
-use serde::Serialize;
+pub fn run(home: &ShiroHome) -> Result<CmdOutput, ShiroError> {
+    let mut checks = Vec::new();
 
-use crate::envelope::{self, NextAction};
+    // Check 1: home directory exists.
+    let home_exists = home.root().as_std_path().is_dir();
+    checks.push(serde_json::json!({
+        "name": "home_directory",
+        "status": if home_exists { "ok" } else { "fail" },
+        "message": if home_exists {
+            format!("{} exists", home.root())
+        } else {
+            format!("{} not found — run `shiro init`", home.root())
+        },
+    }));
 
-#[allow(dead_code)] // Warn/Fail used when checks are implemented
-#[derive(Debug, Clone, Serialize)]
-pub(crate) enum CheckStatus {
-    Ok,
-    Warn,
-    Fail,
-}
+    if !home_exists {
+        let result = serde_json::json!({ "checks": checks, "healthy": false });
+        return Ok(CmdOutput {
+            result,
+            next_actions: vec![NextAction::simple("shiro init", "Initialize the library")],
+        });
+    }
 
-impl fmt::Display for CheckStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Ok => write!(f, "ok"),
-            Self::Warn => write!(f, "warn"),
-            Self::Fail => write!(f, "FAIL"),
+    // Check 2: SQLite database.
+    let db_check = match Store::open(&home.db_path()) {
+        Ok(store) => {
+            let counts = store.count_by_state().unwrap_or_default();
+            let total: usize = counts.iter().map(|(_, c)| c).sum();
+            serde_json::json!({
+                "name": "sqlite_store",
+                "status": "ok",
+                "message": format!("{total} documents in store"),
+                "details": counts.iter().map(|(s, c)| {
+                    serde_json::json!({ "state": s.as_str(), "count": c })
+                }).collect::<Vec<_>>(),
+            })
         }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct Check {
-    name: String,
-    status: CheckStatus,
-}
-
-impl fmt::Display for Check {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.name, self.status)
-    }
-}
-
-#[derive(Serialize)]
-pub(crate) struct DoctorData {
-    checks: Vec<Check>,
-}
-
-impl fmt::Display for DoctorData {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, check) in self.checks.iter().enumerate() {
-            if i > 0 {
-                writeln!(f)?;
-            }
-            write!(f, "  {check}")?;
+        Err(e) => {
+            serde_json::json!({
+                "name": "sqlite_store",
+                "status": "fail",
+                "message": format!("cannot open store: {e}"),
+            })
         }
-        Ok(())
-    }
-}
-
-pub(crate) fn run(json: bool) -> i32 {
-    let data = DoctorData {
-        checks: vec![
-            Check {
-                name: "data_dir".into(),
-                status: CheckStatus::Ok,
-            },
-            Check {
-                name: "index".into(),
-                status: CheckStatus::Ok,
-            },
-        ],
     };
+    let db_ok = db_check["status"].as_str() == Some("ok");
+    checks.push(db_check);
 
-    let next_actions = [NextAction {
-        command: "shiro status".into(),
-        description: "Show current status".into(),
-    }];
+    // Check 3: Tantivy FTS index.
+    let fts_check = match FtsIndex::open(&home.tantivy_dir()) {
+        Ok(fts) => {
+            let count = fts.num_segments().unwrap_or(0);
+            serde_json::json!({
+                "name": "fts_index",
+                "status": "ok",
+                "message": format!("{count} segments indexed"),
+            })
+        }
+        Err(e) => {
+            serde_json::json!({
+                "name": "fts_index",
+                "status": "fail",
+                "message": format!("cannot open FTS index: {e}"),
+            })
+        }
+    };
+    let fts_ok = fts_check["status"].as_str() == Some("ok");
+    checks.push(fts_check);
 
-    envelope::print_success("shiro doctor", &data, &next_actions, json)
+    let healthy = home_exists && db_ok && fts_ok;
+    let result = serde_json::json!({ "checks": checks, "healthy": healthy });
+
+    let mut next_actions = Vec::new();
+    if !healthy {
+        next_actions.push(NextAction::simple(
+            "shiro init",
+            "Re-initialize the library",
+        ));
+    }
+    next_actions.push(NextAction::simple("shiro list", "List documents"));
+
+    Ok(CmdOutput {
+        result,
+        next_actions,
+    })
 }

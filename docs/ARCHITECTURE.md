@@ -436,3 +436,37 @@ Any value that changes outputs must contribute to the appropriate fingerprint.
 
 - [CLI Reference](CLI.md) - Complete command documentation
 - [MCP Guide](MCP.md) - Agent usage patterns
+
+## ADRs (Architecture Decision Records)
+
+### ADR-001: Layered modules over strict hexagonal (2026-03-04)
+
+**Context**: The original DESIGN.md mandated hexagonal architecture with port traits for every adapter boundary. The implementation found this over-abstracts internal infrastructure (SQLite, Tantivy) that has one implementation and no substitution requirement.
+
+**Decision**: Keep traits only for truly external/pluggable adapters (Parser, Embedder, VectorIndex). Use concrete types for internal infrastructure (Store wrapping rusqlite, FtsIndex wrapping Tantivy). This matches Rust ecosystem norms: traits for abstraction boundaries, concrete types for internal modules.
+
+**Consequences**: Simpler code, fewer indirections, easier to debug. If SQLite or Tantivy ever need replacement, the concrete types have clean API surfaces that can be extracted to traits at that point.
+
+### ADR-002: SQLite FTS5 deferred in favor of Tantivy (2026-03-04)
+
+**Context**: SQLite FTS5 would reduce dependencies but the architecture docs explicitly specify Tantivy for BM25.
+
+**Decision**: Use Tantivy per docs. Single index directory (no generational indices yet) for v0.1.
+
+**Consequences**: Generational atomic publish (staging dir rename) is deferred. Current approach: single Tantivy index with commit-per-batch. Acceptable for local single-writer usage.
+
+### ADR-003: Search result IDs are hash-based ephemeral tokens (2026-03-04)
+
+**Context**: `explain` needs to look up a search result by `result_id` without re-running the query.
+
+**Decision**: `result_id = res_<blake3(query:segment_id)[..16]>`. Results are persisted in a `search_results` SQLite table for explain. Old entries accumulate; doctor can clean them.
+
+**Consequences**: Explain works across CLI invocations. Trade-off: unbounded growth of search_results table. Future: add TTL or max-rows cleanup in doctor.
+
+### ADR-004: Envelope contract follows CLI.md not DESIGN.md (2026-03-04)
+
+**Context**: CLI.md uses `{ok, command, result, next_actions}` with snake_case. DESIGN.md uses `{schemaVersion, ok, command, data, nextActions}` with camelCase.
+
+**Decision**: CLI.md is authoritative for CLI output contracts. Fields: `ok`, `command`, `result`, `next_actions` (snake_case). No `schemaVersion` in envelope.
+
+**Consequences**: Breaking change from the stub implementation. All consumers must use the CLI.md contract.

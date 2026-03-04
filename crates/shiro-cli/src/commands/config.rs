@@ -1,40 +1,35 @@
-// TODO: read/write config.toml, support get/set subcommands. Acceptance: round-trips config values.
+//! `shiro config` — show/get/set configuration.
 
-use std::fmt;
+use crate::envelope::{CmdOutput, NextAction};
+use shiro_core::{ShiroError, ShiroHome};
 
-use serde::Serialize;
+pub fn run_show(home: &ShiroHome) -> Result<CmdOutput, ShiroError> {
+    let result = serde_json::json!({
+        "home": home.root().as_str(),
+        "db_path": home.db_path().as_str(),
+        "tantivy_dir": home.tantivy_dir().as_str(),
+        "config_path": home.config_path().as_str(),
+        "lock_dir": home.lock_dir().as_str(),
+    });
 
-use crate::envelope::{self, NextAction};
-
-#[derive(Serialize)]
-pub(crate) struct ConfigData {
-    data_dir: String,
-    config_path: String,
+    Ok(CmdOutput {
+        result,
+        next_actions: vec![NextAction::simple("shiro doctor", "Check library health")],
+    })
 }
 
-impl fmt::Display for ConfigData {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "data_dir:    {}", self.data_dir)?;
-        write!(f, "config_path: {}", self.config_path)
-    }
+pub fn run_get(_home: &ShiroHome, key: &str) -> Result<CmdOutput, ShiroError> {
+    // TODO: read from config.toml when config persistence is implemented.
+    // Acceptance: read values from config.toml; return typed values.
+    Err(ShiroError::Config {
+        message: format!("config key '{key}' not found (config persistence not yet implemented)"),
+    })
 }
 
-pub(crate) fn run(json: bool) -> i32 {
-    let data = ConfigData {
-        data_dir: "~/.local/share/shiro".into(),
-        config_path: "~/.config/shiro/config.toml".into(),
-    };
-
-    let next_actions = [
-        NextAction {
-            command: "shiro init".into(),
-            description: "Initialize shiro data directory".into(),
-        },
-        NextAction {
-            command: "shiro doctor".into(),
-            description: "Check configuration health".into(),
-        },
-    ];
-
-    envelope::print_success("shiro config", &data, &next_actions, json)
+pub fn run_set(_home: &ShiroHome, key: &str, _value: &str) -> Result<CmdOutput, ShiroError> {
+    // TODO: write to config.toml when config persistence is implemented.
+    // Acceptance: persist to config.toml; validate key/value types.
+    Err(ShiroError::Config {
+        message: format!("config set for '{key}' not yet implemented (config persistence pending)"),
+    })
 }

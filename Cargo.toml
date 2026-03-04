@@ -22,6 +22,10 @@ toml = "0.8"
 blake3 = "1"
 camino = { version = "1", features = ["serde1"] }
 
+# storage + indexing
+rusqlite = { version = "0.32", features = ["bundled"] }
+tantivy = "0.22"
+
 # CLI + observability
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
@@ -29,6 +33,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # testing
 proptest = "1"
+tempfile = "3"
 
 # internal crates
 shiro-core = { path = "crates/shiro-core" }
+shiro-store = { path = "crates/shiro-store" }
+shiro-index = { path = "crates/shiro-index" }
+shiro-parse = { path = "crates/shiro-parse" }

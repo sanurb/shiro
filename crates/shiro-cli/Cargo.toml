@@ -4,10 +4,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "shiro"
+path = "src/main.rs"
+
 [dependencies]
 shiro-core.workspace = true
+shiro-store.workspace = true
+shiro-index.workspace = true
+shiro-parse.workspace = true
+blake3.workspace = true
+camino.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

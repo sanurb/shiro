@@ -1,39 +1,98 @@
-// TODO: copy/link file to staging, compute DocId from content. Acceptance: file exists in staging after add.
+//! `shiro add` — stage and process a single document.
 
-use std::fmt;
+use std::collections::BTreeMap;
 
-use serde::Serialize;
+use crate::envelope::{CmdOutput, NextAction, ParamMeta};
+use shiro_core::manifest::DocState;
+use shiro_core::{ShiroError, ShiroHome};
+use shiro_index::FtsIndex;
+use shiro_parse::{segment_document, PlainTextParser};
+use shiro_store::Store;
 
-use crate::envelope::{self, NextAction};
+pub fn run(home: &ShiroHome, path: &str) -> Result<CmdOutput, ShiroError> {
+    let store = Store::open(&home.db_path())?;
+    let fts = FtsIndex::open(&home.tantivy_dir())?;
+    let parser = PlainTextParser;
 
-#[derive(Serialize)]
-pub(crate) struct AddData {
-    path: String,
-    doc_id: String,
-    staged: bool,
-}
+    // Read the source file.
+    let content = std::fs::read(path)?;
+    let source_uri = path.to_string();
 
-impl fmt::Display for AddData {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "added {} (doc_id: {}, staged: {})",
-            self.path, self.doc_id, self.staged
-        )
+    // Parse into Document.
+    use shiro_core::ports::Parser;
+    let doc = parser.parse(&source_uri, &content)?;
+
+    // Check for duplicates (content-addressed).
+    if store.exists(&doc.id)? {
+        let (existing, state) = store.get_document(&doc.id)?;
+        let result = serde_json::json!({
+            "doc_id": existing.id.as_str(),
+            "status": state.as_str(),
+            "title": existing.metadata.title,
+            "changed": false,
+        });
+        return Ok(CmdOutput {
+            result,
+            next_actions: read_next_actions(&existing.id),
+        });
     }
+
+    // Stage document.
+    store.put_document(&doc, DocState::Staged)?;
+    tracing::info!(doc_id = %doc.id, "staged document");
+
+    // Transition to INDEXING.
+    store.set_state(&doc.id, DocState::Indexing)?;
+
+    // Segment the document.
+    let segments = segment_document(&doc)?;
+    store.put_segments(&segments)?;
+    tracing::info!(doc_id = %doc.id, segments = segments.len(), "segmented");
+
+    // Index in Tantivy.
+    fts.index_segments(&segments)?;
+    tracing::info!(doc_id = %doc.id, "indexed in FTS");
+
+    // Transition to READY.
+    store.set_state(&doc.id, DocState::Ready)?;
+    tracing::info!(doc_id = %doc.id, "document READY");
+
+    let result = serde_json::json!({
+        "doc_id": doc.id.as_str(),
+        "status": "READY",
+        "title": doc.metadata.title,
+        "segments": segments.len(),
+        "changed": true,
+    });
+
+    Ok(CmdOutput {
+        result,
+        next_actions: read_next_actions(&doc.id),
+    })
 }
 
-pub(crate) fn run(path: &str, json: bool) -> i32 {
-    let data = AddData {
-        path: path.to_owned(),
-        doc_id: "<not-yet-computed>".into(),
-        staged: false,
-    };
+fn read_next_actions(doc_id: &shiro_core::DocId) -> Vec<NextAction> {
+    let mut params = BTreeMap::new();
+    params.insert(
+        "doc_id".to_string(),
+        ParamMeta {
+            value: Some(serde_json::json!(doc_id.as_str())),
+            default: None,
+            description: Some("Document ID".to_string()),
+        },
+    );
 
-    let next_actions = [NextAction {
-        command: "shiro ingest".into(),
-        description: "Ingest staged documents".into(),
-    }];
-
-    envelope::print_success("shiro add", &data, &next_actions, json)
+    vec![
+        NextAction::with_params(
+            "shiro read <doc_id> --text",
+            "Read document text",
+            params.clone(),
+        ),
+        NextAction::with_params(
+            "shiro read <doc_id> --blocks",
+            "View document blocks",
+            params,
+        ),
+        NextAction::simple("shiro search <query>", "Search the library"),
+    ]
 }

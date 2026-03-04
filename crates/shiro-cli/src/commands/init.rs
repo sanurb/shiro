@@ -1,41 +1,33 @@
-use std::fmt;
+//! `shiro init` — create storage layout and SQLite schema.
 
-use serde::Serialize;
+use crate::envelope::{CmdOutput, NextAction};
+use shiro_core::{ShiroError, ShiroHome};
+use shiro_index::FtsIndex;
+use shiro_store::Store;
 
-use crate::envelope::{self, NextAction};
+pub fn run(home: &ShiroHome) -> Result<CmdOutput, ShiroError> {
+    home.ensure_dirs().map_err(|e| ShiroError::Config {
+        message: format!("failed to create directories: {e}"),
+    })?;
 
-// TODO: create .shiro/ directory structure (staging/, live/, config.toml). Acceptance: idempotent re-init.
+    // Initialize SQLite schema.
+    let _store = Store::open(&home.db_path())?;
+    tracing::info!(path = %home.db_path(), "initialized SQLite store");
 
-#[derive(Debug, Serialize)]
-pub(crate) struct InitData {
-    data_dir: String,
-    created: bool,
-}
+    // Initialize Tantivy index.
+    let _fts = FtsIndex::open(&home.tantivy_dir())?;
+    tracing::info!(path = %home.tantivy_dir(), "initialized FTS index");
 
-impl fmt::Display for InitData {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.created {
-            write!(f, "Initialized shiro data directory at {}", self.data_dir)
-        } else {
-            write!(
-                f,
-                "shiro data directory already exists at {}",
-                self.data_dir
-            )
-        }
-    }
-}
+    let result = serde_json::json!({
+        "home": home.root().as_str(),
+        "created": true,
+    });
 
-pub(crate) fn run(json: bool) -> i32 {
-    let data = InitData {
-        data_dir: ".shiro".to_string(),
-        created: true,
-    };
-
-    let next_actions = [NextAction {
-        command: "shiro add <path>".to_string(),
-        description: "Add a file to the shiro store".to_string(),
-    }];
-
-    envelope::print_success("shiro init", &data, &next_actions, json)
+    Ok(CmdOutput {
+        result,
+        next_actions: vec![
+            NextAction::simple("shiro doctor", "Check library health"),
+            NextAction::simple("shiro add <path|url>", "Add a document to the library"),
+        ],
+    })
 }
