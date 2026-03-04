@@ -14,6 +14,7 @@ use shiro_core::error::{ErrorCode, ShiroError};
 // ---------------------------------------------------------------------------
 
 /// Output from a successful command execution.
+#[derive(Debug)]
 pub struct CmdOutput {
     pub result: serde_json::Value,
     pub next_actions: Vec<NextAction>,
@@ -264,5 +265,106 @@ mod tests {
             v["params"]["doc_id"]["description"].as_str().unwrap(),
             "Document ID"
         );
+    }
+
+    /// Golden test: success envelope MUST have exactly these top-level keys
+    /// per CLI.md. Any addition/removal is a contract break.
+    #[test]
+    fn golden_success_envelope_fields() {
+        let output = CmdOutput {
+            result: serde_json::json!({"status": "ok"}),
+            next_actions: vec![NextAction::simple("shiro doctor", "Check health")],
+        };
+
+        let envelope = SuccessEnvelope {
+            ok: true,
+            command: "shiro init",
+            result: &output.result,
+            next_actions: &output.next_actions,
+        };
+
+        let json_str = serde_json::to_string(&envelope).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let obj = v.as_object().unwrap();
+
+        // Contract: exactly these keys, no more, no fewer.
+        let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            &["command", "next_actions", "ok", "result"],
+            "success envelope keys must match CLI.md contract exactly"
+        );
+        assert_eq!(obj.len(), 4);
+
+        // ok must be true.
+        assert_eq!(obj["ok"], serde_json::json!(true));
+        // command must be a string.
+        assert!(obj["command"].is_string());
+        // result must be an object.
+        assert!(obj["result"].is_object());
+        // next_actions must be an array.
+        assert!(obj["next_actions"].is_array());
+    }
+
+    /// Golden test: error envelope MUST have exactly these top-level keys
+    /// per CLI.md. `fix` is optional (skip_serializing_if).
+    #[test]
+    fn golden_error_envelope_fields() {
+        // With fix
+        let envelope_with_fix = ErrorEnvelope {
+            ok: false,
+            command: "shiro search",
+            error: ErrorDetail {
+                code: "E_STORE_CORRUPT",
+                message: "db damaged",
+            },
+            fix: Some("run doctor --repair"),
+            next_actions: &[],
+        };
+        let json_str = serde_json::to_string(&envelope_with_fix).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let obj = v.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            &["command", "error", "fix", "next_actions", "ok"],
+            "error envelope with fix must have these keys"
+        );
+        assert_eq!(obj.len(), 5);
+
+        // Without fix
+        let envelope_no_fix = ErrorEnvelope {
+            ok: false,
+            command: "shiro search",
+            error: ErrorDetail {
+                code: "E_SEARCH_FAILED",
+                message: "bad query",
+            },
+            fix: None,
+            next_actions: &[],
+        };
+        let json_str = serde_json::to_string(&envelope_no_fix).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let obj = v.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            &["command", "error", "next_actions", "ok"],
+            "error envelope without fix must omit fix key"
+        );
+        assert_eq!(obj.len(), 4);
+
+        // error sub-object must have exactly code + message.
+        let mut err_keys: Vec<&str> = v["error"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        err_keys.sort_unstable();
+        assert_eq!(err_keys, &["code", "message"]);
     }
 }

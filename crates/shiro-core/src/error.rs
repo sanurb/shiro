@@ -145,13 +145,17 @@ impl ErrorCode {
     pub fn exit_code(self) -> i32 {
         match self {
             Self::EInvalidInput | Self::EConfig => 2,
-            Self::EParsePdf | Self::EParseMd | Self::EInvalidIr | Self::EEmbedFail => 10,
+            Self::EParsePdf
+            | Self::EParseMd
+            | Self::EInvalidIr
+            | Self::EEmbedFail
+            | Self::EEnrichFail => 10,
             Self::EIndexBuildFts | Self::EIndexBuildVec => 11,
-            Self::ESearchFailed => 12,
+            Self::ESearchFailed | Self::ENotFound => 12,
             Self::EStoreCorrupt => 20,
             Self::ELockBusy => 21,
             // Unmapped codes default to 1 (generic failure).
-            Self::EIo | Self::EEnrichFail | Self::ETaxonomyCycle | Self::ENotFound => 1,
+            Self::EIo | Self::ETaxonomyCycle => 1,
         }
     }
 }
@@ -188,6 +192,8 @@ mod tests {
         assert_eq!(ErrorCode::ESearchFailed.exit_code(), 12);
         assert_eq!(ErrorCode::EStoreCorrupt.exit_code(), 20);
         assert_eq!(ErrorCode::ELockBusy.exit_code(), 21);
+        assert_eq!(ErrorCode::EEnrichFail.exit_code(), 10);
+        assert_eq!(ErrorCode::ENotFound.exit_code(), 12);
     }
 
     #[test]

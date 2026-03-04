@@ -127,10 +127,44 @@ fn truncate_snippet(text: &str, max_chars: usize) -> String {
     if text.len() <= max_chars {
         return text.to_string();
     }
-    // Find the last space before max_chars.
-    let truncated = &text[..max_chars];
+    // Find the last char boundary at or before max_chars.
+    let mut end = max_chars;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let truncated = &text[..end];
     match truncated.rfind(' ') {
         Some(pos) => format!("{}...", &truncated[..pos]),
         None => format!("{truncated}..."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_ascii() {
+        assert_eq!(truncate_snippet("short", 100), "short");
+        assert_eq!(truncate_snippet("hello world foo", 11), "hello...");
+    }
+
+    #[test]
+    fn truncate_unicode_safe() {
+        // 4-byte emoji: slicing at byte 5 would be mid-character.
+        let text = "a \u{1F600} bcdef ghijk"; // 'a ' + 4-byte emoji + ' bcdef ghijk'
+        let result = truncate_snippet(text, 5);
+        // Must not panic. Should back up to char boundary.
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_no_space() {
+        assert_eq!(truncate_snippet("abcdefghij", 5), "abcde...");
+    }
+
+    #[test]
+    fn truncate_exact_boundary() {
+        assert_eq!(truncate_snippet("12345", 5), "12345");
     }
 }

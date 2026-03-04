@@ -14,7 +14,6 @@ shiro-store.workspace = true
 shiro-index.workspace = true
 shiro-parse.workspace = true
 blake3.workspace = true
-camino.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

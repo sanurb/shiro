@@ -72,8 +72,32 @@ enum Commands {
 
     /// Add a file to the library (parse, index, activate).
     Add {
-        /// Path to the file to add.
+        /// Path or URL of the file to add.
         path: String,
+
+        /// Parser backend.
+        #[arg(long, value_enum, default_value = "baseline")]
+        parser: ParserChoice,
+
+        /// Enable LLM-based enrichment (tags, concepts).
+        #[arg(long)]
+        enrich: bool,
+
+        /// Comma-separated tags to attach.
+        #[arg(long)]
+        tags: Option<String>,
+
+        /// Comma-separated concept IDs to attach.
+        #[arg(long)]
+        concepts: Option<String>,
+
+        /// Skip vector indexing; FTS only.
+        #[arg(long)]
+        fts_only: bool,
+
+        /// Stream NDJSON progress to stdout.
+        #[arg(long)]
+        follow: bool,
     },
 
     /// Batch-ingest documents from directories.
@@ -85,9 +109,33 @@ enum Commands {
         #[arg(long)]
         glob: Option<String>,
 
+        /// Parser backend.
+        #[arg(long, value_enum, default_value = "baseline")]
+        parser: ParserChoice,
+
+        /// Enable LLM-based enrichment.
+        #[arg(long)]
+        enrich: bool,
+
+        /// Comma-separated tags to attach.
+        #[arg(long)]
+        tags: Option<String>,
+
+        /// Comma-separated concept IDs to attach.
+        #[arg(long)]
+        concepts: Option<String>,
+
         /// Maximum number of files to process.
         #[arg(long)]
         max_files: Option<usize>,
+
+        /// Skip vector indexing; FTS only.
+        #[arg(long)]
+        fts_only: bool,
+
+        /// Stream NDJSON progress to stdout.
+        #[arg(long)]
+        follow: bool,
     },
 
     /// Search indexed documents.
@@ -102,6 +150,30 @@ enum Commands {
         /// Maximum number of results.
         #[arg(long, default_value = "10")]
         limit: usize,
+
+        /// Expand results with surrounding context.
+        #[arg(long)]
+        expand: bool,
+
+        /// Max blocks when expanding.
+        #[arg(long, default_value = "12")]
+        max_blocks: usize,
+
+        /// Max chars when expanding.
+        #[arg(long, default_value = "8000")]
+        max_chars: usize,
+
+        /// Filter by tag.
+        #[arg(long)]
+        tag: Option<String>,
+
+        /// Filter by concept ID.
+        #[arg(long)]
+        concept: Option<String>,
+
+        /// Filter by document ID.
+        #[arg(long)]
+        doc: Option<String>,
     },
 
     /// Read document content.
@@ -125,6 +197,14 @@ enum Commands {
         /// Maximum number of documents to show.
         #[arg(long, default_value = "20")]
         limit: usize,
+
+        /// Filter by tag.
+        #[arg(long)]
+        tag: Option<String>,
+
+        /// Filter by concept ID.
+        #[arg(long)]
+        concept: Option<String>,
     },
 
     /// Remove a document from the library.
@@ -138,13 +218,27 @@ enum Commands {
     },
 
     /// Run diagnostic checks on the library.
-    Doctor,
+    Doctor {
+        /// Verify vector index integrity.
+        #[arg(long)]
+        verify_vector: bool,
+
+        /// Attempt repair of detected issues.
+        #[arg(long)]
+        repair: bool,
+    },
 
     /// Show or manage configuration.
     Config {
         #[command(subcommand)]
         action: ConfigAction,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ParserChoice {
+    Baseline,
+    Premium,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -224,7 +318,7 @@ fn dispatch(cli: &Cli) -> Result<CmdOutput, ShiroError> {
             commands::init::run(&home)
         }
 
-        Some(Commands::Add { path }) => {
+        Some(Commands::Add { path, .. }) => {
             let home = resolve_home(cli)?;
             commands::add::run(&home, path)
         }
@@ -233,12 +327,15 @@ fn dispatch(cli: &Cli) -> Result<CmdOutput, ShiroError> {
             dirs,
             glob,
             max_files,
+            ..
         }) => {
             let home = resolve_home(cli)?;
             commands::ingest::run(&home, dirs, glob.as_deref(), *max_files)
         }
 
-        Some(Commands::Search { query, mode, limit }) => {
+        Some(Commands::Search {
+            query, mode, limit, ..
+        }) => {
             let home = resolve_home(cli)?;
             let m = match mode {
                 SearchModeArg::Hybrid => commands::search::SearchMode::Hybrid,
@@ -263,7 +360,7 @@ fn dispatch(cli: &Cli) -> Result<CmdOutput, ShiroError> {
             commands::explain::run(&home, result_id)
         }
 
-        Some(Commands::List { limit }) => {
+        Some(Commands::List { limit, .. }) => {
             let home = resolve_home(cli)?;
             commands::list::run(&home, *limit)
         }
@@ -273,7 +370,7 @@ fn dispatch(cli: &Cli) -> Result<CmdOutput, ShiroError> {
             commands::remove::run(&home, id, *purge)
         }
 
-        Some(Commands::Doctor) => {
+        Some(Commands::Doctor { .. }) => {
             let home = resolve_home(cli)?;
             commands::doctor::run(&home)
         }
@@ -304,7 +401,7 @@ fn command_name(cli: &Cli) -> &'static str {
         Some(Commands::Explain { .. }) => "shiro explain",
         Some(Commands::List { .. }) => "shiro list",
         Some(Commands::Remove { .. }) => "shiro remove",
-        Some(Commands::Doctor) => "shiro doctor",
+        Some(Commands::Doctor { .. }) => "shiro doctor",
         Some(Commands::Config { .. }) => "shiro config",
     }
 }

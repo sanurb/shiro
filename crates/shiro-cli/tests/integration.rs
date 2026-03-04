@@ -159,7 +159,20 @@ fn root_command_self_documenting() {
 
     // Verify required commands from CLI.md are present.
     for required in &[
-        "init", "add", "ingest", "search", "read", "explain", "list", "remove", "doctor", "config",
+        "init",
+        "add",
+        "ingest",
+        "search",
+        "read",
+        "explain",
+        "list",
+        "remove",
+        "taxonomy",
+        "config",
+        "doctor",
+        "reindex",
+        "mcp",
+        "completions",
     ] {
         assert!(
             names.contains(required),
@@ -200,4 +213,78 @@ fn config_show() {
     let v = parse_json(&stdout);
     assert!(v["result"]["home"].is_string());
     assert!(v["result"]["db_path"].is_string());
+}
+
+/// Golden test: verify root command next_actions match CLI.md contract.
+#[test]
+fn root_next_actions_match_contract() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path().join("shiro-next-actions-test");
+
+    let (stdout, code) = shiro(&home, &[]);
+    assert_eq!(code, 0, "root failed: {stdout}");
+    let v = parse_json(&stdout);
+
+    let next = v["next_actions"].as_array().unwrap();
+    assert_eq!(next.len(), 2, "root should have exactly 2 next_actions");
+
+    // First: doctor (simple)
+    assert_eq!(next[0]["command"].as_str().unwrap(), "shiro doctor");
+    assert_eq!(
+        next[0]["description"].as_str().unwrap(),
+        "Check library health"
+    );
+
+    // Second: list with params
+    assert_eq!(
+        next[1]["command"].as_str().unwrap(),
+        "shiro list [--limit <n>]"
+    );
+    assert_eq!(next[1]["params"]["n"]["default"].as_u64().unwrap(), 20);
+}
+
+/// Verify exit codes match CLI.md contract for known error classes.
+#[test]
+fn exit_code_contract() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path().join("shiro-exit-code-test");
+
+    // Search without init = I/O error opening DB (not found).
+    let (_stdout, code) = shiro(&home, &["search", "anything"]);
+    // Should be non-zero.
+    assert_ne!(code, 0, "search on uninitialized home should fail");
+
+    // Config get (unimplemented) = exit 2 (usage error).
+    shiro(&home, &["init"]);
+    let (_stdout, code) = shiro(&home, &["config", "get", "nonexistent"]);
+    assert_eq!(code, 2, "config error should exit 2");
+}
+
+/// Verify that new flags are accepted without error.
+#[test]
+fn new_flags_accepted() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path().join("shiro-flags-test");
+    shiro(&home, &["init"]);
+
+    // Create a test file.
+    let doc_path = tmp.path().join("flagtest.txt");
+    std::fs::write(&doc_path, "Flag test content").unwrap();
+
+    // add with new flags.
+    let (stdout, code) = shiro(
+        &home,
+        &[
+            "add",
+            doc_path.to_str().unwrap(),
+            "--parser",
+            "baseline",
+            "--fts-only",
+        ],
+    );
+    assert_eq!(code, 0, "add with new flags failed: {stdout}");
+
+    // doctor with new flags.
+    let (stdout, code) = shiro(&home, &["doctor", "--verify-vector"]);
+    assert_eq!(code, 0, "doctor with --verify-vector failed: {stdout}");
 }
