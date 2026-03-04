@@ -1,0 +1,29 @@
+[workspace]
+members = [
+  "crates/shiro-core",
+  "crates/shiro-store",
+  "crates/shiro-index",
+  "crates/shiro-parse",
+  "crates/shiro-cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# core building blocks
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+serde_json = "1"
+
+# CLI + observability
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# internal crates
+shiro-core = { path = "crates/shiro-core" }
