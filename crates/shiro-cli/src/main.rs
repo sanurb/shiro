@@ -1,6 +1,6 @@
 //! `shiro` — local-first document knowledge engine CLI.
 //!
-//! JSON output by default. Logs to stderr only.
+//! JSON-only output. Logs to stderr.
 //! See `docs/CLI.md` for the full command contract.
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -26,22 +26,12 @@ struct Cli {
     command: Option<Commands>,
 
     /// Override the data directory (default: ~/.shiro or $SHIRO_HOME).
-    #[arg(long, global = true)]
+    #[arg(long, global = true, env = "SHIRO_HOME")]
     home: Option<String>,
 
     /// Log level for stderr output.
     #[arg(long, global = true, default_value = "warn")]
     log_level: LogLevel,
-
-    /// Output format.
-    #[arg(long, global = true, default_value = "json")]
-    format: Format,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum Format {
-    Json,
-    Text,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -103,7 +93,7 @@ enum Commands {
     /// Batch-ingest documents from directories.
     Ingest {
         /// Directories to scan.
-        dirs: Vec<String>,
+        dirs: Vec<std::path::PathBuf>,
 
         /// File glob pattern (default: *.{txt,md}).
         #[arg(long)]
@@ -279,7 +269,6 @@ enum ConfigAction {
 
 fn main() {
     let cli = Cli::parse();
-    let json = matches!(cli.format, Format::Json);
 
     // Initialize tracing to stderr.
     let filter = cli.log_level.as_filter();
@@ -294,11 +283,11 @@ fn main() {
     let cmd_name = command_name(&cli);
 
     let code = match dispatch(&cli) {
-        Ok(output) => print_success(cmd_name, &output, json),
+        Ok(output) => print_success(cmd_name, &output),
         Err(err) => {
             let fix = suggest_fix(&err);
             let next = recovery_actions(&err);
-            print_error(cmd_name, &err, fix, &next, json)
+            print_error(cmd_name, &err, fix, &next)
         }
     };
 

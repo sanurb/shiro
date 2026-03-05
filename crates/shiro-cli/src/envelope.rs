@@ -4,7 +4,6 @@
 //! Error:   `{ ok, command, error: { code, message }, fix?, next_actions }`
 
 use std::collections::BTreeMap;
-use std::fmt;
 
 use serde::Serialize;
 use shiro_core::error::{ErrorCode, ShiroError};
@@ -97,30 +96,19 @@ struct ErrorDetail<'a> {
 // ---------------------------------------------------------------------------
 
 /// Print a success envelope to stdout. Returns exit code 0.
-pub fn print_success(command: &str, output: &CmdOutput, json: bool) -> i32 {
-    if json {
-        let envelope = SuccessEnvelope {
-            ok: true,
-            command,
-            result: &output.result,
-            next_actions: &output.next_actions,
-        };
-        match serde_json::to_string(&envelope) {
-            Ok(s) => println!("{s}"),
-            Err(e) => {
-                tracing::error!("failed to serialize success envelope: {e}");
-                print_fallback_error();
-                return 1;
-            }
-        }
-    } else {
-        // Text mode: pretty-print the result.
-        match serde_json::to_string_pretty(&output.result) {
-            Ok(s) => println!("{s}"),
-            Err(e) => {
-                tracing::error!("failed to serialize result: {e}");
-                return 1;
-            }
+pub fn print_success(command: &str, output: &CmdOutput) -> i32 {
+    let envelope = SuccessEnvelope {
+        ok: true,
+        command,
+        result: &output.result,
+        next_actions: &output.next_actions,
+    };
+    match serde_json::to_string(&envelope) {
+        Ok(s) => println!("{s}"),
+        Err(e) => {
+            tracing::error!("failed to serialize success envelope: {e}");
+            print_fallback_error();
+            return 1;
         }
     }
     0
@@ -132,34 +120,26 @@ pub fn print_error(
     err: &ShiroError,
     fix: Option<&str>,
     next_actions: &[NextAction],
-    json: bool,
 ) -> i32 {
     let code = ErrorCode::from_error(err);
     let code_str = code.as_str();
     let message = err.to_string();
 
-    if json {
-        let envelope = ErrorEnvelope {
-            ok: false,
-            command,
-            error: ErrorDetail {
-                code: code_str,
-                message: &message,
-            },
-            fix,
-            next_actions,
-        };
-        match serde_json::to_string(&envelope) {
-            Ok(s) => println!("{s}"),
-            Err(e) => {
-                tracing::error!("failed to serialize error envelope: {e}");
-                print_fallback_error();
-            }
-        }
-    } else {
-        eprintln!("error [{code_str}]: {message}");
-        if let Some(f) = fix {
-            eprintln!("fix: {f}");
+    let envelope = ErrorEnvelope {
+        ok: false,
+        command,
+        error: ErrorDetail {
+            code: code_str,
+            message: &message,
+        },
+        fix,
+        next_actions,
+    };
+    match serde_json::to_string(&envelope) {
+        Ok(s) => println!("{s}"),
+        Err(e) => {
+            tracing::error!("failed to serialize error envelope: {e}");
+            print_fallback_error();
         }
     }
 
@@ -170,20 +150,6 @@ fn print_fallback_error() {
     println!(
         r#"{{"ok":false,"command":"unknown","error":{{"code":"E_IO","message":"serialization failed"}},"next_actions":[]}}"#
     );
-}
-
-// ---------------------------------------------------------------------------
-// Display for text mode helpers
-// ---------------------------------------------------------------------------
-
-impl fmt::Display for CmdOutput {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}",
-            serde_json::to_string_pretty(&self.result).unwrap_or_default()
-        )
-    }
 }
 
 #[cfg(test)]

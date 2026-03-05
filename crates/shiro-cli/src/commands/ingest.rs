@@ -1,5 +1,7 @@
 //! `shiro ingest` — batch-add documents from directories.
 
+use std::path::Path;
+
 use crate::envelope::{CmdOutput, NextAction};
 use shiro_core::manifest::DocState;
 use shiro_core::ports::Parser;
@@ -10,7 +12,7 @@ use shiro_store::Store;
 
 pub fn run(
     home: &ShiroHome,
-    dirs: &[String],
+    dirs: &[std::path::PathBuf],
     glob: Option<&str>,
     max_files: Option<usize>,
 ) -> Result<CmdOutput, ShiroError> {
@@ -102,15 +104,14 @@ fn ingest_one(
 ///
 /// For the initial implementation, we do a simple recursive file walk
 /// filtering by extension. Full glob support is a future enhancement.
-fn collect_files(dir: &str, _pattern: &str, out: &mut Vec<String>) -> Result<(), ShiroError> {
-    let dir_path = std::path::Path::new(dir);
-    if !dir_path.is_dir() {
+fn collect_files(dir: &Path, _pattern: &str, out: &mut Vec<String>) -> Result<(), ShiroError> {
+    if !dir.is_dir() {
         return Err(ShiroError::InvalidInput {
-            message: format!("not a directory: {dir}"),
+            message: format!("not a directory: {}", dir.display()),
         });
     }
 
-    walk_dir(dir_path, out)?;
+    walk_dir(dir, out)?;
     Ok(())
 }
 
