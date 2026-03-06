@@ -1,65 +1,64 @@
-<h1 align="center">🏯 Shiro</h1>
+```markdown
+<h1 align="center">🏯 shiro (城)</h1>
 
 <p align="center">
-  <strong>The local-first knowledge engine for your personal fortress of documents.</strong>
+  <strong>The local-first knowledge engine for structured document retrieval.</strong>
 </p>
 
 <p align="center">
-  <a href="https://github.com/sanurb/shiro/actions"><img src="https://img.shields.io/github/actions/workflow/status/sanurb/shiro/ci.yml?branch=master&style=for-the-badge&logo=github" alt="CI"></a>
-  <a href="https://github.com/sanurb/shiro/releases"><img src="https://img.shields.io/github/v/release/sanurb/shiro?style=for-the-badge&logo=rust" alt="Release"></a>
-  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue?style=for-the-badge" alt="License"></a>
+  <a href="https://github.com/sanurb/shiro/actions"><img src="https://img.shields.io/github/actions/workflow/status/sanurb/shiro/ci.yml?branch=master&style=flat-square&logo=github&color=181717" alt="CI Status"></a>
+  <a href="https://github.com/sanurb/shiro/releases"><img src="https://img.shields.io/github/v/release/sanurb/shiro?style=flat-square&logo=rust&color=e44d26" alt="Latest Release"></a>
+  <img src="https://img.shields.io/badge/Architecture-Local--First-blue?style=flat-square" alt="Local-First">
+  <img src="https://img.shields.io/badge/License-MIT%2FApache--2.0-4caf50?style=flat-square" alt="License">
 </p>
-
-
-Works with PDFs AND Markdown files — Index your research papers, books, notes, docs, and any `.md` files in one unified, searchable knowledge base. One binary, zero API costs, total privacy.
 
 > [!TIP]
-> **shiro (城)** is a Japanese castle—fortified, organized, and built to withstand sieges. It is a fortress for your documents, where retrieval is fast and structure matters.
+> **shiro** (Japanese for *castle*) is a high-performance, local-first knowledge engine designed to transform fragmented PDFs and Markdown files into a unified, structure-aware searchable base. 
 
-## ✨ Features
-* **PDF + Markdown** — Index `.pdf` and `.md` files with the same workflow.
-* **Local-first** — Everything runs on your machine; your data never leaves your sight.
-* **AI Enrichment** — Automatic extraction of titles, summaries, tags, and concepts.
-* **SKOS Taxonomy** — Organize documents with professional-grade hierarchical concepts.
-* **Vector Search** — Local semantic search powered by [Ollama](https://ollama.com/) embeddings.
-* **Hybrid Search** — The best of both worlds: BM25 keyword matching combined with vector similarity.
-* **MCP Server** — Seamlessly connect your knowledge to Claude, Cursor, and other AI assistants via the [Model Context Protocol](https://modelcontextprotocol.io).
+Unlike traditional search tools that treat documents as flat strings, `shiro` parses content into a **Document Graph IR**, preserving reading order and block relationships. It exposes this data through a deterministic, JSON-native CLI and an **MCP server**, making your private library instantly accessible to AI agents like Claude and Cursor.
 
+## ✨ Key Differentiators
 
-## 🚀 Quick Start
+* **Structure-Aware IR:** Documents are modeled as hierarchical blocks with byte-level spans, allowing for precise context windowing in LLM applications.
+* **Deterministic JSON CLI:** Built for the Unix philosophy. Every command outputs a structured JSON envelope, perfect for `jq` piping or automated agent consumption.
+* **HATEOAS Navigation:** Responses include `next_actions` with typed parameter templates, enabling AI agents to discover commands dynamically.
+* **Zero-API Dependency:** Everything—from parsing to BM25 indexing—runs on your hardware. No data leaves your machine.
+* **Native MCP Support:** First-class implementation of the [Model Context Protocol](https://modelcontextprotocol.io) for seamless integration with modern AI IDEs and assistants.
 
 
+## 🚀 Getting Started
 
 ### 1. Installation
-Download the binary for your system from [Releases](https://github.com/sanurb/shiro/releases) or install via Cargo:
+Install the pre-compiled binary for your architecture:
+
 ```bash
-cargo install shiro
+# macOS / Linux
+curl -sSL [https://get.shiro.dev](https://get.shiro.dev) | sh
 
 ```
 
-### 2. Initialize and Index
+*Or via Cargo:* `cargo install shiro`
+
+### 2. Initialize your Fortress
 
 ```bash
-# Setup the fortress
 shiro init
-
-# Add your library
-shiro ingest ~/Documents/Research/
+shiro ingest ~/Documents/KnowledgeBase
 
 ```
 
-### 3. Search Your Knowledge
+### 3. Query with JSON Output
 
 ```bash
-# Simple hybrid search
-shiro search "quantum computing optimization"
+# Search for specific concepts
+shiro search "distributed consensus" | jq '.result.hits[0].snippet'
 
 ```
 
 
-## 🔌 Using with AI (MCP)
+## 🤖 AI Integration (MCP)
 
-`shiro` acts as a bridge between your local files and AI agents. To use `shiro` with **Claude Desktop**, add this to your configuration:
+`shiro` bridges the gap between your local documents and AI assistants. Add the following to your `claude_desktop_config.json` or Cursor settings:
 
 ```json
 "mcpServers": {
@@ -71,33 +70,37 @@ shiro search "quantum computing optimization"
 
 ```
 
-Now your AI assistant can "read" your local papers and notes to answer complex questions with citations.
+This grants your AI assistant the ability to search, read, and summarize your local research papers and notes with full citations.
 
 
-## 🛠️ Usage & Commands
+## 🛠 Project Status & Roadmap
 
-| Command | Description |
-| --- | --- |
-| `shiro add <file>` | Parse and index a single document. |
-| `shiro search <query>` | Run a hybrid search (Keywords + Vectors). |
-| `shiro read <id>` | Preview document content or outline in the terminal. |
-| `shiro doctor` | Check the health of your local index and database. |
-| `shiro mcp` | Launch the MCP server for AI tool integration. |
+We prioritize transparency. Here is the current implementation status of the engine:
 
+| Feature | Status | Technology |
+| --- | --- | --- |
+| **Markdown/Text Indexing** | ✅ Stable | Paragraph-boundary segmentation |
+| **BM25 Full-Text Search** | ✅ Stable | [Tantivy](https://github.com/quickwit-oss/tantivy) engine |
+| **JSON/HATEOAS Layer** | ✅ Stable | Structured CLI output |
+| **MCP Server** | 🛠 Beta | Stdio-based protocol implementation |
+| **PDF Parsing** | 🏗 In Progress | Structural IR extraction |
+| **Vector Search** | 🗺 Roadmap | Local embeddings via Ollama/Llama.cpp |
+
+
+## 🏗 Architecture
+
+`shiro` is built in Rust for memory safety and uncompromising performance.
+
+* **Source of Truth:** [SQLite](https://sqlite.org) via `rusqlite` for metadata and state management.
+* **Search Core:** [Tantivy](https://github.com/quickwit-oss/tantivy) for world-class indexing speed.
+* **Deduplication:** Content-addressed IDs using [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) hashes.
 
 ## 🤝 Contributing
 
-Contributions are what make the open-source community an amazing place to learn, inspire, and create.
+We welcome contributions that adhere to our core principles of speed, privacy, and structural integrity.
 
-1. **Fork** the Project.
-2. **Create** your Feature Branch (`git checkout -b feature/AmazingFeature`).
-3. **Commit** your Changes (`git commit -m 'Add some AmazingFeature'`).
-4. **Push** to the Branch (`git push origin feature/AmazingFeature`).
-5. **Open** a Pull Request.
+1. Review the [ARCHITECTURE.md](/docs/ARCHITECTURE.md) for design patterns.
+2. Ensure all changes pass the quality gate: `cargo test-all && cargo lint`.
+3. Open a Pull Request with a clear description of the impact.
 
-
-## 📜 License
-
-Distributed under the **MIT** or **Apache-2.0** License. See `LICENSE` for more information.
-
-**Built with 🦀 by [sanurb**](https://github.com/sanurb)
+**Built with 🦀 by [sanurb**](https://github.com/sanurb) Distributed under the MIT and Apache-2.0 Licenses.
