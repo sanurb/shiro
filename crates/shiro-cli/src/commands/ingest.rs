@@ -35,14 +35,18 @@ pub fn run(
     let mut ready = 0usize;
     let mut failed = 0usize;
     let mut failures = Vec::new();
+    let mut all_segments = Vec::new();
 
+    // Phase 1: parse files and write docs to SQLite in a single transaction.
+    store.begin()?;
     for file_path in &files {
-        match ingest_one(&store, &fts, &parser, file_path) {
-            Ok(true) => {
+        match parse_and_store(&store, &parser, file_path) {
+            Ok(Some(segments)) => {
+                all_segments.extend(segments);
                 added += 1;
                 ready += 1;
             }
-            Ok(false) => {
+            Ok(None) => {
                 // Already existed, skip.
                 ready += 1;
             }
@@ -57,6 +61,24 @@ pub fn run(
                 tracing::warn!(path = %file_path, error = %e, "ingest failed");
             }
         }
+    }
+    store.commit()?;
+
+    // Phase 2: index all segments in a single Tantivy writer+commit.
+    if !all_segments.is_empty() {
+        fts.index_segments(&all_segments)?;
+    }
+
+    // Phase 3: mark all added docs as READY in one transaction.
+    if added > 0 {
+        store.begin()?;
+        let mut seen = std::collections::HashSet::new();
+        for seg in &all_segments {
+            if seen.insert(seg.doc_id.clone()) {
+                store.set_state(&seg.doc_id, DocState::Ready)?;
+            }
+        }
+        store.commit()?;
     }
 
     let result = serde_json::json!({
@@ -75,29 +97,25 @@ pub fn run(
     })
 }
 
-fn ingest_one(
+/// Parse a file and store its document + segments. Returns segments if new.
+fn parse_and_store(
     store: &Store,
-    fts: &FtsIndex,
     parser: &PlainTextParser,
     path: &str,
-) -> Result<bool, ShiroError> {
+) -> Result<Option<Vec<shiro_core::ir::Segment>>, ShiroError> {
     let content = std::fs::read(path)?;
     let doc = parser.parse(path, &content)?;
 
     if store.exists(&doc.id)? {
-        return Ok(false);
+        return Ok(None);
     }
 
-    store.put_document(&doc, DocState::Staged)?;
-    store.set_state(&doc.id, DocState::Indexing)?;
-
+    store.put_document(&doc, DocState::Indexing)?;
     let segments = segment_document(&doc)?;
     store.put_segments(&segments)?;
-    fts.index_segments(&segments)?;
 
-    store.set_state(&doc.id, DocState::Ready)?;
     tracing::info!(doc_id = %doc.id, path = %path, "ingested");
-    Ok(true)
+    Ok(Some(segments))
 }
 
 /// Collect files matching a glob pattern from a directory.

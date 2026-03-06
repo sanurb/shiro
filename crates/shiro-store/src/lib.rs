@@ -411,6 +411,21 @@ impl Store {
 
         Ok(found.is_some())
     }
+
+    /// Begin an explicit transaction (for batch operations).
+    pub fn begin(&self) -> Result<(), ShiroError> {
+        self.conn.execute_batch("BEGIN").map_err(map_db)
+    }
+
+    /// Commit the current transaction.
+    pub fn commit(&self) -> Result<(), ShiroError> {
+        self.conn.execute_batch("COMMIT").map_err(map_db)
+    }
+
+    /// Rollback the current transaction.
+    pub fn rollback(&self) -> Result<(), ShiroError> {
+        self.conn.execute_batch("ROLLBACK").map_err(map_db)
+    }
 }
 
 /// Extension trait to make `query_row` return `Option` on no-rows.
