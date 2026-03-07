@@ -72,6 +72,7 @@ pub enum ReadContent {
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BlockInfo {
     pub index: usize,
+    pub kind: String,
     pub span_start: usize,
     pub span_end: usize,
     pub body: String,
@@ -100,17 +101,38 @@ pub fn execute(store: &Store, input: &ReadInput) -> Result<ReadOutput, ShiroErro
             }
         }
         ReadMode::Blocks => {
-            let segments = store.get_segments(&doc.id)?;
-            let blocks = segments
-                .iter()
-                .map(|s| BlockInfo {
-                    index: s.index,
-                    span_start: s.span.start(),
-                    span_end: s.span.end(),
-                    body: s.body.clone(),
-                })
-                .collect();
-            ReadContent::Blocks { blocks }
+            let graph = &doc.blocks;
+            if graph.blocks.is_empty() {
+                // Fallback for pre-v5 documents without persisted graph.
+                let segments = store.get_segments(&doc.id)?;
+                let blocks = segments
+                    .iter()
+                    .map(|s| BlockInfo {
+                        index: s.index,
+                        kind: "segment".to_string(),
+                        span_start: s.span.start(),
+                        span_end: s.span.end(),
+                        body: s.body.clone(),
+                    })
+                    .collect();
+                ReadContent::Blocks { blocks }
+            } else {
+                let blocks = graph
+                    .reading_order
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(pos, idx)| {
+                        graph.blocks.get(idx.0).map(|block| BlockInfo {
+                            index: pos,
+                            kind: format!("{:?}", block.kind).to_lowercase(),
+                            span_start: block.span.start(),
+                            span_end: block.span.end(),
+                            body: block.canonical_text.clone(),
+                        })
+                    })
+                    .collect();
+                ReadContent::Blocks { blocks }
+            }
         }
         ReadMode::Outline => {
             let segments = store.get_segments(&doc.id)?;

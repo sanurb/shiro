@@ -5,7 +5,9 @@ use shiro_core::error::ShiroError;
 use shiro_core::fingerprint::ProcessingFingerprint;
 use shiro_core::generation::{GenerationId, IndexGeneration};
 use shiro_core::id::{DocId, SegmentId, VersionId};
-use shiro_core::ir::{BlockGraph, Document, Metadata, Segment};
+use shiro_core::ir::{
+    Block, BlockGraph, BlockIdx, BlockKind, Document, Edge, Metadata, Relation, Segment,
+};
 use shiro_core::manifest::DocState;
 use shiro_core::span::Span;
 use shiro_core::taxonomy::{Concept, ConceptId, ConceptRelation, SkosRelation};
@@ -52,8 +54,60 @@ fn relation_to_sql(rel: &SkosRelation) -> &'static str {
     }
 }
 
+/// SQL string for a `BlockKind`.
+fn block_kind_to_sql(kind: &BlockKind) -> &'static str {
+    match kind {
+        BlockKind::Paragraph => "PARAGRAPH",
+        BlockKind::Heading => "HEADING",
+        BlockKind::ListItem => "LIST_ITEM",
+        BlockKind::TableCell => "TABLE_CELL",
+        BlockKind::Code => "CODE",
+        BlockKind::Caption => "CAPTION",
+        BlockKind::Footnote => "FOOTNOTE",
+    }
+}
+
+/// Parse a `BlockKind` from its SQL string representation.
+fn parse_block_kind(s: &str) -> Result<BlockKind, ShiroError> {
+    match s {
+        "PARAGRAPH" => Ok(BlockKind::Paragraph),
+        "HEADING" => Ok(BlockKind::Heading),
+        "LIST_ITEM" => Ok(BlockKind::ListItem),
+        "TABLE_CELL" => Ok(BlockKind::TableCell),
+        "CODE" => Ok(BlockKind::Code),
+        "CAPTION" => Ok(BlockKind::Caption),
+        "FOOTNOTE" => Ok(BlockKind::Footnote),
+        other => Err(ShiroError::StoreCorrupt {
+            message: format!("unknown BlockKind: {other}"),
+        }),
+    }
+}
+
+/// SQL string for a block `Relation`.
+fn relation_to_edge_sql(rel: &Relation) -> &'static str {
+    match rel {
+        Relation::ReadsBefore => "READS_BEFORE",
+        Relation::CaptionOf => "CAPTION_OF",
+        Relation::FootnoteOf => "FOOTNOTE_OF",
+        Relation::RefersTo => "REFERS_TO",
+    }
+}
+
+/// Parse a block `Relation` from its SQL string representation.
+fn parse_edge_relation(s: &str) -> Result<Relation, ShiroError> {
+    match s {
+        "READS_BEFORE" => Ok(Relation::ReadsBefore),
+        "CAPTION_OF" => Ok(Relation::CaptionOf),
+        "FOOTNOTE_OF" => Ok(Relation::FootnoteOf),
+        "REFERS_TO" => Ok(Relation::RefersTo),
+        other => Err(ShiroError::StoreCorrupt {
+            message: format!("unknown block Relation: {other}"),
+        }),
+    }
+}
+
 /// Current schema version this binary expects.
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 /// A row to be saved in the `search_results` table.
 pub struct SearchResultRow {
@@ -140,6 +194,36 @@ CREATE TABLE IF NOT EXISTS generations (
 CREATE TABLE IF NOT EXISTS active_generations (
     kind TEXT PRIMARY KEY,
     gen_id INTEGER NOT NULL
+);
+";
+
+/// V5 DDL: persist BlockGraph as first-class stored representation (ADR-006).
+const V5_CREATE_TABLES: &str = "
+CREATE TABLE IF NOT EXISTS blocks (
+    doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+    block_idx INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    span_start INTEGER NOT NULL,
+    span_end INTEGER NOT NULL,
+    canonical_text TEXT NOT NULL,
+    rendered_text TEXT,
+    PRIMARY KEY (doc_id, block_idx)
+);
+
+CREATE TABLE IF NOT EXISTS block_edges (
+    doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+    edge_idx INTEGER NOT NULL,
+    from_idx INTEGER NOT NULL,
+    to_idx INTEGER NOT NULL,
+    relation TEXT NOT NULL,
+    PRIMARY KEY (doc_id, edge_idx)
+);
+
+CREATE TABLE IF NOT EXISTS block_reading_order (
+    doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    block_idx INTEGER NOT NULL,
+    PRIMARY KEY (doc_id, position)
 );
 ";
 
@@ -265,6 +349,11 @@ fn run_migrations(conn: &rusqlite::Connection, from_version: u32) -> Result<(), 
             }
         }
 
+        if version == 4 {
+            // v4 → v5: persist BlockGraph (ADR-006)
+            conn.execute_batch(V5_CREATE_TABLES).map_err(map_db)?;
+        }
+
         // Update version after each successful migration.
         conn.execute(
             "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -368,6 +457,9 @@ impl Store {
 
         // V3 tables (idempotent via IF NOT EXISTS)
         conn.execute_batch(V3_CREATE_TABLES).map_err(map_db)?;
+
+        // V5 tables: BlockGraph persistence (ADR-006)
+        conn.execute_batch(V5_CREATE_TABLES).map_err(map_db)?;
         conn.execute_batch(
             "INSERT OR IGNORE INTO active_generations (kind, gen_id) VALUES ('fts', 0);
              INSERT OR IGNORE INTO active_generations (kind, gen_id) VALUES ('vector', 0);",
@@ -436,6 +528,9 @@ impl Store {
             )
             .map_err(map_db)?;
 
+        // Persist BlockGraph atomically with document (ADR-006).
+        self.put_block_graph(&doc.id, &doc.blocks)?;
+
         if !existed {
             let version_id = VersionId::new(&doc.id, 1);
             self.create_version(&doc.id, &version_id, None)?;
@@ -487,6 +582,8 @@ impl Store {
         })?;
         let state = parse_state(&state_str)?;
 
+        let blocks = self.get_block_graph(&doc_id)?;
+
         let doc = Document {
             id: doc_id,
             canonical_text,
@@ -496,7 +593,7 @@ impl Store {
                 source_uri,
                 source_hash,
             },
-            blocks: BlockGraph::empty(),
+            blocks,
             losses: Vec::new(),
         };
 
@@ -630,10 +727,210 @@ impl Store {
         })
     }
 
+    // ── BlockGraph persistence (ADR-006) ───────────────────────────────
+
+    /// Persist a document's BlockGraph. Replaces any existing graph data.
+    ///
+    /// Per ADR-006, the graph is canonical; segments are derived.
+    /// This must be called in the same transaction as put_document/put_segments.
+    pub fn put_block_graph(&self, doc_id: &DocId, graph: &BlockGraph) -> Result<(), ShiroError> {
+        self.with_savepoint("put_block_graph", || {
+            let id = doc_id.as_str();
+
+            // Clear existing graph data for this document.
+            self.conn
+                .execute("DELETE FROM blocks WHERE doc_id = ?1", rusqlite::params![id])
+                .map_err(map_db)?;
+            self.conn
+                .execute(
+                    "DELETE FROM block_edges WHERE doc_id = ?1",
+                    rusqlite::params![id],
+                )
+                .map_err(map_db)?;
+            self.conn
+                .execute(
+                    "DELETE FROM block_reading_order WHERE doc_id = ?1",
+                    rusqlite::params![id],
+                )
+                .map_err(map_db)?;
+
+            // Insert blocks.
+            {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "INSERT INTO blocks (doc_id, block_idx, kind, span_start, span_end, canonical_text, rendered_text)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    )
+                    .map_err(map_db)?;
+                for (i, block) in graph.blocks.iter().enumerate() {
+                    stmt.execute(rusqlite::params![
+                        id,
+                        i as i64,
+                        block_kind_to_sql(&block.kind),
+                        block.span.start() as i64,
+                        block.span.end() as i64,
+                        block.canonical_text,
+                        block.rendered_text,
+                    ])
+                    .map_err(map_db)?;
+                }
+            }
+
+            // Insert edges.
+            {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "INSERT INTO block_edges (doc_id, edge_idx, from_idx, to_idx, relation)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                    )
+                    .map_err(map_db)?;
+                for (i, edge) in graph.edges.iter().enumerate() {
+                    stmt.execute(rusqlite::params![
+                        id,
+                        i as i64,
+                        edge.from.0 as i64,
+                        edge.to.0 as i64,
+                        relation_to_edge_sql(&edge.relation),
+                    ])
+                    .map_err(map_db)?;
+                }
+            }
+
+            // Insert reading order.
+            {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "INSERT INTO block_reading_order (doc_id, position, block_idx)
+                         VALUES (?1, ?2, ?3)",
+                    )
+                    .map_err(map_db)?;
+                for (pos, idx) in graph.reading_order.iter().enumerate() {
+                    stmt.execute(rusqlite::params![id, pos as i64, idx.0 as i64])
+                        .map_err(map_db)?;
+                }
+            }
+
+            Ok(())
+        })
+    }
+
+    /// Load the persisted BlockGraph for a document.
+    ///
+    /// Returns `BlockGraph::empty()` if no graph data exists (e.g. pre-v5 documents).
+    pub fn get_block_graph(&self, doc_id: &DocId) -> Result<BlockGraph, ShiroError> {
+        let id = doc_id.as_str();
+
+        // Load blocks.
+        let blocks = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT block_idx, kind, span_start, span_end, canonical_text, rendered_text
+                     FROM blocks WHERE doc_id = ?1 ORDER BY block_idx",
+                )
+                .map_err(map_db)?;
+            let rows = stmt
+                .query_map(rusqlite::params![id], |row| {
+                    let kind_str: String = row.get(1)?;
+                    let span_start: i64 = row.get(2)?;
+                    let span_end: i64 = row.get(3)?;
+                    let canonical_text: String = row.get(4)?;
+                    let rendered_text: Option<String> = row.get(5)?;
+                    Ok((
+                        kind_str,
+                        span_start,
+                        span_end,
+                        canonical_text,
+                        rendered_text,
+                    ))
+                })
+                .map_err(map_db)?;
+
+            let mut blocks = Vec::new();
+            for row in rows {
+                let (kind_str, span_start, span_end, canonical_text, rendered_text) =
+                    row.map_err(map_db)?;
+                let kind = parse_block_kind(&kind_str)?;
+                let span = Span::new(span_start as usize, span_end as usize).map_err(|e| {
+                    ShiroError::StoreCorrupt {
+                        message: format!("invalid block span: {e}"),
+                    }
+                })?;
+                blocks.push(Block {
+                    canonical_text,
+                    rendered_text,
+                    kind,
+                    span,
+                });
+            }
+            blocks
+        };
+
+        // Load edges.
+        let edges = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT from_idx, to_idx, relation
+                     FROM block_edges WHERE doc_id = ?1 ORDER BY edge_idx",
+                )
+                .map_err(map_db)?;
+            let rows = stmt
+                .query_map(rusqlite::params![id], |row| {
+                    let from: i64 = row.get(0)?;
+                    let to: i64 = row.get(1)?;
+                    let rel_str: String = row.get(2)?;
+                    Ok((from, to, rel_str))
+                })
+                .map_err(map_db)?;
+
+            let mut edges = Vec::new();
+            for row in rows {
+                let (from, to, rel_str) = row.map_err(map_db)?;
+                let relation = parse_edge_relation(&rel_str)?;
+                edges.push(Edge {
+                    from: BlockIdx(from as usize),
+                    to: BlockIdx(to as usize),
+                    relation,
+                });
+            }
+            edges
+        };
+
+        // Load reading order.
+        let reading_order = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT block_idx FROM block_reading_order
+                     WHERE doc_id = ?1 ORDER BY position",
+                )
+                .map_err(map_db)?;
+            let rows = stmt
+                .query_map(rusqlite::params![id], |row| {
+                    let idx: i64 = row.get(0)?;
+                    Ok(BlockIdx(idx as usize))
+                })
+                .map_err(map_db)?;
+
+            rows.collect::<Result<Vec<_>, _>>().map_err(map_db)?
+        };
+
+        Ok(BlockGraph {
+            blocks,
+            edges,
+            reading_order,
+        })
+    }
+
     /// Purge all derived data for a document.
     ///
     /// Removes segments and search_results associated with this doc_id.
     /// The document row itself is preserved (tombstoned as DELETED).
+    /// Note: blocks/edges/reading_order are canonical (ADR-006), not derived.
     pub fn purge_derived(&self, doc_id: &DocId) -> Result<(), ShiroError> {
         self.with_savepoint("purge_derived", || {
             self.conn
@@ -1729,7 +2026,7 @@ mod tests {
     #[test]
     fn test_schema_version() {
         let (store, _f) = tmp_store();
-        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     }
 
     #[test]
@@ -2001,9 +2298,9 @@ mod tests {
             .unwrap();
         }
 
-        // Open should migrate to v4 (through v3)
+        // Open should migrate to current version (through v3, v4, v5)
         let store = Store::open(path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
 
         // Verify new tables exist
         let table_count: i64 = store
@@ -2042,7 +2339,7 @@ mod tests {
         // Migration is idempotent — re-open should not fail
         drop(store);
         let store2 = Store::open(path).unwrap();
-        assert_eq!(store2.schema_version().unwrap(), 4);
+        assert_eq!(store2.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     }
 
     #[test]
@@ -2173,7 +2470,7 @@ mod tests {
 
         // Open triggers v3→v4 migration
         let store = Store::open(path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
 
         // Verify doc_versions table exists and has an entry
         let ver_count: i64 = store
@@ -2223,7 +2520,7 @@ mod tests {
         // Migration is idempotent — re-open should not fail
         drop(store);
         let store2 = Store::open(path).unwrap();
-        assert_eq!(store2.schema_version().unwrap(), 4);
+        assert_eq!(store2.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     }
 
     #[test]
@@ -2496,5 +2793,257 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM concept_closure", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count3, 0);
+    }
+
+    // ── BlockGraph persistence tests (ADR-006) ───────────────────────
+
+    fn test_doc_with_graph(content: &str) -> Document {
+        use shiro_core::ir::{Block, BlockIdx, BlockKind, Edge, Relation};
+        Document {
+            id: DocId::from_content(content.as_bytes()),
+            canonical_text: content.to_string(),
+            rendered_text: None,
+            metadata: Metadata {
+                title: Some("Graph Test".to_string()),
+                source_uri: "test.md".to_string(),
+                source_hash: blake3::hash(content.as_bytes()).to_hex().to_string(),
+            },
+            blocks: BlockGraph {
+                blocks: vec![
+                    Block {
+                        canonical_text: "Hello".to_string(),
+                        rendered_text: None,
+                        kind: BlockKind::Heading,
+                        span: Span::new(0, 5).unwrap(),
+                    },
+                    Block {
+                        canonical_text: " world".to_string(),
+                        rendered_text: Some("world".to_string()),
+                        kind: BlockKind::Paragraph,
+                        span: Span::new(5, 11).unwrap(),
+                    },
+                ],
+                edges: vec![Edge {
+                    from: BlockIdx(0),
+                    to: BlockIdx(1),
+                    relation: Relation::ReadsBefore,
+                }],
+                reading_order: vec![BlockIdx(0), BlockIdx(1)],
+            },
+            losses: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_block_graph_roundtrip() {
+        let (store, _f) = tmp_store();
+        let doc = test_doc_with_graph("Hello world");
+
+        store.put_document(&doc, DocState::Staged).unwrap();
+
+        let graph = store.get_block_graph(&doc.id).unwrap();
+        assert_eq!(graph.blocks.len(), 2);
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.reading_order.len(), 2);
+
+        // Verify block content
+        assert_eq!(graph.blocks[0].canonical_text, "Hello");
+        assert_eq!(graph.blocks[0].kind, BlockKind::Heading);
+        assert_eq!(graph.blocks[0].span.start(), 0);
+        assert_eq!(graph.blocks[0].span.end(), 5);
+        assert!(graph.blocks[0].rendered_text.is_none());
+
+        assert_eq!(graph.blocks[1].canonical_text, " world");
+        assert_eq!(graph.blocks[1].kind, BlockKind::Paragraph);
+        assert_eq!(graph.blocks[1].rendered_text.as_deref(), Some("world"));
+
+        // Verify edge
+        assert_eq!(graph.edges[0].from, BlockIdx(0));
+        assert_eq!(graph.edges[0].to, BlockIdx(1));
+        assert_eq!(graph.edges[0].relation, Relation::ReadsBefore);
+
+        // Verify reading order
+        assert_eq!(graph.reading_order, vec![BlockIdx(0), BlockIdx(1)]);
+    }
+
+    #[test]
+    fn test_block_graph_empty_roundtrip() {
+        let (store, _f) = tmp_store();
+        let doc = test_doc("empty graph doc");
+
+        store.put_document(&doc, DocState::Staged).unwrap();
+
+        let graph = store.get_block_graph(&doc.id).unwrap();
+        assert!(graph.blocks.is_empty());
+        assert!(graph.edges.is_empty());
+        assert!(graph.reading_order.is_empty());
+    }
+
+    #[test]
+    fn test_block_graph_persisted_with_document() {
+        let (store, _f) = tmp_store();
+        let doc = test_doc_with_graph("Hello world");
+
+        store.put_document(&doc, DocState::Staged).unwrap();
+
+        // get_document should return the full graph
+        let (loaded, _state) = store.get_document(&doc.id).unwrap();
+        assert_eq!(loaded.blocks.blocks.len(), 2);
+        assert_eq!(loaded.blocks.edges.len(), 1);
+        assert_eq!(loaded.blocks.reading_order.len(), 2);
+    }
+
+    #[test]
+    fn test_block_graph_replaced_on_reput() {
+        let (store, _f) = tmp_store();
+        let doc = test_doc_with_graph("Hello world");
+
+        store.put_document(&doc, DocState::Staged).unwrap();
+
+        // Re-put with empty graph
+        let mut doc2 = doc.clone();
+        doc2.blocks = BlockGraph::empty();
+        store.put_document(&doc2, DocState::Ready).unwrap();
+
+        let graph = store.get_block_graph(&doc.id).unwrap();
+        assert!(graph.blocks.is_empty());
+    }
+
+    #[test]
+    fn test_block_graph_all_block_kinds() {
+        use shiro_core::ir::{Block, BlockIdx, BlockKind};
+        let (store, _f) = tmp_store();
+
+        let kinds = [
+            BlockKind::Paragraph,
+            BlockKind::Heading,
+            BlockKind::ListItem,
+            BlockKind::TableCell,
+            BlockKind::Code,
+            BlockKind::Caption,
+            BlockKind::Footnote,
+        ];
+
+        let content = "x".repeat(kinds.len());
+        let doc_id = DocId::from_content(content.as_bytes());
+        let graph = BlockGraph {
+            blocks: kinds
+                .iter()
+                .enumerate()
+                .map(|(i, &kind)| Block {
+                    canonical_text: "x".to_string(),
+                    rendered_text: None,
+                    kind,
+                    span: Span::new(i, i + 1).unwrap(),
+                })
+                .collect(),
+            edges: vec![],
+            reading_order: (0..kinds.len()).map(BlockIdx).collect(),
+        };
+
+        let doc = Document {
+            id: doc_id.clone(),
+            canonical_text: content,
+            rendered_text: None,
+            metadata: Metadata {
+                title: None,
+                source_uri: "test.md".to_string(),
+                source_hash: "test".to_string(),
+            },
+            blocks: graph,
+            losses: Vec::new(),
+        };
+
+        store.put_document(&doc, DocState::Staged).unwrap();
+
+        let loaded = store.get_block_graph(&doc_id).unwrap();
+        for (i, &expected_kind) in kinds.iter().enumerate() {
+            assert_eq!(
+                loaded.blocks[i].kind, expected_kind,
+                "kind mismatch at index {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_block_graph_all_edge_relations() {
+        use shiro_core::ir::{Block, BlockIdx, BlockKind, Edge, Relation};
+        let (store, _f) = tmp_store();
+
+        let relations = [
+            Relation::ReadsBefore,
+            Relation::CaptionOf,
+            Relation::FootnoteOf,
+            Relation::RefersTo,
+        ];
+
+        let content = "abcde";
+        let doc_id = DocId::from_content(content.as_bytes());
+        let graph = BlockGraph {
+            blocks: vec![
+                Block {
+                    canonical_text: "a".to_string(),
+                    rendered_text: None,
+                    kind: BlockKind::Paragraph,
+                    span: Span::new(0, 1).unwrap(),
+                },
+                Block {
+                    canonical_text: "b".to_string(),
+                    rendered_text: None,
+                    kind: BlockKind::Paragraph,
+                    span: Span::new(1, 2).unwrap(),
+                },
+            ],
+            edges: relations
+                .iter()
+                .enumerate()
+                .map(|(_, &rel)| Edge {
+                    from: BlockIdx(0),
+                    to: BlockIdx(1),
+                    relation: rel,
+                })
+                .collect(),
+            reading_order: vec![BlockIdx(0), BlockIdx(1)],
+        };
+
+        let doc = Document {
+            id: doc_id.clone(),
+            canonical_text: content.to_string(),
+            rendered_text: None,
+            metadata: Metadata {
+                title: None,
+                source_uri: "test.md".to_string(),
+                source_hash: "test".to_string(),
+            },
+            blocks: graph,
+            losses: Vec::new(),
+        };
+
+        store.put_document(&doc, DocState::Staged).unwrap();
+
+        let loaded = store.get_block_graph(&doc_id).unwrap();
+        assert_eq!(loaded.edges.len(), relations.len());
+        for (i, &expected_rel) in relations.iter().enumerate() {
+            assert_eq!(
+                loaded.edges[i].relation, expected_rel,
+                "relation mismatch at index {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_block_graph_survives_purge_derived() {
+        let (store, _f) = tmp_store();
+        let doc = test_doc_with_graph("Hello world");
+
+        store.put_document(&doc, DocState::Staged).unwrap();
+
+        // Purge derived data (segments, search_results).
+        // Per ADR-006, blocks are canonical, NOT derived — they must survive.
+        store.purge_derived(&doc.id).unwrap();
+
+        let graph = store.get_block_graph(&doc.id).unwrap();
+        assert_eq!(graph.blocks.len(), 2, "blocks must survive purge_derived");
+        assert_eq!(graph.edges.len(), 1, "edges must survive purge_derived");
     }
 }
