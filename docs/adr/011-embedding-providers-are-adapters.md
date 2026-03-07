@@ -5,49 +5,71 @@
 
 ## Context
 
-Ollama is a popular tool for running LLM and embedding models locally. Its rise has made local-first embedding operationally attractive, and shiro targets a local-first use case. However, Ollama is not the only viable embedding provider: OpenAI, compatible self-hosted endpoints (e.g., llama.cpp server, vLLM, Mistral), and future runtimes are all legitimate deployment targets.
+Ollama is a popular tool for running embedding models locally. Its rise has made local-first embedding operationally attractive, and shiro targets a local-first use case. However, Ollama is not the only viable embedding provider: OpenAI, compatible self-hosted endpoints (llama.cpp server, vLLM, Mistral), and future runtimes are all legitimate deployment targets.
 
-Architecturally coupling shiro to Ollama would mean:
-- Assuming a specific runtime is installed on the user's machine
-- Assuming local inference is the canonical deployment mode
-- Encoding provider-specific behavior into retrieval and indexing logic
+Architecturally coupling shiro to any single provider would mean:
 
-`HttpEmbedder` in `shiro-embed` already targets any OpenAI-compatible `/v1/embeddings` endpoint. Ollama exposes this same interface. This means Ollama support is already present through the generic adapter — no special-casing is required.
+- Assuming a specific runtime is installed on the user's machine.
+- Assuming local inference is the only deployment mode.
+- Encoding provider-specific behavior into retrieval and indexing logic.
 
-The `Embedder` trait in `shiro-core::ports` defines the correct abstraction boundary: `embed()`, `embed_batch()`, and `dimensions()`. Any implementation behind that boundary is a swappable adapter.
+Ollama already exposes an OpenAI-compatible embedding endpoint, which means Ollama support is available through a generic HTTP adapter with no special-casing required. This observation generalizes: any provider that speaks the same HTTP contract is supported without additional code.
 
 ## Decision
 
-- shiro must not depend on Ollama as the canonical or required embedding architecture.
-- shiro supports Ollama-compatible endpoints as one concrete `Embedder` adapter via `HttpEmbedder` in `shiro-embed`, which targets any OpenAI-compatible `/v1/embeddings` endpoint. No Ollama-specific SDK dependency is introduced.
-- The canonical embedding boundary is the `Embedder` trait in `shiro-core::ports`. All retrieval and indexing logic (`shiro-sdk` fusion via RRF, `shiro-index` generation tracking, `shiro-embed::FlatIndex`) must program against this trait exclusively.
-- All embedding outputs must carry provider, model, and fingerprint metadata (via `ProcessingFingerprint { parser_name, parser_version, segmenter_version }` extended with embedder identity) to enable correctness checks across provider changes.
-- Embedding identity must not be inferred from model name alone. Dimension count and versioned fingerprint together constitute identity.
+**Boundary:** This ADR governs the interface between shiro's retrieval/indexing core and all embedding generation. The Embedder trait is the ONLY interface that crosses this boundary. No code above the trait boundary — in the SDK, indexing, storage, or CLI layers — may import, reference, or depend on any specific embedding provider.
+
+**What is canonical:** The Embedder trait is the **canonical** (**canonical**: the representation that wins when others disagree; the authority from which all others are derived or rebuilt) abstraction for embedding generation. All retrieval and indexing logic programs against this trait exclusively.
+
+**What is derived:** Concrete provider adapters (HTTP-based, stub, or future implementations) are **derived** (**derived**: a representation computed from canonical data; rebuildable, not authoritative) in the architectural sense — they are pluggable implementations selected by configuration, not by code changes.
+
+**What is allowed:**
+
+- Any embedding provider that implements the Embedder trait is a valid adapter.
+- Provider selection is a configuration concern, resolved at application startup.
+- A test double implementing the Embedder trait is the standard mechanism for provider-independent testing.
+
+**What is forbidden:**
+
+- No direct dependency from the retrieval core (SDK, indexing, storage) to any specific provider.
+- No assumption that any particular provider is installed on the host system.
+- No assumption that local inference is the only deployment mode.
+- No embedding identity inferred from model name alone — dimensions and a versioned fingerprint together constitute identity (see ADR-012).
+
+All embedding outputs must carry provider, model, and fingerprint metadata to enable correctness checks across provider changes. Embedding identity must not be inferred from model name alone; dimension count and versioned fingerprint together constitute identity (detailed in ADR-012).
+
+### Architecture Invariants
+
+- The Embedder trait is the sole abstraction boundary. Adding a new provider means implementing this trait. No changes to indexing, retrieval, or storage logic are required or permitted.
+- Switching providers requires re-embedding all content. There is no migration path that preserves vectors across provider changes. This is a fundamental constraint: different providers produce incompatible vector spaces, and no transformation can reliably map between them.
+- All vectors in a single index must share one embedding fingerprint (enforced by ADR-012). Mixed-provider indices are forbidden.
 
 ### Deliberate Absences
 
-- No direct dependency from retrieval core (`shiro-sdk`, `shiro-index`) to Ollama or any specific provider.
-- No assumption that Ollama is installed on the host system.
-- No assumption that local inference is the only deployment mode.
-- No embedding identity inferred from model name alone — dimensions and versioned fingerprint constitute identity.
+- No provider is architecturally privileged. The system does not prefer, recommend, or default to any specific provider at the architectural level. Default provider selection is a CLI/configuration concern.
+- No assumption that local inference is always available or preferred.
+- No provider discovery or auto-detection mechanism.
+- No embedding transport protocol is mandated beyond the trait contract. HTTP is the current implementation; other transports (gRPC, in-process) require a new Embedder implementation, not changes to this decision.
 
 ## Consequences
 
-- Any OpenAI-compatible embedding endpoint (Ollama, OpenAI, llama.cpp, vLLM) works out of the box via `HttpEmbedderConfig { base_url, model, api_key, dimensions }` with no code changes.
-- Adding a new provider means implementing `Embedder` — no changes to `shiro-index`, `shiro-sdk`, or `shiro-store`.
-- `StubEmbedder` in `shiro-embed` remains the canonical test double; tests are provider-independent.
-- `FlatIndex` in `shiro-embed` stores vectors without encoding provider assumptions; dimension mismatch is detected at upsert time via `dimensions()`.
-- Deployments that change provider or model must re-embed all segments, detectable via fingerprint mismatch in `documents.fingerprint`.
+- **Product outcome:** Users can switch from Ollama to OpenAI (or any compatible provider) by changing configuration, not code. A local-first user who later adopts a cloud provider, or vice versa, faces a re-embedding step but no architectural migration.
+- Any OpenAI-compatible embedding endpoint works with no code changes — only configuration (endpoint URL, model name, API key, dimensions).
+- Adding a new provider means implementing a single trait. No changes to indexing, storage, or retrieval logic.
+- **Migration cost:** Switching providers requires re-embedding all indexed content. For large knowledge bases, this is a significant time and compute cost. The system detects this via fingerprint mismatch (ADR-012) and blocks mixed-provider search.
+- **Complexity cost:** The trait boundary introduces an indirection layer. Provider-specific diagnostics (rate limiting, authentication errors, model availability) must be surfaced through a generic error interface, which can obscure root causes.
+- **Testing cost:** A test double must faithfully implement the Embedder trait including fingerprint generation. Tests that depend on specific vector values are inherently provider-coupled and should be avoided.
+- **API surface cost:** The Embedder trait is a public contract. Changes to it (new required methods, signature changes) are breaking for all provider implementations.
 
 ## Alternatives Considered
 
-- **Direct Ollama SDK integration**: Tight coupling to Ollama's native client. Breaks non-Ollama deployments, forks the adapter surface, and adds a runtime installation assumption. Rejected.
-- **ONNX runtime embedding**: Embeds model inference into the binary, eliminating the external dependency. Introduces a large native dependency, single-runtime assumption, and model distribution complexity. Not appropriate for shiro's scope. Rejected.
-- **Provider enum dispatch** (`enum EmbedderKind { Ollama, OpenAI, ... }`): Premature. Encodes provider knowledge into the core and requires code changes for every new provider. The `Embedder` trait already provides open dispatch without an enum. Rejected.
+- **Direct Ollama SDK integration.** Tight coupling to Ollama's native client. Breaks non-Ollama deployments, forks the adapter surface, and adds a runtime installation assumption. Choosing this means every future provider requires a separate integration path, and Ollama becomes a hard dependency for development and testing.
+- **ONNX runtime embedding.** Embeds model inference directly into the binary, eliminating the external provider dependency entirely. This has a genuine advantage: fully offline operation with no network dependency and predictable latency. However, it introduces a large native dependency, constrains model selection to ONNX-exported models, and adds model distribution complexity (bundling or downloading weights). Not appropriate for shiro's current scope, but remains a plausible future Embedder implementation behind the same trait boundary.
+- **Provider enum dispatch.** Encodes provider knowledge into the core via an enumeration of known providers. Requires code changes for every new provider. The Embedder trait already provides open dispatch without an enum, making this strictly less flexible with no compensating benefit.
 
 ## Non-Goals
 
 - Embedding a model runtime into the shiro binary.
 - Providing a model selection or provider discovery UI.
 - Auto-detecting available providers on the host system.
-- Supporting non-HTTP embedding transports (e.g., shared memory, gRPC) — those require a new `Embedder` implementation, not changes to this decision.
+- Supporting non-HTTP embedding transports in this decision — those are future Embedder implementations, not changes to the adapter architecture.

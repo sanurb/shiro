@@ -185,21 +185,21 @@ Decision records live in [`docs/adr/`](adr/). Each is immutable except for statu
 - [ADR-001: Document Graph IR over Tree Model](adr/001-document-graph-ir.md)
 - [ADR-002: SQLite as Source of Truth](adr/002-sqlite-source-of-truth.md)
 - [ADR-003: FlatIndex as Correctness Baseline](adr/003-flatindex-correctness-baseline.md)
-- [ADR-004: Processing Fingerprints Separate from DocId](adr/004-processing-fingerprints.md)
+- [ADR-004: Processing Fingerprints Separate from Content Identity](adr/004-processing-fingerprints.md)
 - [ADR-005: Generation-Based Index Publish](adr/005-generation-based-index-publish.md)
 
 ### Proposed
 
 - [ADR-006: Persist the Document Graph as a First-Class Stored Representation](adr/006-persist-document-graph.md)
 - [ADR-007: Treat EntryPoint as the Primary Retrieval Result](adr/007-entrypoint-as-retrieval-primitive.md)
-- [ADR-011: Embedding Providers Are Adapters; Ollama Is Supported but Not Canonical](adr/011-embedding-providers-are-adapters.md)
-- [ADR-012: Define a Canonical Embedding Contract and Fingerprint](adr/012-canonical-embedding-contract.md)
-- [ADR-014: Define the Hybrid Retrieval Contract](adr/014-hybrid-retrieval-contract.md)
+- [ADR-011: Embedding Providers Are Adapters](adr/011-embedding-providers-are-adapters.md)
+- [ADR-012: Canonical Embedding Contract and Fingerprint](adr/012-canonical-embedding-contract.md)
+- [ADR-014: Hybrid Retrieval Contract](adr/014-hybrid-retrieval-contract.md)
 - [ADR-020: Every Write Has Provenance Metadata](adr/020-every-write-has-provenance.md)
 - [ADR-021: Partition Memory into Trust Zones](adr/021-partition-memory-into-trust-zones.md)
 - [ADR-027: Benchmarking Is a Release Gate](adr/027-benchmarking-is-a-release-gate.md)
 - [ADR-029: Configuration Is Typed, Versioned, and Migrated](adr/029-configuration-typed-versioned-migrated.md)
-- [ADR-031: npm Distribution Strategy for a Rust CLI](adr/031-npm-distribution-strategy.md)
+- [ADR-031: npm Distribution Strategy](adr/031-npm-distribution-strategy.md)
 
 ### Planned (not yet written)
 

@@ -5,49 +5,63 @@
 
 ## Context
 
-`shiro-store` currently records `provider` (heuristic/llm) and `content_hash` on enrichment rows, but all other write paths — document ingest, segment creation, concept assignments, agent-generated artifacts produced via `shiro.execute` — carry no structured provenance. An agent operating through the MCP `shiro.execute` interface can mutate stored data in ways that are indistinguishable from user-initiated writes. For a local-first knowledge engine whose value is the integrity of its knowledge graph, the inability to answer "who wrote this, via what operation, and when" is a correctness gap, not just a missing feature.
+The knowledge base currently tracks processing metadata (parser identity, content hashes) on some write paths, but most mutations — document ingest, segment creation, concept assignments, agent-generated artifacts — carry no structured provenance. An agent operating through the execution interface can mutate stored data in ways that are indistinguishable from user-initiated writes.
 
-`DocState` transitions (Staged → Indexing → Ready/Failed → Deleted) are tracked but the actor driving each transition is not. `ProcessingFingerprint { parser_name, parser_version, segmenter_version }` captures determinism of the parse pipeline but not the initiating actor.
+For a local-first knowledge engine whose value depends on the integrity of its knowledge graph, the inability to answer "who wrote this, via what operation, and when" is a correctness gap, not a missing feature. Document lifecycle transitions are tracked but the actor driving each transition is not. Processing fingerprints capture determinism of the parse pipeline but not the initiating actor.
 
 ## Decision
 
-Every write operation MUST attach a provenance record with the following fields:
+**Principle:** Every mutation to the knowledge base must record who initiated it, through what operation, and when. The provenance record is immutable once written.
 
-- `actor`: one of `user`, `system`, or `agent:<id>` — identifies the write initiator
-- `operation`: the SDK operation name (e.g., `ingest_document`, `assign_concept`, `enrich`) that produced the write
-- `timestamp`: UTC Unix milliseconds at time of write
-- `source_hash`: blake3 content hash of the input artifact at time of write (mirrors `DocId` / `SegmentId` conventions already in `id.rs`)
+Every write operation MUST attach a *provenance record* — a structured annotation that identifies the origin of a mutation. Conceptually, a provenance record contains:
 
-Provenance is required on the following entities:
+- **Actor**: the identity of the write initiator — a human user, the system itself, or a specific agent instance.
+- **Operation**: the logical operation that produced the write (e.g., ingest, segmentation, enrichment, concept assignment).
+- **Timestamp**: the UTC time at which the write occurred.
+- **Content hash**: a cryptographic hash of the input artifact at time of write, linking the provenance record to the specific content version it describes.
 
-- **documents** (`shiro-store`): ingest source and initiating actor
-- **segments** (`shiro-store`): derived from which parse invocation and which `parser_name`/`parser_version`
-- **enrichments** (`shiro-store`): already has `provider` and `content_hash`; these are subsumed into the unified provenance schema
-- **concept assignments** (`shiro-store` `doc_concepts` / taxonomy): who assigned, via what SDK operation
-- **agent-generated artifacts**: MCP execution trace records linking `shiro.execute` call to written rows
+Provenance is required on all stored entities: documents, segments, enrichments, concept assignments, and any agent-generated artifacts.
 
-Provenance is stored in SQLite (`shiro-store`) alongside the records it describes — either as additional columns on existing tables or as a `provenance` join table keyed by `(entity_type, entity_id)`. It is NOT stored in the Tantivy index (`shiro-index`) or the `FlatIndex` JSONL file (`shiro-embed`).
+Provenance records are **append-only**. Corrections do not mutate existing provenance records; they create new records with updated content and a reference to the superseded record. The superseded record is retained indefinitely.
 
-Provenance records are **immutable once written**. Corrections do not UPDATE existing rows; they INSERT new records with updated content and a reference to the superseded record. The superseded record is retained.
+Provenance is stored in the **authoritative store only** — the same persistent store that holds content. It is NOT stored in derived indices (search indices, embedding indices). *Derived* here means representations computed from authoritative data that can be rebuilt; provenance in those indices would be redundant and would diverge on rebuild.
+
+### Architecture Invariants
+
+- **Every write has provenance.** No mutation to the knowledge base may exist without an associated provenance record. A stored entity without provenance is a data integrity violation.
+- **Provenance is immutable and append-only.** Once written, a provenance record is never modified or deleted. Corrections produce new records that reference the superseded one.
+- **Provenance lives in the authoritative store only.** Derived indices do not store provenance. On rebuild, derived indices are recomputed from authoritative data; provenance remains in the authoritative store and does not need to be reconstructed.
+- **Provenance is queryable.** Provenance records are accessible through the same query interface as content. Users and agents can filter, join, and inspect provenance without out-of-band access to logs or external systems.
+- **Actor identity is structured.** The actor field distinguishes human-initiated writes, system-initiated writes, and agent-initiated writes. This distinction is the foundation for trust zone classification (ADR-021).
+
+### Deliberate Absences
+
+- The physical storage layout of provenance (additional columns vs. join table) is not decided by this ADR. Implementations may choose either approach.
+- Provenance retention policy (how long superseded records are kept) is not specified. The current decision is to retain indefinitely; a future ADR may introduce compaction.
+- Provenance-based access control is not specified. Trust zones (ADR-021) use provenance for classification but access control is a separate concern.
+- Read-path provenance (tracking who queried what) is not in scope.
+- Propagation of provenance through derived indices is explicitly excluded.
 
 ## Consequences
 
-- Full audit trail for all mutations is queryable via SQL against `shiro-store`.
-- Agent-generated content (actor prefix `agent:`) is distinguishable from user and system content at query time without out-of-band logging.
-- `explain` output from SDK executor can surface the provenance chain for any retrieved segment or enrichment.
-- Storage overhead is one provenance row per write event — modest relative to segment and enrichment volume.
-- Schema migration required: existing tables (documents, segments, doc_concepts) need provenance columns or a join table; schema_meta version bumps past v4.
-- The `enrichments` table `provider` column becomes a derived view of the unified provenance `actor` field to avoid redundancy.
+- **Users can answer "who added this and when."** For any piece of content in the knowledge base — a document, a segment, an enrichment, a concept assignment — the provenance record identifies the actor, operation, and timestamp. This is the foundation for audit, trust, and debugging.
+- **Agent-generated content is distinguishable.** Writes initiated by agents carry agent-specific actor identity, enabling downstream systems (including trust zones, ADR-021) to classify content by origin without heuristics.
+- **Explain output can surface provenance.** The retrieval explain payload can include the provenance chain for any retrieved segment or enrichment, giving consumers full visibility into content origin.
+- **Migration cost:** Existing stored entities lack provenance. Migration must backfill existing records with a system actor and a migration operation marker. Records that predate provenance are distinguishable from records that were intentionally written by the system.
+- **Storage cost:** One provenance record per write event. Modest relative to segment and enrichment volume, but grows monotonically due to the append-only invariant.
+- **Complexity cost:** Every write path in the system must be instrumented to produce provenance. Missing instrumentation is a bug, not a missing feature. This adds a testing burden to every new write operation.
+- **Schema cost:** Existing storage tables require schema changes to accommodate provenance. This is a breaking migration.
+- **API surface cost:** Query interfaces must support provenance filtering and joining. The explain contract expands to include provenance data.
 
 ## Alternatives Considered
 
-- **Log-only audit (stderr/tracing):** Captures events but is not queryable, not durable across restarts, and not joinable to stored content. Rejected — logs are ephemeral, storage is the system of record.
-- **Provenance in a separate system (e.g., external append-only log):** Splits the source of truth. Queries that need to join content with provenance require cross-system coordination. Rejected — shiro is local-first; a single SQLite database is the right boundary.
-- **No provenance:** Acceptable for a single-user toy system. Not acceptable for a production knowledge engine where agent writes are possible and trust matters.
+- **Log-only audit (stderr/tracing):** Captures events but is not queryable, not durable across restarts, and not joinable to stored content. Logs are ephemeral; the authoritative store is the system of record. Would satisfy debugging needs in the short term but cannot support trust zone classification or structured audit.
+- **Provenance in derived indices as well:** Would place provenance records in both the authoritative store and derived indices (search index, embedding index). Rejected because derived indices are rebuildable artifacts — provenance stored there would be duplicated and would diverge on rebuild. The authoritative store is the single source of truth for provenance.
+- **Provenance in a separate external system (append-only log):** Splits the source of truth. Queries that need to join content with provenance require cross-system coordination. Rejected — shiro is local-first; a single persistent store is the right boundary.
 
 ## Non-Goals
 
-- Not implementing a full event-sourcing or CQRS architecture. SQLite remains the primary store; there is no event log that can replay state.
+- Not implementing a full event-sourcing or CQRS architecture. The persistent store remains the primary store; there is no event log that can replay state.
 - Not tracking read operations. Provenance applies to writes only.
 - Not implementing provenance-based access control. Trust zones are addressed in ADR-021.
-- Not propagating provenance through derived indices. Tantivy and FlatIndex are rebuildable artifacts; provenance lives in the authoritative store only.
+- Not propagating provenance through derived indices. Search and embedding indices are rebuildable; provenance lives in the authoritative store only.

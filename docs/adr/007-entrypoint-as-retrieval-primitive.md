@@ -5,52 +5,69 @@
 
 ## Context
 
-Current search returns segment-level results: a `SegmentId` plus BM25 and vector scores. The consumer must then resolve back to document and block context independently. The `explain` command returns raw index artifacts — `result_id`, `doc_id`, `segment_id`, `block_id`, `span` — alongside scoring and expansion data.
+Current search returns segment-level results: a segment identifier plus scoring data. The consumer must then resolve back to a document and block context independently. Segments are an indexing artifact whose granularity is chosen to serve recall, not presentation. A segment boundary need not align with a natural reading boundary.
 
-Segments are an indexing artifact whose granularity is chosen to serve recall, not presentation. A segment boundary need not align with a natural reading boundary. When a consumer (human or agent) receives a `SegmentId`, it holds an opaque chunk reference with no directly usable reading position. Context expansion (via `--expand`) already reconstructs surrounding `BlockIdx` values from the persisted `BlockGraph` in reading order, bounded by `max_blocks` and `max_chars`; that result is discarded rather than made first-class.
+When a consumer (human or agent) receives a segment identifier, it holds an opaque chunk reference with no directly usable reading position. Context expansion already reconstructs surrounding blocks from the persisted BlockGraph in reading order, but that result is discarded rather than made first-class.
 
-Tying the public retrieval result shape to the indexing unit couples consumers to internal implementation choices and makes any future change to segmentation strategy a breaking API change.
+Tying the public retrieval result shape to the internal indexing unit couples consumers to implementation choices and makes any future change to segmentation strategy a breaking API change.
 
 ## Decision
 
-Retrieval MUST return an `EntryPoint` as its primary result type. An `EntryPoint` is the best entry position into a document for a given query — not only a document id or a chunk reference.
+**Boundary:** This ADR governs the shape of every retrieval result that crosses the SDK boundary. Anything above the SDK (CLI, MCP server, external consumers) sees EntryPoints. Anything below (indexing, storage, segment management) may use internal representations freely.
 
-`EntryPoint` is defined as:
+An **EntryPoint** is defined as: the best position in a document to begin reading in response to a query, including enough surrounding context for comprehension. It is the public retrieval result — the single type that consumers receive.
 
-```
-EntryPoint {
-    doc_id:         DocId,
-    block_id:       BlockIdx,       // the specific block that matched
-    span:           Span,           // byte range into canonical_text
-    context_window: Vec<BlockIdx>,  // surrounding blocks for readability
-    scores:         ScoringMetadata,
-}
-```
+An EntryPoint carries the following information:
 
-- `segment_id` is internal to the indexing layer (`shiro-index`, `shiro-store`); it MUST NOT appear in the public retrieval result.
-- `explain` MUST render an `EntryPoint`, not raw index artifacts.
-- Context expansion (currently `--expand`) produces the `context_window` field of the `EntryPoint`; it is no longer a separate post-processing step.
-- `ScoringMetadata` carries fused RRF score, individual BM25 and vector ranks, and any expansion provenance needed for explanation.
-- The `search_results` table in `shiro-store` evolves to store `EntryPoint` data rather than raw segment matches.
+- **Document identity** — which document the result belongs to (as a DocId).
+- **Block position** — which specific block matched the query.
+- **Text span** — the byte range within the block's canonical text that is most relevant.
+- **Context window** — an ordered sequence of surrounding blocks providing reading context, derived from the BlockGraph in reading order.
+- **Scoring metadata** — fused retrieval score, individual ranking components, and any provenance needed for explanation or debugging.
+
+**What is canonical:** The EntryPoint is the canonical (**canonical**: the representation that wins when others disagree; the authority from which all others are derived or rebuilt) retrieval result. All public APIs, CLI output, and MCP responses return EntryPoints.
+
+**What is derived:** The EntryPoint itself is **derived** (**derived**: a representation computed from canonical data; rebuildable, not authoritative) — it is computed at query time from the persisted BlockGraph and index scores. It is not stored as a persistent entity; it is assembled on demand.
+
+**What is allowed:** Consumers may depend on the stable shape of an EntryPoint. Internal indexing layers may use segment identifiers, block indices, and any internal representation they choose.
+
+**What is forbidden:** Segment identifiers MUST NOT appear in any public retrieval result. No consumer above the SDK boundary may be required to resolve a segment identifier to obtain a reading position. Explanation and debugging output MUST render EntryPoints, not raw index artifacts.
+
+Context expansion is an integral part of EntryPoint construction, not a separate post-processing step.
+
+### Architecture Invariants
+
+- An EntryPoint MUST resolve to a valid block in a persisted BlockGraph (hard dependency on ADR-006). An EntryPoint that references a block not present in the graph is a system error, not a degraded result.
+- If the BlockGraph for a document is not yet persisted (ADR-006 implementation incomplete), the system MUST NOT return an EntryPoint for that document. It is acceptable to fall back to segment-level results in an internal or transitional mode, but such results MUST NOT be exposed through the public API as EntryPoints.
+- When representations disagree, the persisted BlockGraph is the source of truth for block ordering and context window construction.
+- Consumers MAY assume that every block referenced in an EntryPoint's context window exists and is ordered for reading. Consumers MUST NOT assume the context window is exhaustive — it is bounded by retrieval-time constraints.
+
+### Deliberate Absences
+
+- The internal mechanism by which a segment match is resolved to a block position is not specified. Implementations may use direct lookup, graph traversal, or any strategy that satisfies the invariants above.
+- The maximum size of the context window is not specified here. It is a runtime or configuration concern.
+- The serialization format of an EntryPoint (JSON field names, nesting) is not specified. That is an API-layer decision.
+- Scoring metadata composition (which components, how fused) is not specified beyond requiring that the fused score and individual ranking components be present.
 
 ## Consequences
 
-- Consumers receive a directly usable reading position (`block_id` + `span` + `context_window`) without additional resolution calls.
+- **Product outcome:** A user or agent receives a reading position they can use directly — a precise location in a document with surrounding context — instead of an opaque chunk reference that requires further resolution.
 - Decouples the public retrieval result shape from the indexing strategy: segmentation granularity can change without breaking consumers.
-- Requires a persisted `BlockGraph` (ADR-006) to resolve `block_id` from a segment match at query time; this is a hard dependency.
-- `search_results` table schema must be extended or migrated to store `EntryPoint` fields; schema version in `schema_meta` advances accordingly.
-- `shiro-sdk` executor and DSL interpreter consume `EntryPoint` directly; downstream spec results no longer require a resolution step.
-- `shiro-cli` JSON envelope changes: the `segments` field in search output is replaced by `entry_points`.
+- **Hard dependency on ADR-006:** Requires a persisted BlockGraph to resolve block positions from segment matches at query time. Until ADR-006 is fully implemented, EntryPoint construction for documents without a persisted graph is blocked.
+- **Migration cost:** Existing search result storage and CLI output schemas must change. Consumers depending on segment-level output will break and must be updated.
+- **Complexity cost:** Query-time EntryPoint construction adds a resolution step (segment → block → context window) that did not previously exist. This is a new failure mode if the graph is missing or inconsistent.
+- **Performance cost:** Assembling context windows requires reading the BlockGraph at query time, adding I/O and computation to every search request.
+- One best EntryPoint per document per query is the model. Multi-entry-point ranking within a single document is out of scope.
 
 ## Alternatives Considered
 
-- **Return document id only.** Consumer performs all resolution. Maximally decoupled but shifts burden entirely to callers; no universal resolution API exists today.
-- **Return segment id only (current behavior).** Ties every consumer to the indexing strategy. Any change to segmentation is a breaking change for all callers.
-- **Return page number.** PDF-specific. `MarkdownParser` has no page concept; this alternative is not universally applicable across `Parser` implementations.
+- **Return segment identifier plus document identifier (status quo).** This is the current behavior. Every consumer must independently resolve segment identifiers to reading positions. Any change to segmentation is a breaking change for all callers. The resolution logic is duplicated across consumers. Choosing this alternative means accepting permanent coupling between consumers and the indexing strategy.
+- **Return document identifier only.** Consumer performs all resolution. Maximally decoupled but shifts the entire burden to callers. No universal resolution API exists, so each consumer would need to implement its own block-level navigation. This makes shiro a document finder, not a knowledge retrieval engine.
+- **Return page number.** PDF-specific. Markdown and other non-paginated formats have no page concept. This alternative is not universally applicable across parser implementations and would require format-specific branching in every consumer.
 
 ## Non-Goals
 
-- Not implementing multi-document entry points (a single query result spanning multiple `DocId` values).
-- Not ranking multiple entry points within a single document; one best entry point per document per query is the model.
-- Not providing a full reading path or navigation graph from an `EntryPoint`.
-- Not changing how segments are created, stored, or scored internally.
+- Multi-document entry points (a single query result spanning multiple documents).
+- Ranking multiple entry points within a single document.
+- Providing a full reading path or navigation graph from an EntryPoint.
+- Changing how segments are created, stored, or scored internally.
