@@ -165,6 +165,23 @@ jobs:
             exit 1
           fi
 
+      - name: Guard — version must be newer than npm latest
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          LATEST=$(npm view @sanurb/shiro-cli version 2>/dev/null || echo "0.0.0")
+          echo "tag=$TAG npm-latest=$LATEST"
+          if npx semver "$TAG" -r "<=$LATEST" 2>/dev/null; then
+            echo "FATAL: tag $TAG is not newer than published $LATEST"
+            exit 1
+          fi
+          echo "OK: $TAG is newer than $LATEST"
+
+      - name: Guard — GitHub Release must exist for tag
+        run: |
+          gh release view "${GITHUB_REF_NAME}" --json tagName --jq .tagName
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Publish
         run: npm publish --access public
         env:
