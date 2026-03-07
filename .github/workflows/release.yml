@@ -90,7 +90,7 @@ jobs:
       - name: Package
         run: |
           TAG="${GITHUB_REF_NAME}"
-          ARCHIVE="shiro-${TAG}-${{ matrix.target }}"
+          ARCHIVE="shiro-cli-${TAG}-${{ matrix.target }}"
           mkdir -p "dist/${ARCHIVE}"
           cp "target/${{ matrix.target }}/release/shiro" "dist/${ARCHIVE}/shiro"
           cp LICENSE* README.md CHANGELOG.md "dist/${ARCHIVE}/" 2>/dev/null || true
@@ -138,3 +138,34 @@ jobs:
             release/*.tar.gz
             release/SHA256SUMS.txt
           fail_on_unmatched_files: true
+
+  # ── Publish npm package ─────────────────────────────────────────────
+  npm-publish:
+    name: Publish npm
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Verify version alignment (tag ↔ package.json ↔ Cargo.toml)
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          echo "tag=$TAG pkg=$PKG_VERSION cargo=$CARGO_VERSION"
+          if [ "$TAG" != "$PKG_VERSION" ] || [ "$TAG" != "$CARGO_VERSION" ]; then
+            echo "FATAL: version mismatch — tag=$TAG, package.json=$PKG_VERSION, Cargo.toml=$CARGO_VERSION"
+            exit 1
+          fi
+
+      - name: Publish
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
