@@ -21,7 +21,7 @@
   "packageManager": "pnpm@10.0.0",
   "scripts": {
     "test": "cargo test",
-    "prepare": "lefthook install",
+    "prepare": "command -v lefthook >/dev/null 2>&1 && lefthook install || true",
     "version-sync": "bash scripts/version-sync.sh --write",
     "tag-release": "bash scripts/tag-release.sh"
   },
