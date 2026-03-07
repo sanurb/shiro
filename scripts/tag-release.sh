@@ -34,14 +34,14 @@ if ! cargo clippy --workspace --all-targets -- -D warnings; then
   exit 1
 fi
 
-# Idempotent: skip if tag already exists
-if git rev-parse "${TAG}" >/dev/null 2>&1; then
-  echo "Tag ${TAG} already exists. Skipping."
+# Idempotent: skip if tag already exists on the remote
+if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q "${TAG}"; then
+  echo "Tag ${TAG} already exists on remote. Skipping."
   exit 0
 fi
 
-# Create and push tag
+# Create (or reuse existing local) tag and push
 echo "Creating tag ${TAG}..."
-git tag "${TAG}"
+git tag -f "${TAG}"
 git push origin "${TAG}"
 echo "Released ${TAG}."
