@@ -1,5 +1,5 @@
 {
-  "name": "shiro-cli",
+  "name": "@sanurb/shiro-cli",
   "version": "0.3.0",
   "description": "Shiro CLI — local-first PDF/Markdown knowledge engine",
   "license": "MIT OR Apache-2.0",

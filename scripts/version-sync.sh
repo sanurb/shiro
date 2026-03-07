@@ -30,6 +30,14 @@ if [[ -z "$PKG_VERSION" ]]; then
   exit 1
 fi
 
+# Guard: npm package name must be scoped
+EXPECTED_PKG_NAME="@sanurb/shiro-cli"
+ACTUAL_PKG_NAME="$(grep '"name"' "$PACKAGE_JSON" | head -1 | sed 's/.*"name": *"\(.*\)".*/\1/')"
+if [[ "$ACTUAL_PKG_NAME" != "$EXPECTED_PKG_NAME" ]]; then
+  echo "error: package.json name is '$ACTUAL_PKG_NAME', expected '$EXPECTED_PKG_NAME'" >&2
+  exit 1
+fi
+
 WRITE=false
 for arg in "$@"; do
   if [[ "$arg" == "--write" ]]; then
