@@ -118,7 +118,10 @@ jobs:
           print('search OK: found', len(data['result'].get('hits', data['result'].get('results', []))), 'results')"
 
           # 6. JSON error path: read non-existent doc
-          cargo run -q -- read --home "$SHIRO_HOME" nonexistent_doc_id 2>/dev/null | python3 -c "
+          # The command exits non-zero on error (correct behavior),
+          # so capture output first, then validate the JSON envelope.
+          ERROR_JSON=$(cargo run -q -- read --home "$SHIRO_HOME" nonexistent_doc_id 2>/dev/null || true)
+          echo "$ERROR_JSON" | python3 -c "
           import json, sys
           data = json.load(sys.stdin)
           assert data['ok'] == False, 'expected error'
