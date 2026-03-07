@@ -53,9 +53,9 @@ SHIRO_INSTALL_DIR=/usr/local/bin \
 #### Option C: Install via npm
 
 ```bash
-npx shiro-cli
+npx @sanurb/shiro-cli
 # or install globally
-npm install -g shiro-cli
+npm install -g @sanurb/shiro-cli
 ```
 
 
@@ -67,7 +67,7 @@ If you prefer building from source or are on an unsupported platform:
 cargo install shiro-cli
 ```
 
-This installs the `shiro` binary (the **crate name** is `shiro-cli`, but the **executable name** you run is still `shiro`).
+This installs the `shiro` binary (the **crate name** is `shiro-cli`, the **npm package** is `@sanurb/shiro-cli`, but the **executable name** you run is still `shiro`).
 
 ### 2. Initialize your Fortress
 
