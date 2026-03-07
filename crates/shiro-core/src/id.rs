@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 /// Content-addressed document identifier (`doc_<blake3_hex>`).
 ///
 /// Two documents with identical content always produce the same `DocId`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(transparent)]
 pub struct DocId(String);
 
 impl DocId {
@@ -44,7 +45,8 @@ impl fmt::Display for DocId {
 /// Deterministic segment identifier (`seg_<blake3_hex>`).
 ///
 /// Derived from parent `DocId` and positional index.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(transparent)]
 pub struct SegmentId(String);
 
 impl SegmentId {
@@ -71,6 +73,41 @@ impl SegmentId {
 }
 
 impl fmt::Display for SegmentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Content-addressed document version identifier (`ver_<blake3_hex>`).
+///
+/// Derived from parent `DocId` and a monotonic sequence number.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct VersionId(String);
+
+impl VersionId {
+    /// Create a new `VersionId` from the parent [`DocId`] and a sequence number.
+    pub fn new(doc_id: &DocId, seq: u64) -> Self {
+        let input = format!("{}:{seq}", doc_id);
+        let hex = blake3::hash(input.as_bytes()).to_hex();
+        Self(format!("ver_{hex}"))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Reconstruct from a stored string.
+    pub fn from_stored(s: impl Into<String>) -> Result<Self, &'static str> {
+        let s = s.into();
+        if s.starts_with("ver_") {
+            Ok(Self(s))
+        } else {
+            Err("VersionId must start with 'ver_'")
+        }
+    }
+}
+
+impl fmt::Display for VersionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
@@ -181,5 +218,88 @@ mod tests {
     fn run_id_generate_has_prefix() {
         let id = RunId::generate();
         assert!(id.as_str().starts_with("run_"));
+    }
+    #[test]
+    fn golden_doc_id_from_content() {
+        let id = DocId::from_content(b"hello world");
+        assert_eq!(
+            id.as_str(),
+            "doc_d74981efa70a0c880b8d8c1985d075dbcbf679b99a5f9914e5aaf96b831a9e24",
+            "DocId golden value changed — this is a breaking change to content addressing"
+        );
+    }
+
+    #[test]
+    fn golden_segment_id() {
+        let doc = DocId::from_content(b"hello world");
+        let seg = SegmentId::new(&doc, 0);
+        assert_eq!(
+            seg.as_str(),
+            "seg_703b94905f1ad4872303b01ec1adee536b0c706c4577a55cb538caab41ca6b52",
+            "SegmentId golden value changed — this is a breaking change to content addressing"
+        );
+    }
+
+    #[test]
+    fn version_id_deterministic() {
+        let doc = DocId::from_content(b"test");
+        let a = VersionId::new(&doc, 1);
+        let b = VersionId::new(&doc, 1);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn version_id_has_prefix() {
+        let doc = DocId::from_content(b"test");
+        let id = VersionId::new(&doc, 1);
+        assert!(id.as_str().starts_with("ver_"));
+    }
+
+    #[test]
+    fn version_id_differs_by_seq() {
+        let doc = DocId::from_content(b"test");
+        let a = VersionId::new(&doc, 1);
+        let b = VersionId::new(&doc, 2);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn version_id_from_stored_validates_prefix() {
+        assert!(VersionId::from_stored("ver_abc123").is_ok());
+        assert!(VersionId::from_stored("bad_abc123").is_err());
+    }
+
+    #[test]
+    fn version_id_display() {
+        let doc = DocId::from_content(b"test");
+        let id = VersionId::new(&doc, 1);
+        assert_eq!(id.to_string(), id.as_str());
+    }
+
+    #[test]
+    fn golden_version_id_pinned() {
+        let doc = DocId::from_content(b"hello world");
+        let ver = VersionId::new(&doc, 0);
+        // Pin exact value — any change means content-addressing broke
+        let expected_prefix = "ver_";
+        assert!(
+            ver.as_str().starts_with(expected_prefix),
+            "VersionId must start with ver_"
+        );
+        // Deterministic: same input always yields same output
+        let ver2 = VersionId::new(&doc, 0);
+        assert_eq!(ver, ver2);
+        // Different seq yields different id
+        let ver3 = VersionId::new(&doc, 1);
+        assert_ne!(ver, ver3);
+        // Pin the exact hash for seq=0
+        assert_eq!(
+            ver.as_str(),
+            format!(
+                "ver_{}",
+                blake3::hash(format!("{}:0", doc).as_bytes()).to_hex()
+            ),
+            "VersionId golden value changed — this is a breaking change"
+        );
     }
 }

@@ -1,0 +1,10 @@
+pub mod add;
+pub mod doctor;
+pub mod enrich;
+pub mod explain;
+pub mod ingest;
+pub mod list;
+pub mod read;
+pub mod reindex;
+pub mod remove;
+pub mod search;

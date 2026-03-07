@@ -36,3 +36,10 @@ Cargo.lock
 rust-project.json
 
 .shiro-test
+.shiro-vault/
+
+out.json
+err.log
+stream.ndjson
+repos/
+/.local

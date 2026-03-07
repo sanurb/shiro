@@ -2,16 +2,22 @@ use shiro_core::{DocId, ShiroError};
 use shiro_store::Store;
 
 pub mod add;
+pub mod capabilities;
+pub mod completions;
 pub mod config;
 pub mod doctor;
+pub mod enrich;
 pub mod explain;
 pub mod ingest;
 pub mod init;
 pub mod list;
+pub mod mcp;
 pub mod read;
+pub mod reindex;
 pub mod remove;
 pub mod root;
 pub mod search;
+pub mod taxonomy;
 
 /// Resolve a doc ID from either a raw `doc_*` string or a title search.
 pub(crate) fn resolve_doc_id(store: &Store, id_or_title: &str) -> Result<DocId, ShiroError> {

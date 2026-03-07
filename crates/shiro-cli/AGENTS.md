@@ -12,6 +12,12 @@ JSON-only CLI with HATEOAS envelope. clap v4 derive macros. All stdout is single
 | Fix error mapping | `src/main.rs` | `suggest_fix()` and `recovery_actions()` |
 | Title→DocId resolution | `src/commands/mod.rs` | `resolve_doc_id()` shared helper |
 
+## SDK ACCESS PATTERNS
+
+Commands use two access patterns:
+- **High-level**: `Engine::open(home)` — used by `add`, `ingest`, `search`, `explain`
+- **Low-level**: direct `Store`/`FtsIndex` via `ShiroHome` — used by `list`, `read`, `remove`, `doctor`, `reindex`, etc.
+
 ## COMMAND PATTERN
 
 Every command is a function `run_*(...) -> Result<CmdOutput, ShiroError>`:
@@ -22,35 +28,39 @@ Every command is a function `run_*(...) -> Result<CmdOutput, ShiroError>`:
 
 Dispatch in `main.rs` calls the function, `print_success()` or `print_error()` handles serialization + exit code.
 
-## ENVELOPE CONTRACT
+**Exception**: `completions` bypasses the JSON envelope — outputs raw shell script consumed by shell directly.
 
-```
-Success: { "ok": true,  "command": "shiro <cmd>", "result": {}, "next_actions": [...] }
-Error:   { "ok": false, "command": "shiro <cmd>", "error": { "code": "...", "message": "..." }, "next_actions": [...] }
-```
-
-- `next_actions` carries typed `ParamMeta` (value, default, enum, description) — agents consume this
-- Fallback: hard-coded JSON emitted if serde serialization itself fails
-- Golden tests in `envelope.rs` enforce exact top-level key sets
-
-## COMMANDS
+## COMMANDS (17 files = 16 commands + mod.rs)
 
 | Command | File | Purpose |
 |---------|------|---------|
 | add | `add.rs` | Single file: parse → dedup check → stage → index → READY |
 | ingest | `ingest.rs` | Batch: 3-phase (bulk SQLite TX → Tantivy commit → mark READY). Walks `.txt/.md/.markdown` |
 | search | `search.rs` | BM25 via FtsIndex. `result_id = blake3(query:seg_id)[..16]` prefixed `res_`. Persists for explain |
-| read | `read.rs` | Three views: Text (raw, 50k char limit), Blocks (per-segment+span), Outline (first lines) |
+| read | `read.rs` | Three modes: **Text** (raw, 50k char limit), **Segments** (per-segment+span), **Outline** (first lines) |
 | explain | `explain.rs` | Cached result lookup. Vector/taxonomy fields are TODO stubs |
 | list | `list.rs` | Fetches limit+1 to detect truncation without COUNT query |
 | remove | `remove.rs` | Tombstones via `set_state(Deleted)`. `--purge` also removes from Tantivy |
 | doctor | `doctor.rs` | Three checks: home dir, Store open, FtsIndex open. Short-circuits on first failure |
-| config | `config.rs` | `show` returns paths. `get`/`set` are stubs (return error) |
+| config | `config.rs` | Sub-enum: `show`/`get`/`set` — fully implemented. Uses `run_show`, `run_get`, `run_set` |
 | init | `init.rs` | Create dirs + open Store (migrates) + open FtsIndex. Idempotent |
-| root | `root.rs` | No-subcommand: self-documenting JSON listing all commands (incl. unimplemented ones) |
+| root | `root.rs` | No-subcommand: self-documenting JSON listing all commands |
+| taxonomy | `taxonomy.rs` | Sub-enum with 5 sub-commands: `add`/`list`/`relations`/`assign`/`import`. Each has `run_*` fn |
+| mcp | `mcp.rs` | JSON-RPC stdio server. 2 tools: search + execute |
+| capabilities | `capabilities.rs` | Static capability arrays + `schema_version` from Store |
+| reindex | `reindex.rs` | Rebuild FTS index from stored segments via `shiro_sdk::ops::reindex` |
+| enrich | `enrich.rs` | Run enrichment pipeline on a document via `shiro_sdk::ops::enrich` |
+| completions | `completions.rs` | Shell completions (bash/zsh/fish/powershell). Bypasses JSON envelope — raw output |
+
+## SUB-ENUM COMMANDS
+
+`taxonomy` and `config` use clap sub-enums dispatched to multiple `pub run_*` functions:
+- `config`: `run_show`, `run_get`, `run_set`
+- `taxonomy`: `run_add`, `run_list`, `run_relations`, `run_assign`, `run_import`
 
 ## TESTS
 
-- `tests/integration.rs`: spawns real binary via `env!(CARGO_BIN_EXE_shiro)`, `--home` tempdir, `--log-level silent`
+- `tests/integration.rs` + `tests/performance.rs`: 26 tests total, each creates `TempDir`
+- Spawns real binary via `env!(CARGO_BIN_EXE_shiro)`, `--home` tempdir, `--log-level silent`
 - All output parsed as JSON — tests validate envelope schema, exit codes, pipeline correctness
 - `cargo test -p shiro-cli` to run

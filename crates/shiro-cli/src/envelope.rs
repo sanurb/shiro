@@ -285,7 +285,7 @@ mod tests {
                 code: "E_STORE_CORRUPT",
                 message: "db damaged",
             },
-            fix: Some("run doctor --repair"),
+            fix: Some("run doctor to diagnose"),
             next_actions: &[],
         };
         let json_str = serde_json::to_string(&envelope_with_fix).unwrap();

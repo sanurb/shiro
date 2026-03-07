@@ -1,51 +1,55 @@
-//! `shiro explain` — scoring breakdown for a search result.
+//! `shiro explain` — thin adapter over shiro-sdk explain.
 
 use crate::envelope::{CmdOutput, NextAction};
 use shiro_core::{ShiroError, ShiroHome};
-use shiro_store::Store;
+use shiro_sdk::{Engine, ExplainInput};
 
 pub fn run(home: &ShiroHome, result_id: &str) -> Result<CmdOutput, ShiroError> {
-    let store = Store::open(&home.db_path())?;
+    let engine = Engine::open(home.clone())?;
 
-    let (query, doc_id, segment_id, bm25_score, bm25_rank) = store.get_search_result(result_id)?;
+    let input = ExplainInput {
+        result_id: result_id.to_string(),
+    };
+    let output = engine.explain(&input)?;
 
-    // Load segment details.
-    let segments = store.get_segments(&doc_id)?;
-    let segment = segments
-        .iter()
-        .find(|s| s.id == segment_id)
-        .ok_or_else(|| ShiroError::NotFoundMsg {
-            message: format!("segment {} not in store", segment_id),
-        })?;
+    let retrieval_trace = serde_json::json!({
+        "pipeline": output.retrieval_trace.pipeline,
+        "stages": output.retrieval_trace.stages,
+        "fusion": output.retrieval_trace.fusion,
+        "filters_applied": [],
+        "expansions_applied": [],
+    });
 
     let result = serde_json::json!({
-        "result_id": result_id,
-        "query": query,
-        "doc_id": doc_id.as_str(),
-        "segment_id": segment_id.as_str(),
-        "block_id": segment.index,
+        "result_id": output.result_id,
+        "query": output.query,
+        "query_digest": output.query_digest,
+        "generations": { "fts": output.fts_generation },
+        "doc_id": output.doc_id,
+        "segment_id": output.segment_id,
+        "block_id": output.block_id,
         "span": {
-            "start": segment.span.start(),
-            "end": segment.span.end(),
+            "start": output.span_start,
+            "end": output.span_end,
         },
         "scores": {
             "bm25": {
-                "score": bm25_score,
-                "rank": bm25_rank,
+                "score": output.bm25_score,
+                "rank": output.bm25_rank,
             },
-            "fused": bm25_score,
-            // TODO: vector scores when vector backend is implemented.
-            // TODO: taxonomy_boost when taxonomy is implemented.
+            "fused": {
+                "score": output.fused_score,
+                "rank": output.fused_rank,
+            },
         },
+        "retrieval_trace": retrieval_trace,
         "expansion": {
-            // TODO: context expansion is not yet implemented.
             "rules_fired": [],
-            "included_block_ids": [segment.index],
+            "included_block_ids": [output.block_id],
             "budgets": {
                 "max_blocks": 12,
                 "max_chars": 8000,
                 "used_blocks": 1,
-                "used_chars": segment.body.len(),
             },
         },
     });
@@ -54,7 +58,7 @@ pub fn run(home: &ShiroHome, result_id: &str) -> Result<CmdOutput, ShiroError> {
         result,
         next_actions: vec![
             NextAction::simple(
-                format!("shiro read {} --text", doc_id),
+                format!("shiro read {} --text", output.doc_id),
                 "Read the full document",
             ),
             NextAction::simple("shiro search <query>", "Run another search"),

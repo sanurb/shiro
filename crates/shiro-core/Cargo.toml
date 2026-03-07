@@ -11,8 +11,10 @@ description.workspace = true
 blake3.workspace = true
 camino.workspace = true
 serde.workspace = true
+schemars.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true

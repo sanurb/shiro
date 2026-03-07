@@ -47,6 +47,15 @@ pub enum ShiroError {
     #[error("lock busy: {message}")]
     LockBusy { message: String },
 
+    #[error("MCP error: {message}")]
+    McpError { message: String },
+
+    #[error("schema migration failed: {message}")]
+    SchemaMigration { message: String },
+
+    #[error("generation conflict: {message}")]
+    GenerationConflict { message: String },
+
     // --- Extension codes (not in CLI.md stable list but needed internally) ---
     #[error("not found: {0}")]
     NotFound(DocId),
@@ -62,6 +71,12 @@ pub enum ShiroError {
 
     #[error("search failed: {message}")]
     SearchFailed { message: String },
+
+    #[error("execution limit exceeded: {message}")]
+    ExecutionLimit { message: String },
+
+    #[error("DSL error: {message}")]
+    DslError { message: String },
 }
 
 /// Stable, machine-readable error codes for the JSON envelope.
@@ -80,12 +95,17 @@ pub enum ErrorCode {
     EEnrichFail,
     ETaxonomyCycle,
     ELockBusy,
+    EMcp,
+    ESchemaMigration,
+    EGenerationConflict,
     // Extension codes
     EIo,
     ENotFound,
     EInvalidInput,
     EConfig,
     ESearchFailed,
+    EExecutionLimit,
+    EDslError,
 }
 
 impl ErrorCode {
@@ -106,7 +126,12 @@ impl ErrorCode {
             ShiroError::NotFound(_) | ShiroError::NotFoundMsg { .. } => Self::ENotFound,
             ShiroError::InvalidInput { .. } => Self::EInvalidInput,
             ShiroError::Config { .. } => Self::EConfig,
+            ShiroError::McpError { .. } => Self::EMcp,
+            ShiroError::SchemaMigration { .. } => Self::ESchemaMigration,
+            ShiroError::GenerationConflict { .. } => Self::EGenerationConflict,
             ShiroError::SearchFailed { .. } => Self::ESearchFailed,
+            ShiroError::ExecutionLimit { .. } => Self::EExecutionLimit,
+            ShiroError::DslError { .. } => Self::EDslError,
         }
     }
 
@@ -127,7 +152,12 @@ impl ErrorCode {
             Self::ENotFound => "E_NOT_FOUND",
             Self::EInvalidInput => "E_INVALID_INPUT",
             Self::EConfig => "E_CONFIG",
+            Self::EMcp => "E_MCP",
+            Self::ESchemaMigration => "E_SCHEMA_MIGRATION",
+            Self::EGenerationConflict => "E_GENERATION_CONFLICT",
             Self::ESearchFailed => "E_SEARCH_FAILED",
+            Self::EExecutionLimit => "E_EXECUTION_LIMIT",
+            Self::EDslError => "E_DSL_ERROR",
         }
     }
 
@@ -144,18 +174,18 @@ impl ErrorCode {
     /// | 21   | lock busy                   |
     pub fn exit_code(self) -> i32 {
         match self {
-            Self::EInvalidInput | Self::EConfig => 2,
+            Self::EInvalidInput | Self::EConfig | Self::EExecutionLimit | Self::EDslError => 2,
             Self::EParsePdf
             | Self::EParseMd
             | Self::EInvalidIr
             | Self::EEmbedFail
             | Self::EEnrichFail => 10,
-            Self::EIndexBuildFts | Self::EIndexBuildVec => 11,
+            Self::EIndexBuildFts | Self::EIndexBuildVec | Self::EGenerationConflict => 11,
             Self::ESearchFailed | Self::ENotFound => 12,
-            Self::EStoreCorrupt => 20,
+            Self::EStoreCorrupt | Self::ESchemaMigration => 20,
             Self::ELockBusy => 21,
             // Unmapped codes default to 1 (generic failure).
-            Self::EIo | Self::ETaxonomyCycle => 1,
+            Self::EIo | Self::ETaxonomyCycle | Self::EMcp => 1,
         }
     }
 }
@@ -194,6 +224,19 @@ mod tests {
         assert_eq!(ErrorCode::ELockBusy.exit_code(), 21);
         assert_eq!(ErrorCode::EEnrichFail.exit_code(), 10);
         assert_eq!(ErrorCode::ENotFound.exit_code(), 12);
+    }
+
+    #[test]
+    fn new_error_codes() {
+        assert_eq!(ErrorCode::EMcp.as_str(), "E_MCP");
+        assert_eq!(ErrorCode::ESchemaMigration.as_str(), "E_SCHEMA_MIGRATION");
+        assert_eq!(
+            ErrorCode::EGenerationConflict.as_str(),
+            "E_GENERATION_CONFLICT"
+        );
+        assert_eq!(ErrorCode::EMcp.exit_code(), 1);
+        assert_eq!(ErrorCode::ESchemaMigration.exit_code(), 20);
+        assert_eq!(ErrorCode::EGenerationConflict.exit_code(), 11);
     }
 
     #[test]
@@ -242,6 +285,21 @@ mod tests {
                 message: String::new(),
             },
             ShiroError::SearchFailed {
+                message: String::new(),
+            },
+            ShiroError::McpError {
+                message: String::new(),
+            },
+            ShiroError::SchemaMigration {
+                message: String::new(),
+            },
+            ShiroError::GenerationConflict {
+                message: String::new(),
+            },
+            ShiroError::ExecutionLimit {
+                message: String::new(),
+            },
+            ShiroError::DslError {
                 message: String::new(),
             },
         ];

@@ -12,6 +12,8 @@ shiro-core.workspace = true
 blake3.workspace = true
 camino.workspace = true
 tracing.workspace = true
+pulldown-cmark.workspace = true
+pdf-extract.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

@@ -1,519 +1,249 @@
-# MCP Agent Guide
+# MCP Server — Code Mode
 
-shiro’s MCP server exposes a single tool `execute` using the **codemode pattern**: agents send JavaScript to run server-side; only the returned value is emitted.
+> **Status:** Implemented (v0.3.0). `shiro capabilities` reports `"mcp_server": "code_mode"`. The `shiro mcp` command starts a JSON-RPC 2.0 stdio server with two tools: `shiro.search` and `shiro.execute`.
 
-This minimizes round trips and lets agents compose multi-step workflows with normal control flow.
+The MCP server exposes shiro's document library and a safe execution environment to AI assistants (Claude, Cursor, etc.) via the [Model Context Protocol](https://modelcontextprotocol.io).
 
+## Protocol
 
-## Why codemode?
+- **Transport:** JSON-RPC 2.0 over stdio
+- **Input:** Newline-delimited JSON on stdin
+- **Output:** JSON + newline on stdout
+- **Protocol version:** `2024-11-05`
 
-Traditional MCP integrations require one tool call per operation (add → enrich → search → assign concept → reindex…). Codemode collapses that into one execution:
+## Lifecycle
 
-**Multiple tool calls (typical MCP):**
-1. add document  
-2. run enrichment  
-3. search  
-4. assign taxonomy  
-5. explain result  
-
-**Single codemode execution:**
-```js
-const doc = await docs.add({ path: "~/docs/paper.pdf", enrich: true });
-
-const hits = await search.query("reading order", { mode: "hybrid", expand: true, limit: 5 });
-
-await taxonomy.assign(doc.doc_id, ["ai/rag"], { source: "manual", confidence: 0.9 });
-
-return { doc, hits };
-````
-
-Benefits:
-
-* fewer tool invocations
-* simpler error recovery (try/catch once)
-* better composition (loops, branching, batching)
-
-
-## Running the MCP server
-
-The MCP server is a mode of the `shiro` binary:
-
-```bash
-shiro mcp
+```
+Client                              Server
+  │                                    │
+  │─── initialize ────────────────────>│
+  │<── capabilities, serverInfo ───────│
+  │                                    │
+  │─── notifications/initialized ─────>│
+  │    (no response — notification)    │
+  │                                    │
+  │─── tools/list ────────────────────>│
+  │<── shiro.search, shiro.execute ───│
+  │                                    │
+  │─── tools/call {shiro.search} ────>│
+  │<── SpecSearchResult[] ────────────│
+  │                                    │
+  │─── tools/call {shiro.execute} ───>│
+  │<── ExecutionResult ───────────────│
 ```
 
-Transport: **stdio** (recommended).
+1. Client sends `initialize` → server responds with capabilities (`tools: {}`), server info (`name: "shiro"`, `version`).
+2. Client sends `notifications/initialized` → server acknowledges (no response for notifications).
+3. Client sends `tools/list` → server returns exactly two tools: `shiro.search` and `shiro.execute`.
+4. Client sends `tools/call` → server dispatches to the requested tool with strict input validation.
+5. Unknown methods → JSON-RPC error code `-32601` ("method not found").
 
+## Tools
 
-## The `execute` tool
+### `shiro.search`
 
-### Input
+Search for available operations by keyword.
 
-* `code` (string, required): JavaScript program
-* `timeout_ms` (number, optional): execution timeout (default 30_000, max 120_000)
-* `home` (string, optional): overrides `SHIRO_HOME` for this execution
-
-### Output (always JSON)
-
-The tool always returns an **agent-first envelope**:
-
-**Success**
+**Input:**
 
 ```json
 {
-  "ok": true,
-  "command": "shiro.mcp.execute",
-  "result": {},
-  "next_actions": [
-    { "command": "shiro <...>", "description": "..." }
-  ]
+  "query": "search for documents",
+  "limit": 5
 }
 ```
 
-**Error**
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `query` | string | yes | — | Search terms (AND semantics) |
+| `limit` | integer | no | 10 | Max results to return |
+
+**Output:** Array of `SpecSearchResult` objects, ranked by score descending with name ascending as tie-break. Each result includes the operation spec, JSON Schema for inputs/outputs, and usage examples.
+
+### `shiro.execute`
+
+Execute a DSL program against the shiro library.
+
+**Input:**
 
 ```json
 {
-  "ok": false,
-  "command": "shiro.mcp.execute",
-  "error": { "message": "...", "code": "E_SOMETHING" },
-  "fix": "Plain-language suggested fix",
-  "next_actions": [
-    { "command": "shiro <...>", "description": "..." }
-  ]
-}
-```
-
-### HATEOAS: `next_actions` templates
-
-`next_actions[].command` uses POSIX/docopt-style placeholders:
-
-* `<required>` positional args
-* `[--flag <value>]` optional flags
-
-If `params` is present, it is a **typed template**:
-
-```json
-{
-  "command": "shiro read <doc_id> --outline",
-  "description": "Inspect extracted structure",
-  "params": {
-    "doc_id": { "value": "doc_...", "description": "Document ID" }
+  "program": [
+    { "let": { "name": "results", "call": { "op": "search", "params": { "query": "machine learning" } } } },
+    { "return": { "value": "$results" } }
+  ],
+  "limits": {
+    "max_steps": 100,
+    "max_iterations": 50,
+    "timeout_secs": 15
   }
 }
 ```
 
-### Truncation (context protection)
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `program` | Node[] | yes | — | DSL program (array of nodes) |
+| `limits` | Limits | no | defaults | Override execution limits |
 
-If `result` would exceed output limits, shiro truncates and returns a pointer:
+**Output:** `ExecutionResult` containing:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `value` | any | Return value from the program |
+| `steps_executed` | integer | Total DSL steps executed |
+| `total_duration_us` | integer | Wall-clock execution time in microseconds |
+| `trace` | StepTrace[] | Per-step execution trace with timing, op name, args hash, result summary, error codes |
+
+## DSL Grammar
+
+The DSL is a JSON AST interpreted by a safe, sandboxed interpreter. All node types use `deny_unknown_fields` for strict validation.
+
+### Node Types
+
+#### `let` — Bind a variable to the result of a call
+
+```json
+{ "let": { "name": "docs", "call": { "op": "list", "params": {} } } }
+```
+
+#### `call` — Execute an operation (result discarded)
+
+```json
+{ "call": { "op": "search", "params": { "query": "neural networks" } } }
+```
+
+#### `if` — Conditional execution
 
 ```json
 {
-  "ok": true,
-  "command": "shiro.mcp.execute",
-  "result": {
-    "showing": 20,
-    "total": 981,
-    "truncated": true,
-    "full_output": "/tmp/shiro-output-abc123.json",
-    "items": [ ... ]
-  },
-  "next_actions": [
-    {
-      "command": "shiro search <query> [--limit <n>]",
-      "description": "Request a smaller page",
-      "params": { "n": { "default": 20 } }
+  "if": {
+    "condition": "$results",
+    "then": [
+      { "return": { "value": "$results" } }
+    ],
+    "else": [
+      { "return": { "value": "no results" } }
+    ]
+  }
+}
+```
+
+#### `for_each` — Iterate over a collection
+
+```json
+{
+  "for_each": {
+    "collection": "$docs",
+    "item": "doc",
+    "body": [
+      { "call": { "op": "read", "params": { "doc_id": "$doc.id" } } }
+    ]
+  }
+}
+```
+
+#### `return` — Return a value from the program
+
+```json
+{ "return": { "value": "$results.0.title" } }
+```
+
+### Variable Substitution
+
+Variables are referenced with `$` prefix and support path traversal:
+
+- `$var` — simple variable reference
+- `$var.field` — object field access
+- `$var.0` — array index access
+- `$var.path.0.field` — chained path traversal
+
+## Limits and Safety
+
+The DSL interpreter enforces hard limits to prevent abuse:
+
+| Limit | Default | Description |
+|-------|---------|-------------|
+| `max_steps` | 200 | Maximum total DSL steps (all node evaluations) |
+| `max_iterations` | 100 | Maximum iterations per `for_each` loop |
+| `max_output_bytes` | 1 MiB | Maximum size of the return value |
+| `timeout` | 30s | Wall-clock execution timeout |
+
+**Safety guarantees:**
+
+- No arbitrary code execution — JSON AST interpreter only
+- `deny_unknown_fields` on all DSL nodes rejects typos and injection attempts
+- All limits are enforced at the interpreter level; clients can lower but not raise defaults
+- Structured execution trace provides full auditability
+
+## Error Mapping
+
+Errors are returned as JSON-RPC error responses with structured codes:
+
+| ErrorCode | as_str() | Description |
+|-----------|----------|-------------|
+| `ExecutionLimit` | `E_EXECUTION_LIMIT` | Execution limit exceeded (steps, iterations, output size, or timeout) |
+| `DslError` | `E_DSL_ERROR` | DSL interpretation error (unknown node, invalid variable, type error) |
+| `NotFound` | `E_NOT_FOUND` | Referenced document or resource not found |
+| `InvalidInput` | `E_INVALID_INPUT` | Invalid tool input (schema validation failure) |
+| `Mcp` | `E_MCP` | MCP protocol-level error |
+
+JSON-RPC error codes:
+
+| Code | Meaning |
+|------|---------|
+| `-32600` | Invalid request (malformed JSON-RPC) |
+| `-32601` | Method not found |
+| `-32602` | Invalid params (unknown fields, schema mismatch) |
+| `-32603` | Internal error |
+
+## Client Configuration
+
+### Claude Desktop
+
+Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+
+```json
+{
+  "mcpServers": {
+    "shiro": {
+      "command": "shiro",
+      "args": ["mcp"]
     }
-  ]
+  }
 }
 ```
 
+### Cursor
 
-## Execution environment (sandbox)
+Add to Cursor's MCP settings (Settings → MCP Servers):
 
-Codemode runs in an embedded JS VM (no Node runtime).
-
-### Available globals
-
-* `docs` — document ingest/read/list/remove
-* `search` — vector/BM25/hybrid search + expansion
-* `taxonomy` — SKOS operations + assignments + proposal review
-* `config` — read/update configuration
-* `maintenance` — doctor/reindex/repair helpers
-* `jobs` — long-running operation tracking
-* `shiro` — helpers (ids, templates, paging, etc.)
-
-### Security constraints (default)
-
-* **No network access** (`fetch` disabled)
-* No arbitrary filesystem access from JS (only via shiro APIs)
-* CPU/memory bounded
-* Time-limited execution (`timeout_ms`)
-
-
-## Type definitions (reference)
-
-> These are documentation types. The runtime is JavaScript; return values must be JSON-serializable.
-
-```ts
-// IDs are stable strings. Suggested format:
-// doc_<base32(blake3)> and seg_<base32(blake3)>
-type DocId = string;
-type SegmentId = string;
-type ConceptId = string;
-type JobId = string;
-
-type SearchMode = "vector" | "bm25" | "hybrid";
-type ParserMode = "baseline" | "premium";
-
-interface NextAction {
-  command: string;
-  description: string;
-  params?: Record<string, {
-    value?: string | number | boolean;
-    default?: string | number | boolean;
-    enum?: Array<string | number>;
-    description?: string;
-  }>;
-}
-
-interface Envelope<T> {
-  ok: true;
-  command: string;
-  result: T;
-  next_actions: NextAction[];
-}
-
-interface ErrorEnvelope {
-  ok: false;
-  command: string;
-  error: { message: string; code: string };
-  fix?: string;
-  next_actions: NextAction[];
-}
-
-interface Document {
-  doc_id: DocId;
-  source_uri: string;
-  source_hash: string;
-  title?: string;
-  summary?: string;
-  tags?: string[];
-  doc_type?: string;
-  created_at: string;  // ISO8601
-  ingested_at: string; // ISO8601
-  status: "STAGED" | "INDEXING" | "READY" | "FAILED" | "DELETED";
-}
-
-interface AddResult {
-  doc: Document;
-  changed: boolean;
-}
-
-interface IngestResult {
-  added: number;
-  ready: number;
-  failed: number;
-  failures?: Array<{ source: string; code: string; message: string }>;
-}
-
-interface SearchHit {
-  result_id: string;     // ephemeral per query
-  doc_id: DocId;
-  segment_id: SegmentId;
-  block_id: number;
-  span: { start: number; end: number };
-  page_range?: { start: number; end: number };
-  title?: string;
-  snippet: string;
-  scores: {
-    vector?: { score: number; rank: number };
-    bm25?: { score: number; rank: number };
-    fused?: number;
-  };
-  expanded?: {
-    included_block_ids: number[];
-    text: string;
-  };
-}
-
-interface SearchResult {
-  query: string;
-  mode: SearchMode;
-  results: SearchHit[];
-  truncated?: boolean;
-}
-
-interface ExplainResult {
-  result_id: string;
-  doc_id: DocId;
-  segment_id: SegmentId;
-  block_id: number;
-  span: { start: number; end: number };
-  scores: {
-    vector?: { score: number; rank: number };
-    bm25?: { score: number; rank: number };
-    fused?: number;
-    taxonomy_boost?: number;
-  };
-  expansion: {
-    rules_fired: string[];
-    included_block_ids: number[];
-    budgets: { max_blocks: number; max_chars: number; used_blocks: number; used_chars: number };
-  };
-  taxonomy?: {
-    matched_concepts?: Array<{ concept_id: ConceptId; depth: number; contribution: number }>;
-  };
-}
-
-interface Concept {
-  concept_id: ConceptId;
-  pref_label: string;
-  alt_labels?: string[];
-  scope_note?: string;
-}
-
-interface ProposedConcept {
-  concept_id: ConceptId;
-  pref_label: string;
-  suggested_broader?: ConceptId;
-  reason?: string;
-}
-
-interface Job {
-  job_id: JobId;
-  kind: "ingest" | "reindex" | "enrich";
-  status: "queued" | "running" | "completed" | "failed";
-  created_at: string;
-  updated_at: string;
-  result?: unknown;
-  error?: { code: string; message: string };
+```json
+{
+  "mcpServers": {
+    "shiro": {
+      "command": "shiro",
+      "args": ["mcp"]
+    }
+  }
 }
 ```
 
+### Custom Home Directory
 
-## API reference
+To use a non-default library location:
 
-### `docs`
-
-```js
-// Add a single document (path or URL)
-await docs.add({
-  path: "<path|url>",
-  parser: "baseline" | "premium",   // default: baseline
-  enrich: boolean,                  // default: false
-  tags: string[],                   // optional
-  concepts: string[],               // optional (concept IDs)
-  fts_only: boolean                 // default: false
-}) -> AddResult
-
-// Bulk ingest (may return a Job when long-running)
-await docs.ingest({
-  dirs: string[],
-  glob: string,                     // default: **/*.{pdf,md}
-  parser: "baseline" | "premium",
-  enrich: boolean,
-  tags: string[],
-  concepts: string[],
-  max_files: number,
-  fts_only: boolean
-}) -> IngestResult | Job
-
-// List documents
-await docs.list({
-  limit: number,                    // default: 20
-  tag: string,
-  concept: string
-}) -> { showing, total, truncated, items: Document[], full_output? }
-
-// Read a document
-await docs.read({
-  id: "<doc_id|title>",
-  mode: "outline" | "text" | "blocks",
-  limit_chars: number               // for text mode; default bounded
-}) -> object
-
-// Remove a document
-await docs.remove({ id: "<doc_id|title>", purge: boolean }) -> { removed: true }
-```
-
-### `search`
-
-```js
-await search.query("<query>", {
-  mode: "hybrid" | "vector" | "bm25",    // default: hybrid
-  limit: number,                         // default: 10
-  topk_vec: number,                      // default: 200
-  topk_bm25: number,                     // default: 200
-  rrf_k: number,                         // default: 60
-  expand: boolean,                        // default: false
-  max_blocks: number,                     // default: 12
-  max_chars: number,                      // default: 8000
-  tag: string,
-  concept: string,
-  doc: string
-}) -> SearchResult
-
-await search.explain("<result_id>") -> ExplainResult
-```
-
-### `taxonomy` (SKOS)
-
-```js
-await taxonomy.list({ limit: number }) -> { showing, total, truncated, items: Concept[] }
-
-await taxonomy.tree({ root: "<concept_id>", depth: number }) -> object
-
-await taxonomy.search("<query>", { limit: number }) -> Concept[]
-
-await taxonomy.add({
-  concept_id: "<id>",
-  label: "<prefLabel>",
-  broader: "<concept_id>",
-  alt: string[],
-  note: string
-}) -> Concept
-
-await taxonomy.assign("<doc_id|title>", ["concept/id", "..."], {
-  confidence: number,             // default: 1.0
-  source: "manual" | "enriched"   // default: manual
-}) -> { assigned: number }
-
-await taxonomy.proposed({ limit: number }) -> ProposedConcept[]
-
-await taxonomy.accept({
-  concept_id: "<id>",
-  label: "<prefLabel>",
-  broader: "<concept_id>",
-  alt: string[],
-  note: string
-}) -> Concept
-
-await taxonomy.reject("<concept_id>") -> { rejected: true }
-```
-
-### `config`
-
-```js
-await config.show() -> object
-await config.get("<key>") -> { key: string, value: unknown }
-await config.set("<key>", "<value>") -> { updated: true }
-```
-
-### `maintenance`
-
-```js
-await maintenance.doctor({ verify_vector: boolean, repair: boolean }) -> object
-await maintenance.reindex({ fts: boolean, vector: boolean }) -> Job | { ok: true }
-```
-
-### `jobs`
-
-```js
-await jobs.get("<job_id>") -> Job
-await jobs.wait("<job_id>", { timeout_ms: number }) -> Job
-await jobs.list({ status: "queued"|"running"|"completed"|"failed", limit: number }) -> Job[]
-```
-
-
-## Usage patterns
-
-### 1) Add → search → explain
-
-```js
-const add = await docs.add({ path: "~/docs/paper.pdf", enrich: true });
-
-const res = await search.query("reading order", { mode: "hybrid", expand: true, limit: 5 });
-
-const exp = res.results.length ? await search.explain(res.results[0].result_id) : null;
-
-return { add, top: res.results[0], exp };
-```
-
-### 2) Bulk ingest with job polling
-
-```js
-const r = await docs.ingest({ dirs: ["~/papers"], enrich: true });
-
-if (r.job_id) {
-  const done = await jobs.wait(r.job_id, { timeout_ms: 120000 });
-  return done;
-}
-
-return r;
-```
-
-### 3) Accept proposed concepts and assign
-
-```js
-const proposed = await taxonomy.proposed({ limit: 50 });
-
-for (const p of proposed) {
-  // Accept with suggested broader if present; otherwise place under a known root
-  await taxonomy.accept({
-    concept_id: p.concept_id,
-    label: p.pref_label,
-    broader: p.suggested_broader ?? "meta/proposed"
-  });
-}
-
-return { accepted: proposed.length };
-```
-
-### 4) Taxonomy-guided search
-
-```js
-// Search within a concept scope (config may expand to descendants)
-const hits = await search.query("disk index", { concept: "systems/storage", expand: true, limit: 10 });
-return hits;
-```
-
-
-## Error handling
-
-`execute` returns an error envelope on uncaught errors. Inside codemode, use try/catch:
-
-```js
-try {
-  return await docs.add({ path: "~/docs/bad.pdf" });
-} catch (e) {
-  // You can return your own structured result; shiro will still wrap it.
-  return { recovered: false, message: String(e) };
+```json
+{
+  "mcpServers": {
+    "shiro": {
+      "command": "shiro",
+      "args": ["--home", "/path/to/library", "mcp"]
+    }
+  }
 }
 ```
 
-Common recoveries:
+## See Also
 
-* `E_LOCK_BUSY`: another writer running → retry later or run `doctor`
-* `E_PARSE_PDF`: try `parser: "premium"` if configured
-* `E_EMBED_FAIL`: verify model cache/config; run `maintenance.doctor()`
-* `E_TAXONOMY_CYCLE`: revise broader relation; do not attempt to force insert
-
-
-## Best practices
-
-1. **Prefer codemode composition**
-   Do multi-step workflows in one `execute` call.
-
-2. **Use `next_actions`**
-   If the result includes IDs (doc/job/result), shiro suggests follow-up command templates.
-
-3. **Bound your outputs**
-   Always pass `limit` for list/search. If you need more, paginate and avoid dumping huge text.
-
-4. **Treat enrichment as advisory**
-   Use enrichment to populate metadata; do not assume it is deterministic.
-
-
-## Limitations
-
-* Default execution timeout: 30s (max 120s)
-* Output is bounded; large results are truncated with `full_output` pointers
-* No network calls from JS
-* No direct filesystem access from JS (use shiro APIs)
-* Single-writer library lock; concurrent writes return `E_LOCK_BUSY`
-
-## See also
-
-* [CLI Reference](CLI.md) — agent-first CLI contract and commands
-* [Architecture](ARCHITECTURE.md) — core design
+- [CLI Reference](CLI.md) for the agent-first CLI interface
+- [Architecture](ARCHITECTURE.md) for design context

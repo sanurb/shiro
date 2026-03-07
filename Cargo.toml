@@ -5,6 +5,8 @@ members = [
   "crates/shiro-index",
   "crates/shiro-parse",
   "crates/shiro-cli",
+  "crates/shiro-embed",
+  "crates/shiro-sdk",
 ]
 resolver = "2"
 
@@ -24,6 +26,7 @@ serde_json = "1"
 toml = "0.8"
 blake3 = "1"
 camino = { version = "1", features = ["serde1"] }
+schemars = { version = "1", features = ["derive"] }
 
 # storage + indexing
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -31,15 +34,21 @@ tantivy = "0.22"
 
 # CLI + observability
 clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # testing
 proptest = "1"
 tempfile = "3"
+pulldown-cmark = "0.12"
+pdf-extract = "0.7"
+ureq = { version = "2", features = ["json"] }
 
 # internal crates
 shiro-core = { path = "crates/shiro-core" }
 shiro-store = { path = "crates/shiro-store" }
 shiro-index = { path = "crates/shiro-index" }
 shiro-parse = { path = "crates/shiro-parse" }
+shiro-embed = { path = "crates/shiro-embed" }
+shiro-sdk   = { path = "crates/shiro-sdk" }

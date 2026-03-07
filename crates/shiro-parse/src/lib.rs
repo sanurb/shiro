@@ -4,9 +4,16 @@
 //! a standalone [`segment_document`] function that splits a [`Document`]
 //! into indexable [`Segment`]s.
 
-use shiro_core::ir::{BlockIdx, Document, Metadata, Segment};
+use shiro_core::ir::{
+    Block, BlockGraph, BlockIdx, BlockKind, Document, Edge, Metadata, Relation, Segment,
+};
 use shiro_core::ports::Parser;
 use shiro_core::{DocId, SegmentId, ShiroError, Span};
+
+pub mod markdown;
+pub use markdown::MarkdownParser;
+pub mod pdf;
+pub use pdf::PdfParser;
 
 // ---------------------------------------------------------------------------
 // Parser
@@ -28,16 +35,19 @@ impl Parser for PlainTextParser {
 
         let id = DocId::from_content(content);
         let source_hash = blake3::hash(content).to_hex().to_string();
+        let blocks = build_paragraph_block_graph(text);
 
         Ok(Document {
             id,
             canonical_text: text.to_string(),
+            rendered_text: None,
             metadata: Metadata {
                 title: extract_title(text),
                 source_uri: source_uri.to_string(),
                 source_hash,
             },
-            blocks: None,
+            blocks,
+            losses: Vec::new(),
         })
     }
 }
@@ -56,15 +66,10 @@ fn extract_title(text: &str) -> Option<String> {
 
 /// Segment a document into indexable chunks.
 ///
-/// Strategy: split on double-newline (paragraph boundaries).
-/// - If blocks exist, use `reading_order` to derive segments from the block
-///   arena.
-/// - If no blocks, split `canonical_text` directly.
+/// Uses `reading_order` to derive segments from the block arena. Every
+/// parser now produces a `BlockGraph`, so there is no text-split fallback.
 pub fn segment_document(doc: &Document) -> Result<Vec<Segment>, ShiroError> {
-    match &doc.blocks {
-        Some(graph) => segment_from_blocks(doc, graph),
-        None => segment_from_text(doc),
-    }
+    segment_from_blocks(doc, &doc.blocks)
 }
 
 fn segment_from_blocks(
@@ -102,10 +107,10 @@ fn segment_from_blocks(
     Ok(segments)
 }
 
-fn segment_from_text(doc: &Document) -> Result<Vec<Segment>, ShiroError> {
-    let text = &doc.canonical_text;
-    let mut segments = Vec::new();
-    let mut seg_idx = 0usize;
+/// Build a [`BlockGraph`] from plain text by splitting on paragraph
+/// boundaries (`\n\n`). Exported for reuse by other baseline parsers (e.g. PDF).
+pub fn build_paragraph_block_graph(text: &str) -> BlockGraph {
+    let mut blocks: Vec<Block> = Vec::new();
 
     for part in text.split("\n\n") {
         let trimmed = part.trim();
@@ -113,28 +118,39 @@ fn segment_from_text(doc: &Document) -> Result<Vec<Segment>, ShiroError> {
             continue;
         }
 
-        // Compute byte offset of `part` within `text` via pointer arithmetic.
+        // Pointer arithmetic: offset of `part` within `text`.
         let offset = part.as_ptr() as usize - text.as_ptr() as usize;
-        // Compute where the trimmed content starts within `part`.
+        // Where the trimmed content starts within `part`.
         let trim_start = trimmed.as_ptr() as usize - part.as_ptr() as usize;
         let start = offset + trim_start;
         let end = start + trimmed.len();
 
-        let span = Span::new(start, end).map_err(|e| ShiroError::InvalidIr {
-            message: e.to_string(),
-        })?;
-
-        segments.push(Segment {
-            id: SegmentId::new(&doc.id, seg_idx),
-            doc_id: doc.id.clone(),
-            index: seg_idx,
-            span,
-            body: trimmed.to_string(),
-        });
-        seg_idx += 1;
+        if let Ok(span) = Span::new(start, end) {
+            blocks.push(Block {
+                canonical_text: trimmed.to_string(),
+                rendered_text: None,
+                kind: BlockKind::Paragraph,
+                span,
+            });
+        }
     }
 
-    Ok(segments)
+    let reading_order: Vec<BlockIdx> = (0..blocks.len()).map(BlockIdx).collect();
+
+    let mut edges = Vec::new();
+    for window in reading_order.windows(2) {
+        edges.push(Edge {
+            from: window[0],
+            to: window[1],
+            relation: Relation::ReadsBefore,
+        });
+    }
+
+    BlockGraph {
+        blocks,
+        edges,
+        reading_order,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -156,7 +172,8 @@ mod tests {
         assert_eq!(doc.metadata.source_uri, "file:///test.txt");
         assert_eq!(doc.metadata.title.as_deref(), Some("Hello World"));
         assert!(!doc.metadata.source_hash.is_empty());
-        assert!(doc.blocks.is_none());
+        assert_eq!(doc.blocks.blocks.len(), 2);
+        assert_eq!(doc.blocks.reading_order.len(), 2);
     }
 
     #[test]
@@ -250,5 +267,54 @@ mod tests {
         );
         assert_eq!(extract_title(""), None);
         assert_eq!(extract_title("   \n   \n   "), None);
+    }
+
+    #[test]
+    fn test_reads_before_edges_multi_paragraph() {
+        let text = "Alpha\n\nBravo\n\nCharlie";
+        let graph = build_paragraph_block_graph(text);
+        assert!(graph.validate(text.len()).is_empty(), "graph must be valid");
+
+        assert_eq!(graph.blocks.len(), 3);
+        assert_eq!(graph.edges.len(), 2);
+
+        assert_eq!(graph.edges[0].from, BlockIdx(0));
+        assert_eq!(graph.edges[0].to, BlockIdx(1));
+        assert!(matches!(graph.edges[0].relation, Relation::ReadsBefore));
+
+        assert_eq!(graph.edges[1].from, BlockIdx(1));
+        assert_eq!(graph.edges[1].to, BlockIdx(2));
+        assert!(matches!(graph.edges[1].relation, Relation::ReadsBefore));
+    }
+
+    #[test]
+    fn test_reads_before_edges_single_paragraph() {
+        let text = "Only one paragraph";
+        let graph = build_paragraph_block_graph(text);
+        assert!(graph.validate(text.len()).is_empty(), "graph must be valid");
+
+        assert_eq!(graph.blocks.len(), 1);
+        assert_eq!(graph.edges.len(), 0);
+    }
+
+    #[test]
+    fn test_reads_before_edges_empty() {
+        let text = "";
+        let graph = build_paragraph_block_graph(text);
+        assert!(graph.validate(text.len()).is_empty(), "graph must be valid");
+
+        assert_eq!(graph.blocks.len(), 0);
+        assert_eq!(graph.edges.len(), 0);
+    }
+
+    #[test]
+    fn test_reads_before_edge_count_matches_blocks() {
+        let text = "A\n\nB\n\nC\n\nD\n\nE";
+        let graph = build_paragraph_block_graph(text);
+        assert!(graph.validate(text.len()).is_empty(), "graph must be valid");
+
+        assert_eq!(graph.blocks.len(), 5);
+        // n blocks => n-1 ReadsBefore edges
+        assert_eq!(graph.edges.len(), graph.blocks.len() - 1);
     }
 }

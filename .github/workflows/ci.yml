@@ -30,5 +30,55 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: Schema snapshot
+        run: |
+          cargo run -q -- capabilities --home /tmp/shiro-ci 2>/dev/null | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          # Verify structural contract
+          assert data['ok'] == True
+          assert set(data['result'].keys()) == {'version','schema_version','state_machine','id_schemes','parsers','features','storage'}
+          assert set(data['result']['features'].keys()) == {'fts_bm25','vector_search','taxonomy','enrichment','mcp_server'}
+          assert data['result']['state_machine']['states'] == ['STAGED','INDEXING','READY','FAILED','DELETED']
+          print('Schema contract verified')
+          "
+
+      - name: Schema version gate
+        run: |
+          VERSION=$(cargo run -q -- capabilities --home /tmp/shiro-ci 2>/dev/null | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          print(data['result']['schema_version'])
+          ")
+          echo "Schema version: $VERSION"
+          if [ -z "$VERSION" ]; then
+            echo '::error::capabilities command did not return schema_version'
+            exit 1
+          fi
+          # Verify it's a valid integer
+          if ! echo "$VERSION" | grep -qE '^[0-9]+$'; then
+            echo "::error::schema_version is not a valid integer: $VERSION"
+            exit 1
+          fi
+      - name: Capabilities parity check
+        run: bash scripts/check-capabilities.sh
+
       - name: Check
         run: cargo check --workspace
+
+      - name: MCP smoke test
+        run: |
+          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | \
+            timeout 5 cargo run -q -- --home /tmp/shiro-mcp-ci --log-level silent mcp 2>/dev/null | \
+            python3 -c "
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    data = json.loads(line)
+    if 'jsonrpc' in data:
+        assert data['result']['protocolVersion'] == '2024-11-05'
+        assert data['result']['serverInfo']['name'] == 'shiro'
+        print('MCP handshake verified')
+        break
+"

@@ -8,7 +8,9 @@ use shiro_core::{ShiroError, ShiroHome};
 
 mod commands;
 mod envelope;
+mod schema;
 
+use commands::completions::CompletionShell;
 use envelope::{print_error, print_success, CmdOutput, NextAction};
 
 // ---------------------------------------------------------------------------
@@ -64,30 +66,6 @@ enum Commands {
     Add {
         /// Path or URL of the file to add.
         path: String,
-
-        /// Parser backend.
-        #[arg(long, value_enum, default_value = "baseline")]
-        parser: ParserChoice,
-
-        /// Enable LLM-based enrichment (tags, concepts).
-        #[arg(long)]
-        enrich: bool,
-
-        /// Comma-separated tags to attach.
-        #[arg(long)]
-        tags: Option<String>,
-
-        /// Comma-separated concept IDs to attach.
-        #[arg(long)]
-        concepts: Option<String>,
-
-        /// Skip vector indexing; FTS only.
-        #[arg(long)]
-        fts_only: bool,
-
-        /// Stream NDJSON progress to stdout.
-        #[arg(long)]
-        follow: bool,
     },
 
     /// Batch-ingest documents from directories.
@@ -95,33 +73,9 @@ enum Commands {
         /// Directories to scan.
         dirs: Vec<std::path::PathBuf>,
 
-        /// File glob pattern (default: *.{txt,md}).
-        #[arg(long)]
-        glob: Option<String>,
-
-        /// Parser backend.
-        #[arg(long, value_enum, default_value = "baseline")]
-        parser: ParserChoice,
-
-        /// Enable LLM-based enrichment.
-        #[arg(long)]
-        enrich: bool,
-
-        /// Comma-separated tags to attach.
-        #[arg(long)]
-        tags: Option<String>,
-
-        /// Comma-separated concept IDs to attach.
-        #[arg(long)]
-        concepts: Option<String>,
-
         /// Maximum number of files to process.
         #[arg(long)]
         max_files: Option<usize>,
-
-        /// Skip vector indexing; FTS only.
-        #[arg(long)]
-        fts_only: bool,
 
         /// Stream NDJSON progress to stdout.
         #[arg(long)]
@@ -212,10 +166,6 @@ enum Commands {
         /// Verify vector index integrity.
         #[arg(long)]
         verify_vector: bool,
-
-        /// Attempt repair of detected issues.
-        #[arg(long)]
-        repair: bool,
     },
 
     /// Show or manage configuration.
@@ -223,19 +173,39 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
-}
 
-#[derive(Clone, Copy, ValueEnum)]
-enum ParserChoice {
-    Baseline,
-    Premium,
+    /// Describe shiro's capabilities as structured JSON.
+    Capabilities,
+
+    /// Start the MCP JSON-RPC server (reads from stdin, writes to stdout).
+    Mcp,
+
+    /// Manage SKOS-style taxonomy concepts.
+    Taxonomy {
+        #[command(subcommand)]
+        action: TaxonomyAction,
+    },
+
+    /// Rebuild FTS index from stored segments.
+    Reindex,
+
+    /// Generate shell completions.
+    Completions {
+        /// Target shell.
+        shell: CompletionShell,
+    },
+
+    /// Run enrichment on a document.
+    Enrich {
+        /// Document ID or title.
+        id: String,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
 enum SearchModeArg {
     Hybrid,
     Bm25,
-    Vector,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -263,6 +233,64 @@ enum ConfigAction {
     },
 }
 
+#[derive(Subcommand)]
+enum TaxonomyAction {
+    /// Add a concept to the taxonomy.
+    Add {
+        /// Scheme URI.
+        #[arg(long)]
+        scheme: String,
+
+        /// Preferred label.
+        #[arg(long)]
+        label: String,
+
+        /// Comma-separated alternative labels.
+        #[arg(long)]
+        alt_labels: Option<String>,
+
+        /// Prose definition.
+        #[arg(long)]
+        definition: Option<String>,
+    },
+
+    /// List concepts.
+    List {
+        /// Maximum number of concepts.
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+
+    /// Show relations for a concept.
+    Relations {
+        /// Concept ID.
+        concept_id: String,
+    },
+
+    /// Assign a concept to a document.
+    Assign {
+        /// Document ID or title.
+        doc_id: String,
+
+        /// Concept ID.
+        concept_id: String,
+
+        /// Confidence score.
+        #[arg(long, default_value_t = 1.0)]
+        confidence: f32,
+
+        /// Assignment source.
+        #[arg(long, default_value = "manual")]
+        source: String,
+    },
+
+    /// Import concepts from a SKOS JSON file.
+    Import {
+        /// Path to JSON file.
+        file: std::path::PathBuf,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -280,7 +308,19 @@ fn main() {
         .with_writer(std::io::stderr)
         .init();
 
+    // Completions bypass the JSON envelope — raw shell script to stdout.
+    if let Some(Commands::Completions { shell }) = &cli.command {
+        let mut cmd = <Cli as clap::CommandFactory>::command();
+        if let Err(e) = commands::completions::run(*shell, &mut cmd) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let cmd_name = command_name(&cli);
+
+    let start = std::time::Instant::now();
 
     let code = match dispatch(&cli) {
         Ok(output) => print_success(cmd_name, &output),
@@ -291,6 +331,13 @@ fn main() {
         }
     };
 
+    tracing::info!(
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        command = cmd_name,
+        exit_code = code,
+        "completed"
+    );
+
     std::process::exit(code);
 }
 
@@ -299,6 +346,7 @@ fn main() {
 // ---------------------------------------------------------------------------
 
 fn dispatch(cli: &Cli) -> Result<CmdOutput, ShiroError> {
+    let _span = tracing::info_span!("dispatch", command = command_name(cli)).entered();
     match &cli.command {
         None => commands::root::run(),
 
@@ -314,24 +362,28 @@ fn dispatch(cli: &Cli) -> Result<CmdOutput, ShiroError> {
 
         Some(Commands::Ingest {
             dirs,
-            glob,
             max_files,
-            ..
+            follow,
         }) => {
             let home = resolve_home(cli)?;
-            commands::ingest::run(&home, dirs, glob.as_deref(), *max_files)
+            commands::ingest::run(&home, dirs, *max_files, *follow)
         }
 
         Some(Commands::Search {
-            query, mode, limit, ..
+            query,
+            mode,
+            limit,
+            expand,
+            max_blocks,
+            max_chars,
+            ..
         }) => {
             let home = resolve_home(cli)?;
             let m = match mode {
                 SearchModeArg::Hybrid => commands::search::SearchMode::Hybrid,
                 SearchModeArg::Bm25 => commands::search::SearchMode::Bm25,
-                SearchModeArg::Vector => commands::search::SearchMode::Vector,
             };
-            commands::search::run(&home, query, m, *limit)
+            commands::search::run(&home, query, m, *limit, *expand, *max_blocks, *max_chars)
         }
 
         Some(Commands::Read { id, view }) => {
@@ -359,9 +411,9 @@ fn dispatch(cli: &Cli) -> Result<CmdOutput, ShiroError> {
             commands::remove::run(&home, id, *purge)
         }
 
-        Some(Commands::Doctor { .. }) => {
+        Some(Commands::Doctor { verify_vector }) => {
             let home = resolve_home(cli)?;
-            commands::doctor::run(&home)
+            commands::doctor::run(&home, *verify_vector)
         }
 
         Some(Commands::Config { action }) => {
@@ -371,6 +423,60 @@ fn dispatch(cli: &Cli) -> Result<CmdOutput, ShiroError> {
                 ConfigAction::Get { key } => commands::config::run_get(&home, key),
                 ConfigAction::Set { key, value } => commands::config::run_set(&home, key, value),
             }
+        }
+
+        Some(Commands::Capabilities) => {
+            let home = resolve_home(cli)?;
+            commands::capabilities::run(&home)
+        }
+
+        Some(Commands::Mcp) => {
+            let home = resolve_home(cli)?;
+            commands::mcp::run(home)
+        }
+
+        Some(Commands::Taxonomy { action }) => {
+            let home = resolve_home(cli)?;
+            match action {
+                TaxonomyAction::Add {
+                    scheme,
+                    label,
+                    alt_labels,
+                    definition,
+                } => commands::taxonomy::run_add(
+                    &home,
+                    scheme,
+                    label,
+                    alt_labels.as_deref(),
+                    definition.as_deref(),
+                ),
+                TaxonomyAction::List { limit } => commands::taxonomy::run_list(&home, *limit),
+                TaxonomyAction::Relations { concept_id } => {
+                    commands::taxonomy::run_relations(&home, concept_id)
+                }
+                TaxonomyAction::Assign {
+                    doc_id,
+                    concept_id,
+                    confidence,
+                    source,
+                } => commands::taxonomy::run_assign(&home, doc_id, concept_id, *confidence, source),
+                TaxonomyAction::Import { file } => commands::taxonomy::run_import(&home, file),
+            }
+        }
+
+        Some(Commands::Reindex) => {
+            let home = resolve_home(cli)?;
+            commands::reindex::run(&home)
+        }
+
+        Some(Commands::Completions { .. }) => {
+            // Handled in main() before dispatch — should never reach here.
+            unreachable!("completions handled before dispatch")
+        }
+
+        Some(Commands::Enrich { id }) => {
+            let home = resolve_home(cli)?;
+            commands::enrich::run(&home, id)
         }
     }
 }
@@ -392,6 +498,12 @@ fn command_name(cli: &Cli) -> &'static str {
         Some(Commands::Remove { .. }) => "shiro remove",
         Some(Commands::Doctor { .. }) => "shiro doctor",
         Some(Commands::Config { .. }) => "shiro config",
+        Some(Commands::Capabilities) => "shiro capabilities",
+        Some(Commands::Mcp) => "shiro mcp",
+        Some(Commands::Taxonomy { .. }) => "shiro taxonomy",
+        Some(Commands::Reindex) => "shiro reindex",
+        Some(Commands::Completions { .. }) => "shiro completions",
+        Some(Commands::Enrich { .. }) => "shiro enrich",
     }
 }
 
@@ -400,10 +512,10 @@ fn suggest_fix(err: &ShiroError) -> Option<&'static str> {
         ShiroError::LockBusy { .. } => {
             Some("Another shiro process may be running. Wait or run `shiro doctor`.")
         }
-        ShiroError::StoreCorrupt { .. } => Some("Run `shiro doctor --repair` to attempt recovery."),
-        ShiroError::ParsePdf { .. } => {
-            Some("Ensure the file is a valid PDF. Try `--parser premium` if configured.")
+        ShiroError::StoreCorrupt { .. } => {
+            Some("Database may be corrupt. Run `shiro doctor` or re-init with `shiro init`.")
         }
+        ShiroError::ParsePdf { .. } => Some("Ensure the file is a valid PDF."),
         ShiroError::Config { .. } => Some("Check SHIRO_HOME or run `shiro init`."),
         _ => None,
     }
@@ -412,10 +524,7 @@ fn suggest_fix(err: &ShiroError) -> Option<&'static str> {
 fn recovery_actions(err: &ShiroError) -> Vec<NextAction> {
     match err {
         ShiroError::StoreCorrupt { .. } => {
-            vec![NextAction::simple(
-                "shiro doctor --repair",
-                "Attempt repair",
-            )]
+            vec![NextAction::simple("shiro doctor", "Run diagnostics")]
         }
         ShiroError::LockBusy { .. } => {
             vec![NextAction::simple("shiro doctor", "Check for stale locks")]

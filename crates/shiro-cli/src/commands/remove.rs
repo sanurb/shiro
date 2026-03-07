@@ -1,30 +1,28 @@
 //! `shiro remove` — tombstone or purge a document.
 
 use crate::envelope::{CmdOutput, NextAction};
-use shiro_core::manifest::DocState;
 use shiro_core::{ShiroError, ShiroHome};
 use shiro_index::FtsIndex;
 use shiro_store::Store;
 
 pub fn run(home: &ShiroHome, id_or_title: &str, purge: bool) -> Result<CmdOutput, ShiroError> {
     let store = Store::open(&home.db_path())?;
-    let doc_id = super::resolve_doc_id(&store, id_or_title)?;
-
-    // Tombstone the document.
-    store.set_state(&doc_id, DocState::Deleted)?;
-    tracing::info!(doc_id = %doc_id, "tombstoned document");
-
-    if purge {
-        // Also remove from FTS index.
-        let fts = FtsIndex::open(&home.tantivy_dir())?;
-        fts.delete_doc(&doc_id)?;
-        tracing::info!(doc_id = %doc_id, "purged from FTS index");
-    }
+    let fts = if purge {
+        Some(FtsIndex::open(&home.tantivy_dir())?)
+    } else {
+        None
+    };
+    let input = shiro_sdk::ops::remove::RemoveInput {
+        id: id_or_title.to_string(),
+        purge,
+    };
+    let output = shiro_sdk::ops::remove::execute(&store, fts.as_ref(), &input)?;
 
     let result = serde_json::json!({
-        "doc_id": doc_id.as_str(),
+        "doc_id": output.doc_id,
         "removed": true,
         "purged": purge,
+        "previous_state": output.previous_state,
     });
 
     Ok(CmdOutput {

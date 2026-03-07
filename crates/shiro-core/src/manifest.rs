@@ -17,7 +17,7 @@ use crate::id::{DocId, RunId};
 /// Document lifecycle state per `docs/ARCHITECTURE.md`.
 ///
 /// Documents are searchable **only** when `Ready`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DocState {
     /// Queued for processing.
@@ -41,6 +41,24 @@ impl DocState {
             Self::Failed => "FAILED",
             Self::Deleted => "DELETED",
         }
+    }
+
+    /// Check whether transitioning from `self` to `to` is valid.
+    ///
+    /// Valid transitions per `docs/ARCHITECTURE.md`:
+    /// - `STAGED → INDEXING → READY`
+    /// - `INDEXING → FAILED`
+    /// - `FAILED → STAGED` (retry)
+    /// - `any → DELETED` (tombstone)
+    pub fn can_transition_to(self, to: DocState) -> bool {
+        matches!(
+            (self, to),
+            (Self::Staged, Self::Indexing)
+                | (Self::Indexing, Self::Ready)
+                | (Self::Indexing, Self::Failed)
+                | (Self::Failed, Self::Staged)
+                | (_, Self::Deleted)
+        )
     }
 }
 
@@ -73,4 +91,49 @@ pub struct RunManifest {
     pub run_id: RunId,
     pub state: RunState,
     pub docs: Vec<DocEntry>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_transitions() {
+        // Normal pipeline
+        assert!(DocState::Staged.can_transition_to(DocState::Indexing));
+        assert!(DocState::Indexing.can_transition_to(DocState::Ready));
+
+        // Failure path
+        assert!(DocState::Indexing.can_transition_to(DocState::Failed));
+
+        // Retry from failure
+        assert!(DocState::Failed.can_transition_to(DocState::Staged));
+
+        // Tombstone from any state
+        assert!(DocState::Staged.can_transition_to(DocState::Deleted));
+        assert!(DocState::Indexing.can_transition_to(DocState::Deleted));
+        assert!(DocState::Ready.can_transition_to(DocState::Deleted));
+        assert!(DocState::Failed.can_transition_to(DocState::Deleted));
+        assert!(DocState::Deleted.can_transition_to(DocState::Deleted));
+    }
+
+    #[test]
+    fn invalid_transitions() {
+        // Cannot skip stages
+        assert!(!DocState::Staged.can_transition_to(DocState::Ready));
+        assert!(!DocState::Staged.can_transition_to(DocState::Failed));
+
+        // Cannot go backwards (except retry)
+        assert!(!DocState::Ready.can_transition_to(DocState::Staged));
+        assert!(!DocState::Ready.can_transition_to(DocState::Indexing));
+        assert!(!DocState::Indexing.can_transition_to(DocState::Staged));
+
+        // Cannot un-delete
+        assert!(!DocState::Deleted.can_transition_to(DocState::Staged));
+        assert!(!DocState::Deleted.can_transition_to(DocState::Ready));
+
+        // Self-transitions (except Deleted) are invalid
+        assert!(!DocState::Staged.can_transition_to(DocState::Staged));
+        assert!(!DocState::Ready.can_transition_to(DocState::Ready));
+    }
 }

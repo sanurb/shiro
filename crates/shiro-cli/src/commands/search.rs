@@ -1,102 +1,75 @@
-//! `shiro search` — BM25 / hybrid search over indexed documents.
+//! `shiro search` — thin adapter over shiro-sdk search.
 
 use std::collections::BTreeMap;
 
 use crate::envelope::{CmdOutput, NextAction, ParamMeta};
 use shiro_core::{ShiroError, ShiroHome};
-use shiro_index::FtsIndex;
-use shiro_store::Store;
+use shiro_sdk::{Engine, SearchInput};
 
-/// Search mode — hybrid is the default (falls back to BM25-only until
-/// vector backend is implemented).
-#[derive(Debug, Clone, Copy)]
-pub enum SearchMode {
-    Hybrid,
-    Bm25,
-    Vector,
-}
+pub use shiro_sdk::SearchMode;
 
 pub fn run(
     home: &ShiroHome,
     query: &str,
     mode: SearchMode,
     limit: usize,
+    expand: bool,
+    max_blocks: usize,
+    max_chars: usize,
 ) -> Result<CmdOutput, ShiroError> {
-    // Vector mode is not yet implemented.
-    if matches!(mode, SearchMode::Vector) {
-        return Err(ShiroError::SearchFailed {
-            message: "vector search not yet implemented; use --bm25 or --hybrid".to_string(),
-        });
-    }
+    let engine = Engine::open(home.clone())?;
 
-    let store = Store::open(&home.db_path())?;
-    let fts = FtsIndex::open(&home.tantivy_dir())?;
-
-    let hits = fts.search(query, limit)?;
-
-    // Build result IDs and persist for explain.
-    let mut results = Vec::with_capacity(hits.len());
-    let mut search_cache = Vec::new();
-
-    for (rank_idx, hit) in hits.iter().enumerate() {
-        let result_id = make_result_id(query, &hit.segment_id);
-
-        search_cache.push((
-            result_id.clone(),
-            shiro_core::DocId::from_stored(&hit.doc_id).map_err(|e| ShiroError::SearchFailed {
-                message: e.to_string(),
-            })?,
-            shiro_core::SegmentId::from_stored(&hit.segment_id).map_err(|e| {
-                ShiroError::SearchFailed {
-                    message: e.to_string(),
-                }
-            })?,
-            hit.bm25_score,
-            rank_idx + 1,
-        ));
-
-        let snippet = truncate_snippet(&hit.body, 200);
-        results.push(serde_json::json!({
-            "result_id": result_id,
-            "doc_id": hit.doc_id,
-            "segment_id": hit.segment_id,
-            "block_id": hit.seg_index,
-            "span": { "start": hit.span_start, "end": hit.span_end },
-            "snippet": snippet,
-            "scores": {
-                "bm25": { "score": hit.bm25_score, "rank": hit.bm25_rank },
-                "fused": hit.bm25_score,
-            },
-        }));
-    }
-
-    // Persist search results for explain.
-    if !search_cache.is_empty() {
-        if let Err(e) = store.save_search_results(query, &search_cache) {
-            tracing::warn!(error = %e, "failed to cache search results for explain");
-        }
-    }
-
-    let mode_str = match mode {
-        SearchMode::Hybrid => "hybrid",
-        SearchMode::Bm25 => "bm25",
-        SearchMode::Vector => "vector",
+    let input = SearchInput {
+        query: query.to_string(),
+        mode,
+        limit,
+        expand,
+        max_blocks,
+        max_chars,
     };
+    let output = engine.search(&input)?;
+
+    // Convert SDK output to JSON envelope.
+    let results: Vec<serde_json::Value> = output
+        .hits
+        .iter()
+        .map(|h| {
+            serde_json::json!({
+                "result_id": h.result_id,
+                "doc_id": h.doc_id,
+                "segment_id": h.segment_id,
+                "block_id": h.block_id,
+                "span": { "start": h.span_start, "end": h.span_end },
+                "snippet": h.snippet,
+                "scores": {
+                    "bm25": h.scores.bm25_rank.map(|_| serde_json::json!({
+                        "score": h.scores.bm25_score, "rank": h.scores.bm25_rank
+                    })),
+                    "fused": h.scores.fused_score,
+                },
+                "expansion": {
+                    "expanded": h.expansion.expanded,
+                    "blocks": h.expansion.blocks,
+                    "chars": h.expansion.chars,
+                },
+            })
+        })
+        .collect();
 
     let result = serde_json::json!({
-        "query": query,
-        "mode": mode_str,
+        "query": output.query,
+        "mode": output.mode,
+        "generations": { "fts": output.fts_generation },
         "results": results,
     });
 
     let mut next_actions = Vec::new();
-    if let Some(first) = results.first() {
-        let rid = first["result_id"].as_str().unwrap_or("");
+    if let Some(first) = output.hits.first() {
         let mut params = BTreeMap::new();
         params.insert(
             "result_id".to_string(),
             ParamMeta {
-                value: Some(serde_json::json!(rid)),
+                value: Some(serde_json::json!(first.result_id)),
                 default: None,
                 description: Some("Result ID from search".to_string()),
             },
@@ -113,58 +86,4 @@ pub fn run(
         result,
         next_actions,
     })
-}
-
-/// Generate a deterministic result_id from query + segment_id.
-fn make_result_id(query: &str, segment_id: &str) -> String {
-    let input = format!("{query}:{segment_id}");
-    let hash = blake3::hash(input.as_bytes());
-    format!("res_{}", &hash.to_hex()[..16])
-}
-
-/// Truncate a snippet to max_chars, breaking at word boundaries.
-fn truncate_snippet(text: &str, max_chars: usize) -> String {
-    if text.len() <= max_chars {
-        return text.to_string();
-    }
-    // Find the last char boundary at or before max_chars.
-    let mut end = max_chars;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    let truncated = &text[..end];
-    match truncated.rfind(' ') {
-        Some(pos) => format!("{}...", &truncated[..pos]),
-        None => format!("{truncated}..."),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn truncate_ascii() {
-        assert_eq!(truncate_snippet("short", 100), "short");
-        assert_eq!(truncate_snippet("hello world foo", 11), "hello...");
-    }
-
-    #[test]
-    fn truncate_unicode_safe() {
-        // 4-byte emoji: slicing at byte 5 would be mid-character.
-        let text = "a \u{1F600} bcdef ghijk"; // 'a ' + 4-byte emoji + ' bcdef ghijk'
-        let result = truncate_snippet(text, 5);
-        // Must not panic. Should back up to char boundary.
-        assert!(result.ends_with("..."));
-    }
-
-    #[test]
-    fn truncate_no_space() {
-        assert_eq!(truncate_snippet("abcdefghij", 5), "abcde...");
-    }
-
-    #[test]
-    fn truncate_exact_boundary() {
-        assert_eq!(truncate_snippet("12345", 5), "12345");
-    }
 }
