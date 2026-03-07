@@ -1,4 +1,3 @@
-```markdown
 <h1 align="center">🏯 shiro (城)</h1>
 
 <p align="center">
@@ -162,5 +161,3 @@ We welcome contributions that adhere to our core principles of speed, privacy, a
 2. Review the [CLI Reference](docs/CLI.md) for the output contract.
 3. Ensure all changes pass the quality gate: `cargo test && cargo clippy`.
 4. Open a Pull Request with a clear description of the impact.
-
-**Built with 🦀 by [sanurb**](https://github.com/sanurb) Distributed under the MIT and Apache-2.0 Licenses.

@@ -1,0 +1,32 @@
+{
+  "name": "shiro-cli",
+  "version": "0.3.0",
+  "description": "Shiro CLI — local-first PDF/Markdown knowledge engine",
+  "license": "MIT OR Apache-2.0",
+  "author": "sanurb",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sanurb/shiro.git"
+  },
+  "homepage": "https://github.com/sanurb/shiro",
+  "bugs": {
+    "url": "https://github.com/sanurb/shiro/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "packageManager": "pnpm@10.0.0",
+  "scripts": {
+    "test": "cargo test",
+    "prepare": "lefthook install",
+    "version-sync": "bash scripts/version-sync.sh --write",
+    "tag-release": "bash scripts/tag-release.sh"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.29.8",
+    "lefthook": "^2.1.2"
+  }
+}

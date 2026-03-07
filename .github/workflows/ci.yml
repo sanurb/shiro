@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [master]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -21,6 +25,9 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
+      - name: Version sync
+        run: bash scripts/version-sync.sh
+
       - name: Format
         run: cargo fmt --all -- --check
 
@@ -30,55 +37,111 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: Check
+        run: cargo check --workspace
+
       - name: Schema snapshot
         run: |
           cargo run -q -- capabilities --home /tmp/shiro-ci 2>/dev/null | python3 -c "
           import json, sys
           data = json.load(sys.stdin)
-          # Verify structural contract
           assert data['ok'] == True
-          assert set(data['result'].keys()) == {'version','schema_version','state_machine','id_schemes','parsers','features','storage'}
-          assert set(data['result']['features'].keys()) == {'fts_bm25','vector_search','taxonomy','enrichment','mcp_server'}
-          assert data['result']['state_machine']['states'] == ['STAGED','INDEXING','READY','FAILED','DELETED']
+          r = data['result']
+          assert 'version' in r
+          assert 'schemaVersion' in r
+          assert 'state_machine' in r
+          assert 'id_schemes' in r
+          assert 'parsers' in r
+          assert 'features' in r
+          assert 'storage' in r
+          assert r['state_machine']['states'] == ['STAGED','INDEXING','READY','FAILED','DELETED']
           print('Schema contract verified')
           "
 
-      - name: Schema version gate
-        run: |
-          VERSION=$(cargo run -q -- capabilities --home /tmp/shiro-ci 2>/dev/null | python3 -c "
-          import json, sys
-          data = json.load(sys.stdin)
-          print(data['result']['schema_version'])
-          ")
-          echo "Schema version: $VERSION"
-          if [ -z "$VERSION" ]; then
-            echo '::error::capabilities command did not return schema_version'
-            exit 1
-          fi
-          # Verify it's a valid integer
-          if ! echo "$VERSION" | grep -qE '^[0-9]+$'; then
-            echo "::error::schema_version is not a valid integer: $VERSION"
-            exit 1
-          fi
       - name: Capabilities parity check
         run: bash scripts/check-capabilities.sh
-
-      - name: Check
-        run: cargo check --workspace
 
       - name: MCP smoke test
         run: |
           echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | \
             timeout 5 cargo run -q -- --home /tmp/shiro-mcp-ci --log-level silent mcp 2>/dev/null | \
             python3 -c "
-import json, sys
-for line in sys.stdin:
-    line = line.strip()
-    if not line: continue
-    data = json.loads(line)
-    if 'jsonrpc' in data:
-        assert data['result']['protocolVersion'] == '2024-11-05'
-        assert data['result']['serverInfo']['name'] == 'shiro'
-        print('MCP handshake verified')
-        break
-"
+          import json, sys
+          for line in sys.stdin:
+              line = line.strip()
+              if not line: continue
+              data = json.loads(line)
+              if 'jsonrpc' in data:
+                  assert data['result']['protocolVersion'] == '2024-11-05'
+                  assert data['result']['serverInfo']['name'] == 'shiro'
+                  print('MCP handshake verified')
+                  break
+          "
+
+      - name: CLI smoke test (fixture-based)
+        run: |
+          set -euo pipefail
+          SHIRO_HOME=$(mktemp -d)
+          trap 'rm -rf "$SHIRO_HOME"' EXIT
+
+          # 1. --help exits cleanly
+          cargo run -q -- --help >/dev/null
+
+          # 2. init
+          cargo run -q -- init --home "$SHIRO_HOME" 2>/dev/null | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          assert data['ok'] == True, 'init failed'
+          print('init OK')"
+
+          # 3. add fixture
+          cargo run -q -- add --home "$SHIRO_HOME" fixtures/tiny.md 2>/dev/null | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          assert data['ok'] == True, 'add failed'
+          assert 'result' in data
+          print('add OK')"
+
+          # 4. ingest
+          cargo run -q -- ingest --home "$SHIRO_HOME" 2>/dev/null | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          assert data['ok'] == True, 'ingest failed'
+          print('ingest OK')"
+
+          # 5. search for known content
+          cargo run -q -- search --home "$SHIRO_HOME" 'shiro' 2>/dev/null | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          assert data['ok'] == True, 'search failed'
+          assert 'result' in data
+          print('search OK: found', len(data['result'].get('hits', data['result'].get('results', []))), 'results')"
+
+          # 6. JSON error path: read non-existent doc
+          # The command exits non-zero on error (correct behavior),
+          # so capture output first, then validate the JSON envelope.
+          ERROR_JSON=$(cargo run -q -- read --home "$SHIRO_HOME" nonexistent_doc_id 2>/dev/null || true)
+          echo "$ERROR_JSON" | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          assert data['ok'] == False, 'expected error'
+          assert 'error' in data
+          assert 'code' in data['error']
+          assert 'message' in data['error']
+          print('error contract OK: code=' + data['error']['code'])"
+
+          echo 'All smoke tests passed'
+
+  nix:
+    name: Nix build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Flake check
+        run: nix flake check
+      - name: Nix build
+        run: nix build

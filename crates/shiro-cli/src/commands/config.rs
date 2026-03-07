@@ -276,8 +276,10 @@ mod tests {
     #[test]
     fn roundtrip_write_read() {
         let (_dir, home) = test_home();
-        let mut cfg = ShiroConfig::default();
-        cfg.search = Some(SearchConfig { limit: Some(42) });
+        let cfg = ShiroConfig {
+            search: Some(SearchConfig { limit: Some(42) }),
+            ..Default::default()
+        };
         write_config_atomic(&home.config_path(), &cfg).unwrap();
         let loaded = load_config(&home).unwrap();
         assert_eq!(loaded, cfg);
