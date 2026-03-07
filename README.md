@@ -50,6 +50,15 @@ SHIRO_INSTALL_DIR=/usr/local/bin \
   curl -sSfL https://raw.githubusercontent.com/sanurb/shiro/master/install.sh | sh
 ```
 
+#### Option C: Install via npm
+
+```bash
+npx shiro-cli
+# or install globally
+npm install -g shiro-cli
+```
+
+
 #### Option B: Install via Cargo
 
 If you prefer building from source or are on an unsupported platform:
