@@ -2996,8 +2996,7 @@ mod tests {
             ],
             edges: relations
                 .iter()
-                .enumerate()
-                .map(|(_, &rel)| Edge {
+                .map(|&rel| Edge {
                     from: BlockIdx(0),
                     to: BlockIdx(1),
                     relation: rel,
