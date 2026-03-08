@@ -1068,6 +1068,44 @@ fn contract_list_json() {
     );
 }
 
+/// ADR-004: verify processing fingerprints are persisted after add.
+#[test]
+fn fingerprint_persisted_after_add() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path().join("shiro-fp-test");
+
+    let (stdout, code) = shiro(&home, &["init"]);
+    assert_eq!(code, 0, "init failed: {stdout}");
+
+    let doc_path = tmp.path().join("fp_test.txt");
+    std::fs::write(
+        &doc_path,
+        "Fingerprint test content for ADR-004 compliance.",
+    )
+    .unwrap();
+
+    let (stdout, code) = shiro(&home, &["add", doc_path.to_str().unwrap()]);
+    assert_eq!(code, 0, "add failed: {stdout}");
+
+    // Doctor should show processing_fingerprints check as "ok"
+    let (stdout, code) = shiro(&home, &["doctor"]);
+    assert_eq!(code, 0, "doctor failed: {stdout}");
+    let v = parse_json(&stdout);
+    let checks = v["result"]["checks"].as_array().unwrap();
+    let fp_check = checks
+        .iter()
+        .find(|c| c["name"].as_str() == Some("processing_fingerprints"));
+    assert!(
+        fp_check.is_some(),
+        "doctor should include processing_fingerprints check"
+    );
+    assert_eq!(
+        fp_check.unwrap()["status"].as_str(),
+        Some("ok"),
+        "fingerprint should be present after add"
+    );
+}
+
 /// Contract test: doctor JSON envelope structure.
 #[test]
 fn contract_doctor_json() {

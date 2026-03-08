@@ -48,7 +48,8 @@ pub fn execute(
     store.put_document(&doc, DocState::Staged)?;
 
     // Persist processing fingerprint (ADR-004) for staleness detection.
-    let fingerprint = ProcessingFingerprint::new(parser.name(), parser.version(), SEGMENTER_VERSION);
+    let fingerprint =
+        ProcessingFingerprint::new(parser.name(), parser.version(), SEGMENTER_VERSION);
     store.set_fingerprint(&doc.id, &fingerprint)?;
     tracing::info!(doc_id = %doc.id, "staged document");
 

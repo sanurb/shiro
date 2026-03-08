@@ -191,7 +191,8 @@ fn parse_and_store(
     store.put_document(&doc, DocState::Indexing)?;
 
     // Persist processing fingerprint (ADR-004) for staleness detection.
-    let fingerprint = ProcessingFingerprint::new(parser.name(), parser.version(), SEGMENTER_VERSION);
+    let fingerprint =
+        ProcessingFingerprint::new(parser.name(), parser.version(), SEGMENTER_VERSION);
     store.set_fingerprint(&doc.id, &fingerprint)?;
 
     let segments = segment_document(&doc)?;

@@ -1,12 +1,12 @@
 # SHIRO KNOWLEDGE BASE
 
-**Generated:** 2026-03-06 | **Branch:** master
+**Generated:** 2026-03-07 | **Branch:** master
 
 ## OVERVIEW
 
 Local-first PDF/Markdown knowledge engine. Indexes documents into a unified searchable base using BM25 full-text search, SKOS taxonomy, and heuristic enrichment. Single Rust binary, JSON-only CLI + Code Mode MCP server (stdio). v0.3.0, MIT/Apache-2.0.
 
-Seven crates: **shiro-core** (domain types, ports, errors), **shiro-store** (SQLite persistence, schema v4), **shiro-index** (Tantivy BM25 full-text search), **shiro-parse** (Markdown + PDF parsers, emits ReadsBefore edges), **shiro-embed** (vector embedding: FlatIndex with generation management + blake3 checksums, HttpEmbedder for OpenAI-compatible endpoints, StubEmbedder for tests), **shiro-sdk** (typed API surface, spec registry, executor), **shiro-cli** (JSON-only CLI + MCP server).
+Seven crates: **shiro-core** (domain types, ports, errors), **shiro-store** (SQLite persistence, schema v5), **shiro-index** (Tantivy BM25 full-text search), **shiro-parse** (Markdown + PDF parsers, emits ReadsBefore edges, SEGMENTER_VERSION=1), **shiro-embed** (vector embedding: FlatIndex with generation management + blake3 checksums, HttpEmbedder for OpenAI-compatible endpoints, StubEmbedder for tests), **shiro-sdk** (typed API surface, spec registry, executor), **shiro-cli** (JSON-only CLI + MCP server).
 
 ## STRUCTURE
 
@@ -72,6 +72,7 @@ Search → FtsIndex.search() → RRF fusion(k=60, BM25-only currently)
 - **Config get/set** — fully implemented with dotted-key TOML support. `config get <key>` reads, `config set <key> <value>` writes.
 - **All 17 commands dispatched** — init, add, ingest, search, read, explain, list, remove, doctor, config, capabilities, taxonomy, reindex, mcp, completions, enrich, root.
 - **Search** — BM25-only (hybrid falls back to BM25 when no vector index). RRF fusion k=60, stable tie-break (score desc, id asc).
+- **Processing fingerprints (ADR-004)** — `ProcessingFingerprint` (parser_name, parser_version, segmenter_version) persisted on every add/ingest. `Parser` trait requires `version()` method. `SEGMENTER_VERSION` constant in shiro-parse. Doctor checks for missing fingerprints.
 - **Context expansion** — `--expand` on search: alternating before/after from hit segment, budget (max_blocks default 12, max_chars default 8000).
 - **Staging→promote atomic rename** — FtsIndex and FlatIndex both build into staging dirs, then `fs::rename()` atomically into place. Prevents partial indices.
 - **write.lock for writes only** — file lock in `lock_dir` acquired only for mutating operations. Reads are lock-free.

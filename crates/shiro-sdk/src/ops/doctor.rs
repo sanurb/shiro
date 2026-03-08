@@ -179,7 +179,10 @@ pub fn execute(home: &ShiroHome, input: &DoctorInput) -> Result<DoctorOutput, Sh
                     format!("{missing} READY documents missing processing fingerprint — run `shiro reindex` to reprocess"),
                 )
             } else {
-                ("ok", format!("{ready_count} READY documents have processing fingerprints"))
+                (
+                    "ok",
+                    format!("{ready_count} READY documents have processing fingerprints"),
+                )
             };
             checks.push(DoctorCheck {
                 name: "processing_fingerprints".into(),
