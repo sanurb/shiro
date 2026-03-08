@@ -1,4 +1,9 @@
 //! Search operation — BM25 / hybrid search over indexed documents.
+//!
+//! Per ADR-007, the public retrieval result is an **EntryPoint**: the best
+//! position in a document to begin reading, with a context window assembled
+//! from the persisted BlockGraph (ADR-006). Segment identifiers are internal
+//! and never appear in the SDK output.
 
 use std::collections::HashMap;
 
@@ -48,24 +53,29 @@ pub struct SearchScores {
     pub fused_rank: usize,
 }
 
+/// A block in the context window surrounding the matched block.
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct ExpandedContext {
-    pub expanded: bool,
-    pub blocks: Vec<usize>,
-    pub chars: usize,
+pub struct ContextBlock {
+    pub block_idx: usize,
+    pub kind: String,
+    pub span_start: usize,
+    pub span_end: usize,
+    pub text: String,
 }
 
+/// The public retrieval result — per ADR-007, this is the single type
+/// that consumers receive from search. No segment identifiers are exposed.
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SearchHit {
     pub result_id: String,
     pub doc_id: String,
-    pub segment_id: String,
-    pub block_id: usize,
+    pub block_idx: usize,
+    pub block_kind: String,
     pub span_start: usize,
     pub span_end: usize,
     pub snippet: String,
     pub scores: SearchScores,
-    pub expansion: ExpandedContext,
+    pub context_window: Vec<ContextBlock>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -86,7 +96,7 @@ pub fn execute(
     fts: &FtsIndex,
     input: &SearchInput,
 ) -> Result<SearchOutput, ShiroError> {
-    // Empty query → empty output.
+    // Empty query -> empty output.
     if input.query.is_empty() {
         return Ok(SearchOutput {
             query: String::new(),
@@ -96,16 +106,16 @@ pub fn execute(
         });
     }
 
-    // ── FTS results ──────────────────────────────────────────────────────
+    // -- FTS results --
     let bm25_hits = fts.search(&input.query, input.limit)?;
 
-    // ── Generation tracking ──────────────────────────────────────────────
+    // -- Generation tracking --
     let fts_gen = store
         .active_generation("fts")
         .map(|g| g.as_u64())
         .unwrap_or(0);
 
-    // ── Build RRF ranked list ────────────────────────────────────────────
+    // -- Build RRF ranked list --
     let mut ranked_map: HashMap<String, RankedHit> = HashMap::new();
 
     for h in &bm25_hits {
@@ -128,25 +138,25 @@ pub fn execute(
         .map(|(i, f)| (f.id.as_str(), (f.rrf_score, i + 1)))
         .collect();
 
-    // ── BM25 score/rank lookup ───────────────────────────────────────────
+    // -- BM25 score/rank lookup --
     let bm25_lookup: HashMap<String, (f32, usize)> = bm25_hits
         .iter()
         .map(|h| (h.segment_id.clone(), (h.bm25_score, h.bm25_rank)))
         .collect();
 
-    // ── Segment body lookup (for snippets + expansion) ───────────────────
+    // -- FTS body map --
     let fts_body_map: HashMap<String, &shiro_index::FtsHit> = bm25_hits
         .iter()
         .map(|h| (h.segment_id.clone(), h))
         .collect();
 
-    // ── Query digest ─────────────────────────────────────────────────────
+    // -- Query digest --
     let query_digest = {
         let hash = blake3::hash(input.query.as_bytes());
         hash.to_hex()[..16].to_string()
     };
 
-    // ── Build output in fused rank order ─────────────────────────────────
+    // -- Build output in fused rank order --
     let mut hits = Vec::with_capacity(fused.len().min(input.limit));
     let mut search_cache: Vec<shiro_store::SearchResultRow> = Vec::new();
 
@@ -178,8 +188,8 @@ pub fn execute(
             .copied()
             .unwrap_or((0.0, 0));
 
-        // Get snippet body from FTS hit or store.
-        let (body, seg_index, span_start, span_end) =
+        // Get segment info from FTS hit or store.
+        let (body, _seg_index, span_start, span_end) =
             if let Some(fts_hit) = fts_body_map.get(seg_id_str) {
                 (
                     fts_hit.body.clone(),
@@ -203,28 +213,22 @@ pub fn execute(
 
         let snippet = truncate_snippet(&body, 200);
 
-        // ── Expansion ────────────────────────────────────────────────
-        let expansion = if input.expand && input.max_blocks > 0 && input.max_chars > 0 {
-            expand_context(
-                store,
-                &doc_id_str,
-                seg_index,
-                &body,
-                input.max_blocks,
-                input.max_chars,
-            )
-        } else {
-            ExpandedContext {
-                expanded: false,
-                blocks: vec![seg_index],
-                chars: body.len(),
-            }
-        };
-
-        // ── Persist row ──────────────────────────────────────────────
+        // -- Resolve segment to block position via BlockGraph (ADR-006/007) --
         let doc_id = DocId::from_stored(&doc_id_str).map_err(|e| ShiroError::SearchFailed {
             message: e.to_string(),
         })?;
+
+        let (block_idx, block_kind) =
+            resolve_segment_to_block(store, &doc_id, span_start, span_end);
+
+        // -- Build context window from BlockGraph reading order --
+        let context_window = if input.expand && input.max_blocks > 0 && input.max_chars > 0 {
+            build_context_window(store, &doc_id, block_idx, input.max_blocks, input.max_chars)
+        } else {
+            Vec::new()
+        };
+
+        // -- Persist row for explain (internal, still uses segment_id) --
         let segment_id =
             SegmentId::from_stored(seg_id_str).map_err(|e| ShiroError::SearchFailed {
                 message: e.to_string(),
@@ -232,7 +236,7 @@ pub fn execute(
 
         search_cache.push(shiro_store::SearchResultRow {
             result_id: result_id.clone(),
-            doc_id,
+            doc_id: doc_id.clone(),
             segment_id,
             bm25_score: bm25_info.map(|i| i.0),
             bm25_rank: bm25_info.map(|i| i.1),
@@ -245,8 +249,8 @@ pub fn execute(
         hits.push(SearchHit {
             result_id,
             doc_id: doc_id_str,
-            segment_id: seg_id_str.clone(),
-            block_id: seg_index,
+            block_idx,
+            block_kind,
             span_start,
             span_end,
             snippet,
@@ -256,7 +260,7 @@ pub fn execute(
                 fused_score,
                 fused_rank,
             },
-            expansion,
+            context_window,
         });
     }
 
@@ -275,6 +279,142 @@ pub fn execute(
         fts_generation: fts_gen,
         hits,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Segment-to-block resolution (ADR-007)
+// ---------------------------------------------------------------------------
+
+/// Resolve a segment's byte span to the best-matching block in the
+/// document's persisted BlockGraph. Returns (block_idx, block_kind_str).
+///
+/// Falls back to (0, "PARAGRAPH") if the graph is empty or no block overlaps.
+fn resolve_segment_to_block(
+    store: &Store,
+    doc_id: &DocId,
+    seg_span_start: usize,
+    seg_span_end: usize,
+) -> (usize, String) {
+    let graph = match store.get_block_graph(doc_id) {
+        Ok(g) if !g.blocks.is_empty() => g,
+        _ => return (0, "PARAGRAPH".to_string()),
+    };
+
+    // Find the block whose span best contains the segment's start.
+    // Prefer the block with the largest overlap.
+    let mut best_idx = 0;
+    let mut best_overlap: usize = 0;
+
+    for (i, block) in graph.blocks.iter().enumerate() {
+        let b_start = block.span.start();
+        let b_end = block.span.end();
+
+        // Calculate overlap between [seg_span_start, seg_span_end) and [b_start, b_end).
+        let overlap_start = seg_span_start.max(b_start);
+        let overlap_end = seg_span_end.min(b_end);
+        if overlap_start < overlap_end {
+            let overlap = overlap_end - overlap_start;
+            if overlap > best_overlap {
+                best_overlap = overlap;
+                best_idx = i;
+            }
+        }
+    }
+
+    let kind_str = format!("{:?}", graph.blocks[best_idx].kind).to_uppercase();
+    (best_idx, kind_str)
+}
+
+/// Build a context window from the BlockGraph's reading order, centered
+/// on the matched block. Respects max_blocks and max_chars budgets.
+fn build_context_window(
+    store: &Store,
+    doc_id: &DocId,
+    hit_block_idx: usize,
+    max_blocks: usize,
+    max_chars: usize,
+) -> Vec<ContextBlock> {
+    let graph = match store.get_block_graph(doc_id) {
+        Ok(g) if !g.blocks.is_empty() => g,
+        _ => return Vec::new(),
+    };
+
+    // Find position of hit_block_idx in reading order.
+    let hit_pos = graph
+        .reading_order
+        .iter()
+        .position(|idx| idx.0 == hit_block_idx)
+        .unwrap_or(0);
+
+    let hit_block = &graph.blocks[hit_block_idx];
+    let mut included: Vec<usize> = vec![hit_pos];
+    let mut total_chars = hit_block.canonical_text.len();
+
+    // Expand outward alternating before/after in reading order.
+    let mut before = hit_pos.wrapping_sub(1);
+    let mut after = hit_pos + 1;
+    let ro_len = graph.reading_order.len();
+
+    loop {
+        if included.len() >= max_blocks || total_chars >= max_chars {
+            break;
+        }
+
+        let can_before = before < ro_len;
+        let can_after = after < ro_len;
+
+        if !can_before && !can_after {
+            break;
+        }
+
+        if can_before {
+            let block_idx = graph.reading_order[before].0;
+            let block = &graph.blocks[block_idx];
+            let block_len = block.canonical_text.len();
+            if total_chars + block_len <= max_chars && included.len() < max_blocks {
+                included.push(before);
+                total_chars += block_len;
+            } else {
+                break;
+            }
+            before = before.wrapping_sub(1);
+        }
+
+        if included.len() >= max_blocks || total_chars >= max_chars {
+            break;
+        }
+
+        if can_after {
+            let block_idx = graph.reading_order[after].0;
+            let block = &graph.blocks[block_idx];
+            let block_len = block.canonical_text.len();
+            if total_chars + block_len <= max_chars && included.len() < max_blocks {
+                included.push(after);
+                total_chars += block_len;
+            } else {
+                break;
+            }
+            after += 1;
+        }
+    }
+
+    // Sort by reading order position so context is in document order.
+    included.sort_unstable();
+
+    included
+        .into_iter()
+        .map(|ro_pos| {
+            let block_idx = graph.reading_order[ro_pos].0;
+            let block = &graph.blocks[block_idx];
+            ContextBlock {
+                block_idx,
+                kind: format!("{:?}", block.kind).to_uppercase(),
+                span_start: block.span.start(),
+                span_end: block.span.end(),
+                text: block.canonical_text.clone(),
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -302,111 +442,6 @@ pub(crate) fn truncate_snippet(text: &str, max_chars: usize) -> String {
     match truncated.rfind(' ') {
         Some(pos) => format!("{}...", &truncated[..pos]),
         None => format!("{truncated}..."),
-    }
-}
-
-/// Expand context around a segment using the document's segments as blocks.
-///
-/// Since `BlockGraph` is not persisted in the store, we use the segments table
-/// as a proxy for adjacent blocks. Expands outward from the hit's segment index.
-pub(crate) fn expand_context(
-    store: &Store,
-    doc_id_str: &str,
-    hit_index: usize,
-    hit_body: &str,
-    max_blocks: usize,
-    max_chars: usize,
-) -> ExpandedContext {
-    let doc_id = match DocId::from_stored(doc_id_str) {
-        Ok(id) => id,
-        Err(_) => {
-            return ExpandedContext {
-                expanded: false,
-                blocks: vec![hit_index],
-                chars: hit_body.len(),
-            }
-        }
-    };
-
-    let segments = match store.get_segments(&doc_id) {
-        Ok(s) => s,
-        Err(_) => {
-            return ExpandedContext {
-                expanded: false,
-                blocks: vec![hit_index],
-                chars: hit_body.len(),
-            }
-        }
-    };
-
-    if segments.is_empty() {
-        return ExpandedContext {
-            expanded: false,
-            blocks: vec![hit_index],
-            chars: hit_body.len(),
-        };
-    }
-
-    // Find the position of our hit in the sorted segment list.
-    let hit_pos = segments
-        .iter()
-        .position(|s| s.index == hit_index)
-        .unwrap_or(0);
-
-    let mut included_indices = vec![hit_index];
-    let mut total_chars = hit_body.len();
-
-    // Expand outward alternating before/after.
-    let mut before = hit_pos.wrapping_sub(1); // wraps to usize::MAX on underflow
-    let mut after = hit_pos + 1;
-
-    loop {
-        if included_indices.len() >= max_blocks || total_chars >= max_chars {
-            break;
-        }
-
-        let can_before = before < segments.len(); // wraps to false on underflow
-        let can_after = after < segments.len();
-
-        if !can_before && !can_after {
-            break;
-        }
-
-        // Try expanding before.
-        if can_before {
-            let seg = &segments[before];
-            if total_chars + seg.body.len() <= max_chars && included_indices.len() < max_blocks {
-                included_indices.push(seg.index);
-                total_chars += seg.body.len();
-            } else {
-                break;
-            }
-            before = before.wrapping_sub(1);
-        }
-
-        if included_indices.len() >= max_blocks || total_chars >= max_chars {
-            break;
-        }
-
-        // Try expanding after.
-        if can_after {
-            let seg = &segments[after];
-            if total_chars + seg.body.len() <= max_chars && included_indices.len() < max_blocks {
-                included_indices.push(seg.index);
-                total_chars += seg.body.len();
-            } else {
-                break;
-            }
-            after += 1;
-        }
-    }
-
-    included_indices.sort_unstable();
-
-    ExpandedContext {
-        expanded: included_indices.len() > 1,
-        blocks: included_indices,
-        chars: total_chars,
     }
 }
 

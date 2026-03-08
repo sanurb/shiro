@@ -1,4 +1,7 @@
 //! `shiro search` — thin adapter over shiro-sdk search.
+//!
+//! Per ADR-007, output uses EntryPoint shape: block-level position
+//! and context window. No segment identifiers in public output.
 
 use std::collections::BTreeMap;
 
@@ -34,11 +37,24 @@ pub fn run(
         .hits
         .iter()
         .map(|h| {
+            let context_window: Vec<serde_json::Value> = h
+                .context_window
+                .iter()
+                .map(|cb| {
+                    serde_json::json!({
+                        "block_idx": cb.block_idx,
+                        "kind": cb.kind,
+                        "span": { "start": cb.span_start, "end": cb.span_end },
+                        "text": cb.text,
+                    })
+                })
+                .collect();
+
             serde_json::json!({
                 "result_id": h.result_id,
                 "doc_id": h.doc_id,
-                "segment_id": h.segment_id,
-                "block_id": h.block_id,
+                "block_idx": h.block_idx,
+                "block_kind": h.block_kind,
                 "span": { "start": h.span_start, "end": h.span_end },
                 "snippet": h.snippet,
                 "scores": {
@@ -47,11 +63,7 @@ pub fn run(
                     })),
                     "fused": h.scores.fused_score,
                 },
-                "expansion": {
-                    "expanded": h.expansion.expanded,
-                    "blocks": h.expansion.blocks,
-                    "chars": h.expansion.chars,
-                },
+                "context_window": context_window,
             })
         })
         .collect();

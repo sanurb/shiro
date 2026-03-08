@@ -15,6 +15,10 @@ impl Parser for MarkdownParser {
         "markdown"
     }
 
+    fn version(&self) -> u32 {
+        1
+    }
+
     fn parse(&self, source_uri: &str, content: &[u8]) -> Result<Document, ShiroError> {
         let text = std::str::from_utf8(content).map_err(|e| ShiroError::ParseMd {
             message: format!("invalid UTF-8: {e}"),

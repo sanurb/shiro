@@ -1,4 +1,7 @@
 //! `explain` — scoring breakdown for a search result.
+//!
+//! Per ADR-007, the public output uses block-level position, not segment
+//! identifiers. Segment resolution happens internally.
 
 use serde::{Deserialize, Serialize};
 use shiro_core::ShiroError;
@@ -25,8 +28,8 @@ pub struct ExplainOutput {
     pub query_digest: String,
     pub fts_generation: u64,
     pub doc_id: String,
-    pub segment_id: String,
-    pub block_id: usize,
+    pub block_idx: usize,
+    pub block_kind: String,
     pub span_start: usize,
     pub span_end: usize,
     pub bm25_score: f32,
@@ -39,7 +42,7 @@ pub struct ExplainOutput {
 pub fn execute(store: &Store, input: &ExplainInput) -> Result<ExplainOutput, ShiroError> {
     let detail = store.get_search_result(&input.result_id)?;
 
-    // Load segment to get span / index info.
+    // Load segment to get span info.
     let segments = store.get_segments(&detail.doc_id)?;
     let segment = segments
         .iter()
@@ -47,6 +50,32 @@ pub fn execute(store: &Store, input: &ExplainInput) -> Result<ExplainOutput, Shi
         .ok_or_else(|| ShiroError::NotFoundMsg {
             message: format!("segment {} not in store", detail.segment_id),
         })?;
+
+    // Resolve segment to block via BlockGraph (ADR-007).
+    let graph = store.get_block_graph(&detail.doc_id)?;
+    let (block_idx, block_kind) = if graph.blocks.is_empty() {
+        (segment.index, "PARAGRAPH".to_string())
+    } else {
+        let seg_start = segment.span.start();
+        let seg_end = segment.span.end();
+        let mut best_idx = 0;
+        let mut best_overlap: usize = 0;
+        for (i, block) in graph.blocks.iter().enumerate() {
+            let b_start = block.span.start();
+            let b_end = block.span.end();
+            let overlap_start = seg_start.max(b_start);
+            let overlap_end = seg_end.min(b_end);
+            if overlap_start < overlap_end {
+                let overlap = overlap_end - overlap_start;
+                if overlap > best_overlap {
+                    best_overlap = overlap;
+                    best_idx = i;
+                }
+            }
+        }
+        let kind_str = format!("{:?}", graph.blocks[best_idx].kind).to_uppercase();
+        (best_idx, kind_str)
+    };
 
     let bm25_rank = detail.bm25_rank.unwrap_or(0);
     let bm25_score = detail.bm25_score.unwrap_or(0.0);
@@ -99,8 +128,8 @@ pub fn execute(store: &Store, input: &ExplainInput) -> Result<ExplainOutput, Shi
         query_digest,
         fts_generation: fts_gen,
         doc_id: detail.doc_id.as_str().to_string(),
-        segment_id: detail.segment_id.as_str().to_string(),
-        block_id: segment.index,
+        block_idx,
+        block_kind,
         span_start: segment.span.start(),
         span_end: segment.span.end(),
         bm25_score,

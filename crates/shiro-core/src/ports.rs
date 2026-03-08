@@ -18,6 +18,13 @@ pub trait Parser {
     /// Human-readable name for logging/fingerprinting.
     fn name(&self) -> &str;
 
+    /// Monotonic version of the parser implementation.
+    ///
+    /// Must be incremented whenever the parser's output-affecting behavior
+    /// changes (ADR-004). Used to build [`ProcessingFingerprint`] for
+    /// staleness detection.
+    fn version(&self) -> u32;
+
     /// Parse raw bytes into a Document.
     ///
     /// `source_uri` is the original path or URL (for metadata).

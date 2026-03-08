@@ -1,11 +1,12 @@
 //! `add` — stage and index a single document.
 
 use serde::{Deserialize, Serialize};
+use shiro_core::fingerprint::ProcessingFingerprint;
 use shiro_core::manifest::DocState;
 use shiro_core::ports::Parser;
 use shiro_core::ShiroError;
 use shiro_index::FtsIndex;
-use shiro_parse::segment_document;
+use shiro_parse::{segment_document, SEGMENTER_VERSION};
 use shiro_store::Store;
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -45,6 +46,10 @@ pub fn execute(
 
     // Stage → Index → Ready pipeline.
     store.put_document(&doc, DocState::Staged)?;
+
+    // Persist processing fingerprint (ADR-004) for staleness detection.
+    let fingerprint = ProcessingFingerprint::new(parser.name(), parser.version(), SEGMENTER_VERSION);
+    store.set_fingerprint(&doc.id, &fingerprint)?;
     tracing::info!(doc_id = %doc.id, "staged document");
 
     store.set_state(&doc.id, DocState::Indexing)?;

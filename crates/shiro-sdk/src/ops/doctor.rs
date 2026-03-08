@@ -155,7 +155,42 @@ pub fn execute(home: &ShiroHome, input: &DoctorInput) -> Result<DoctorOutput, Sh
         });
     }
 
-    // Check 6: FTS consistency
+    // Check 6: processing fingerprints (ADR-004)
+    if let Some(ref store) = store_opt {
+        let counts = store.count_by_state().unwrap_or_default();
+        let ready_count: usize = counts
+            .iter()
+            .filter(|(s, _)| s.as_str() == "READY")
+            .map(|(_, c)| *c)
+            .sum();
+        if ready_count > 0 {
+            let docs = store.list_documents(ready_count).unwrap_or_default();
+            let mut missing = 0usize;
+            for (doc_id, state, _title) in &docs {
+                if state.as_str() == "READY" {
+                    if let Ok(None) = store.get_fingerprint(doc_id) {
+                        missing += 1;
+                    }
+                }
+            }
+            let (status, message) = if missing > 0 {
+                (
+                    "warn",
+                    format!("{missing} READY documents missing processing fingerprint — run `shiro reindex` to reprocess"),
+                )
+            } else {
+                ("ok", format!("{ready_count} READY documents have processing fingerprints"))
+            };
+            checks.push(DoctorCheck {
+                name: "processing_fingerprints".into(),
+                status: status.into(),
+                message,
+                details: None,
+            });
+        }
+    }
+
+    // Check 7: FTS consistency
     if let (Some(ref store), true) = (&store_opt, fts_ok) {
         let counts = store.count_by_state().unwrap_or_default();
         let ready_count: usize = counts

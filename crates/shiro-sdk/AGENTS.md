@@ -16,7 +16,7 @@ CLI and MCP are thin adapters that delegate here. Engine struct delegates to `op
 
 ## Constants
 
-- `SCHEMA_VERSION = 2` — embedded in CLI/MCP JSON responses (`lib.rs`)
+- `SCHEMA_VERSION = 3` — embedded in CLI/MCP JSON responses (`lib.rs`)
 - `RRF_K = 60.0` — reciprocal rank fusion parameter (`fusion.rs`), deterministic tie-break by segment ID
 
 ## Operation pattern

@@ -1,4 +1,6 @@
 //! `shiro explain` — thin adapter over shiro-sdk explain.
+//!
+//! Per ADR-007, output uses block-level position. No segment identifiers.
 
 use crate::envelope::{CmdOutput, NextAction};
 use shiro_core::{ShiroError, ShiroHome};
@@ -26,8 +28,8 @@ pub fn run(home: &ShiroHome, result_id: &str) -> Result<CmdOutput, ShiroError> {
         "query_digest": output.query_digest,
         "generations": { "fts": output.fts_generation },
         "doc_id": output.doc_id,
-        "segment_id": output.segment_id,
-        "block_id": output.block_id,
+        "block_idx": output.block_idx,
+        "block_kind": output.block_kind,
         "span": {
             "start": output.span_start,
             "end": output.span_end,
@@ -43,15 +45,6 @@ pub fn run(home: &ShiroHome, result_id: &str) -> Result<CmdOutput, ShiroError> {
             },
         },
         "retrieval_trace": retrieval_trace,
-        "expansion": {
-            "rules_fired": [],
-            "included_block_ids": [output.block_id],
-            "budgets": {
-                "max_blocks": 12,
-                "max_chars": 8000,
-                "used_blocks": 1,
-            },
-        },
     });
 
     Ok(CmdOutput {

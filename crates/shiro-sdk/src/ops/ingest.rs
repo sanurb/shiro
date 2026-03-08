@@ -4,11 +4,12 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use shiro_core::fingerprint::ProcessingFingerprint;
 use shiro_core::manifest::DocState;
 use shiro_core::ports::Parser;
 use shiro_core::{ErrorCode, ShiroError};
 use shiro_index::FtsIndex;
-use shiro_parse::segment_document;
+use shiro_parse::{segment_document, SEGMENTER_VERSION};
 use shiro_store::Store;
 
 // ── Inputs ──────────────────────────────────────────────────────────────────
@@ -188,6 +189,11 @@ fn parse_and_store(
     }
 
     store.put_document(&doc, DocState::Indexing)?;
+
+    // Persist processing fingerprint (ADR-004) for staleness detection.
+    let fingerprint = ProcessingFingerprint::new(parser.name(), parser.version(), SEGMENTER_VERSION);
+    store.set_fingerprint(&doc.id, &fingerprint)?;
+
     let segments = segment_document(&doc)?;
     store.put_segments(&segments)?;
 

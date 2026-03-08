@@ -13,6 +13,10 @@ impl Parser for PdfParser {
         "pdf"
     }
 
+    fn version(&self) -> u32 {
+        1
+    }
+
     fn parse(&self, source_uri: &str, content: &[u8]) -> Result<Document, ShiroError> {
         let text =
             pdf_extract::extract_text_from_mem(content).map_err(|e| ShiroError::ParsePdf {

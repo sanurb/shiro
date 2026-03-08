@@ -65,7 +65,7 @@ pub fn run(home: &ShiroHome) -> Result<CmdOutput, ShiroError> {
             "enrichment":     "heuristic_only",
             "mcp_server":     "code_mode",
             "completions":    "implemented",
-            "vector_embed":   "http_embedder",
+            "vector_embed":   "infrastructure_only",
         },
         "storage": {
             "engine":     "sqlite",

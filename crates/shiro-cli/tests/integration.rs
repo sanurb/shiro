@@ -95,6 +95,20 @@ fn end_to_end_pipeline() {
         "result_id should have res_ prefix"
     );
     assert!(first["scores"]["bm25"]["score"].as_f64().unwrap() > 0.0);
+    // ADR-007: segment_id must NOT appear in public output.
+    assert!(
+        first.get("segment_id").is_none(),
+        "segment_id must not appear in public search output (ADR-007)"
+    );
+    // ADR-007: block_idx and block_kind must be present.
+    assert!(
+        first["block_idx"].is_u64(),
+        "block_idx must be present in search output"
+    );
+    assert!(
+        first["block_kind"].is_string(),
+        "block_kind must be present in search output"
+    );
 
     // 7. Read the document (text mode).
     let (stdout, code) = shiro(&home, &["read", &doc_id, "--view", "text"]);
@@ -115,7 +129,19 @@ fn end_to_end_pipeline() {
     assert!(v["ok"].as_bool().unwrap());
     assert_eq!(v["result"]["result_id"].as_str().unwrap(), result_id);
     assert!(v["result"]["scores"]["bm25"]["score"].as_f64().unwrap() > 0.0);
-    assert!(v["result"]["expansion"].is_object());
+    // ADR-007: segment_id must NOT appear in public output.
+    assert!(
+        v["result"].get("segment_id").is_none(),
+        "segment_id must not appear in explain output (ADR-007)"
+    );
+    assert!(
+        v["result"]["block_idx"].is_u64(),
+        "block_idx must be present in explain output"
+    );
+    assert!(
+        v["result"]["block_kind"].is_string(),
+        "block_kind must be present in explain output"
+    );
 
     // 10. Doctor check.
     let (stdout, code) = shiro(&home, &["doctor"]);
@@ -550,9 +576,21 @@ fn search_schema_stable() {
         let obj = r
             .as_object()
             .unwrap_or_else(|| panic!("result[{i}] not an object"));
-        for key in &["doc_id", "segment_id", "result_id", "snippet", "scores"] {
+        for key in &[
+            "doc_id",
+            "block_idx",
+            "block_kind",
+            "result_id",
+            "snippet",
+            "scores",
+        ] {
             assert!(obj.contains_key(*key), "result[{i}] missing key: {key}");
         }
+        // ADR-007: segment_id must NOT appear.
+        assert!(
+            !obj.contains_key("segment_id"),
+            "result[{i}] must not contain segment_id (ADR-007)"
+        );
 
         // result_id prefix.
         let result_id = obj["result_id"].as_str().unwrap();
@@ -995,8 +1033,8 @@ fn contract_capabilities_json() {
     );
     assert_eq!(
         v["result"]["features"]["vector_embed"].as_str(),
-        Some("http_embedder"),
-        "vector_embed must equal http_embedder"
+        Some("infrastructure_only"),
+        "vector_embed must equal infrastructure_only"
     );
 }
 

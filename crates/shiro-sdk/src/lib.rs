@@ -32,11 +32,11 @@ pub use ops::read::{ReadInput, ReadMode, ReadOutput};
 pub use ops::reindex::ReindexOutput;
 pub use ops::remove::{RemoveInput, RemoveOutput};
 pub use ops::search::{
-    ExpandedContext, SearchHit, SearchInput, SearchMode, SearchOutput, SearchScores,
+    ContextBlock, SearchHit, SearchInput, SearchMode, SearchOutput, SearchScores,
 };
 
 /// Schema version for SDK output types.
 ///
 /// Bump when any output struct shape changes. CLI and MCP embed this in
 /// their responses so consumers can detect breaking changes.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;

@@ -167,7 +167,8 @@ pub static OPS: &[OpSpec] = &[
         name: "explain",
         description: "Explain why a search result was ranked as it was",
         params: EXPLAIN_PARAMS,
-        returns: "ExplainOutput { result_id, query, doc_id, segment_id, retrieval_trace }",
+        returns:
+            "ExplainOutput { result_id, query, doc_id, block_idx, block_kind, retrieval_trace }",
         input_schema_ref: "ExplainInput",
         output_schema_ref: "ExplainOutput",
         example: r#"{"type":"let","name":"trace","call":{"op":"explain","params":{"result_id":"res_abc123"}}}"#,

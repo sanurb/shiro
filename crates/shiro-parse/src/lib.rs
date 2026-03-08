@@ -23,9 +23,18 @@ pub use pdf::PdfParser;
 #[derive(Debug, Clone, Copy)]
 pub struct PlainTextParser;
 
+/// Segmenter version — bump when segmentation logic changes.
+///
+/// Used in [`ProcessingFingerprint`] to detect stale segments (ADR-004).
+pub const SEGMENTER_VERSION: u32 = 1;
+
 impl Parser for PlainTextParser {
     fn name(&self) -> &str {
         "plaintext"
+    }
+
+    fn version(&self) -> u32 {
+        1
     }
 
     fn parse(&self, source_uri: &str, content: &[u8]) -> Result<Document, ShiroError> {

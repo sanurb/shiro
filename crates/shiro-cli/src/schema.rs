@@ -41,13 +41,13 @@ pub struct IngestFailure {
     pub message: String,
 }
 
-/// A single search hit.
+/// A single search hit (EntryPoint shape per ADR-007).
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct SearchHit {
     pub result_id: String,
     pub doc_id: String,
-    pub segment_id: String,
-    pub block_id: u64,
+    pub block_idx: u64,
+    pub block_kind: String,
     pub span: SpanResult,
     pub snippet: String,
     pub scores: ScoresResult,
