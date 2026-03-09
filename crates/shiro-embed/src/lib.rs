@@ -6,4 +6,4 @@ mod stub;
 
 pub use flat::FlatIndex;
 pub use http::{HttpEmbedder, HttpEmbedderConfig};
-pub use stub::StubEmbedder;
+pub use stub::{DeterministicStubEmbedder, StubEmbedder};

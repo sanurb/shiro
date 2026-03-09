@@ -113,6 +113,7 @@ impl Embedder for HttpEmbedder {
         EmbeddingMeta {
             dimensions: self.config.dimensions,
             model_name: self.config.model.clone(),
+            provider: "http".to_string(),
         }
     }
 }
