@@ -34,6 +34,8 @@ pub struct ExplainOutput {
     pub span_end: usize,
     pub bm25_score: f32,
     pub bm25_rank: usize,
+    pub vector_score: Option<f32>,
+    pub vector_rank: Option<usize>,
     pub fused_score: f32,
     pub fused_rank: usize,
     pub retrieval_trace: RetrievalTrace,
@@ -79,6 +81,8 @@ pub fn execute(store: &Store, input: &ExplainInput) -> Result<ExplainOutput, Shi
 
     let bm25_rank = detail.bm25_rank.unwrap_or(0);
     let bm25_score = detail.bm25_score.unwrap_or(0.0);
+    let vector_score = detail.vector_score;
+    let vector_rank = detail.vector_rank;
     let fused_score = detail.fused_score.unwrap_or(0.0);
     let fused_rank = detail.fused_rank.unwrap_or(0);
     let fts_gen = detail.fts_gen.unwrap_or(0);
@@ -109,6 +113,26 @@ pub fn execute(store: &Store, input: &ExplainInput) -> Result<ExplainOutput, Shi
         );
     }
 
+    if let Some(v_rank) = detail.vector_rank {
+        pipeline.push("vector".to_string());
+        let vector_rrf = 1.0 / (RRF_K + v_rank as f64);
+        stages.push(serde_json::json!({
+            "name": "vector",
+            "input_query": &detail.query,
+            "this_result": {
+                "rank": v_rank,
+                "raw_score": detail.vector_score.unwrap_or(0.0),
+            },
+        }));
+        contributions.insert(
+            "vector".to_string(),
+            serde_json::json!({
+                "rank": v_rank,
+                "rrf_contribution": vector_rrf,
+            }),
+        );
+    }
+
     let fusion = serde_json::json!({
         "method": "rrf",
         "k": RRF_K as u64,
@@ -134,6 +158,8 @@ pub fn execute(store: &Store, input: &ExplainInput) -> Result<ExplainOutput, Shi
         span_end: segment.span.end(),
         bm25_score,
         bm25_rank,
+        vector_score,
+        vector_rank,
         fused_score,
         fused_rank,
         retrieval_trace,

@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use shiro_core::ports::{Embedder, Reranker, VectorIndex};
 use shiro_core::{DocId, SegmentId, ShiroError};
 use shiro_index::FtsIndex;
 use shiro_store::Store;
@@ -18,12 +19,13 @@ use crate::fusion::{reciprocal_rank_fusion, RankedHit};
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Search mode — hybrid is the default (falls back to BM25-only until
-/// vector backend is implemented).
+/// Search mode — hybrid is the default. Falls back to BM25-only when no
+/// vector backend is configured.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum SearchMode {
     Hybrid,
     Bm25,
+    Vector,
 }
 
 impl SearchMode {
@@ -31,6 +33,7 @@ impl SearchMode {
         match self {
             Self::Hybrid => "hybrid",
             Self::Bm25 => "bm25",
+            Self::Vector => "vector",
         }
     }
 }
@@ -43,14 +46,20 @@ pub struct SearchInput {
     pub expand: bool,
     pub max_blocks: usize,
     pub max_chars: usize,
+    /// Enable post-fusion reranking when a reranker is available.
+    pub rerank: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SearchScores {
     pub bm25_score: Option<f32>,
     pub bm25_rank: Option<usize>,
+    pub vector_score: Option<f32>,
+    pub vector_rank: Option<usize>,
     pub fused_score: f64,
     pub fused_rank: usize,
+    pub reranker_score: Option<f32>,
+    pub reranker_rank: Option<usize>,
 }
 
 /// A block in the context window surrounding the matched block.
@@ -84,6 +93,17 @@ pub struct SearchOutput {
     pub mode: String,
     pub fts_generation: u64,
     pub hits: Vec<SearchHit>,
+    /// Summary of which retrieval sources and stages were active.
+    pub retrieval_info: RetrievalInfo,
+}
+
+/// Machine-readable summary of what retrieval components were active.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RetrievalInfo {
+    pub bm25_active: bool,
+    pub vector_active: bool,
+    pub reranker_active: bool,
+    pub reranker_model: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +114,9 @@ pub struct SearchOutput {
 pub fn execute(
     store: &Store,
     fts: &FtsIndex,
+    embedder: Option<&dyn Embedder>,
+    vector_index: Option<&dyn VectorIndex>,
+    reranker: Option<&dyn Reranker>,
     input: &SearchInput,
 ) -> Result<SearchOutput, ShiroError> {
     // Empty query -> empty output.
@@ -103,11 +126,41 @@ pub fn execute(
             mode: input.mode.as_str().to_string(),
             fts_generation: 0,
             hits: Vec::new(),
+            retrieval_info: RetrievalInfo {
+                bm25_active: false,
+                vector_active: false,
+                reranker_active: false,
+                reranker_model: None,
+            },
         });
     }
 
+    // -- Determine active sources based on mode and availability --
+    let use_bm25 = !matches!(input.mode, SearchMode::Vector);
+    let use_vector =
+        !matches!(input.mode, SearchMode::Bm25) && embedder.is_some() && vector_index.is_some();
+    let use_reranker = input.rerank && reranker.is_some();
+
     // -- FTS results --
-    let bm25_hits = fts.search(&input.query, input.limit)?;
+    let bm25_hits = if use_bm25 {
+        fts.search(&input.query, input.limit)?
+    } else {
+        Vec::new()
+    };
+
+    // -- Vector results --
+    let vector_hits = if use_vector {
+        let emb = embedder.ok_or_else(|| ShiroError::EmbedFail {
+            message: "embedder required for vector search".to_string(),
+        })?;
+        let vi = vector_index.ok_or_else(|| ShiroError::SearchFailed {
+            message: "vector index required for vector search".to_string(),
+        })?;
+        let query_vec = emb.embed(&input.query)?;
+        vi.search(&query_vec, input.limit)?
+    } else {
+        Vec::new()
+    };
 
     // -- Generation tracking --
     let fts_gen = store
@@ -129,6 +182,18 @@ pub fn execute(
         entry.bm25_rank = Some(h.bm25_rank);
     }
 
+    for (rank, vh) in vector_hits.iter().enumerate() {
+        let seg_id = vh.segment_id.as_str().to_string();
+        let entry = ranked_map
+            .entry(seg_id.clone())
+            .or_insert_with(|| RankedHit {
+                id: seg_id,
+                bm25_rank: None,
+                vector_rank: None,
+            });
+        entry.vector_rank = Some(rank + 1);
+    }
+
     let ranked_vec: Vec<RankedHit> = ranked_map.into_values().collect();
     let fused = reciprocal_rank_fusion(&ranked_vec);
 
@@ -142,6 +207,13 @@ pub fn execute(
     let bm25_lookup: HashMap<String, (f32, usize)> = bm25_hits
         .iter()
         .map(|h| (h.segment_id.clone(), (h.bm25_score, h.bm25_rank)))
+        .collect();
+
+    // -- Vector score lookup --
+    let vector_lookup: HashMap<String, (f32, usize)> = vector_hits
+        .iter()
+        .enumerate()
+        .map(|(i, vh)| (vh.segment_id.as_str().to_string(), (vh.score, i + 1)))
         .collect();
 
     // -- FTS body map --
@@ -159,6 +231,8 @@ pub fn execute(
     // -- Build output in fused rank order --
     let mut hits = Vec::with_capacity(fused.len().min(input.limit));
     let mut search_cache: Vec<shiro_store::SearchResultRow> = Vec::new();
+    // Collect segment bodies for reranking
+    let mut hit_segment_bodies: Vec<String> = Vec::new();
 
     for fh in fused.iter().take(input.limit) {
         let seg_id_str = &fh.id;
@@ -183,6 +257,7 @@ pub fn execute(
         let result_id = make_result_id(&input.query, seg_id_str);
 
         let bm25_info = bm25_lookup.get(seg_id_str);
+        let vector_info = vector_lookup.get(seg_id_str);
         let (fused_score, fused_rank) = rrf_lookup
             .get(seg_id_str.as_str())
             .copied()
@@ -240,11 +315,13 @@ pub fn execute(
             segment_id,
             bm25_score: bm25_info.map(|i| i.0),
             bm25_rank: bm25_info.map(|i| i.1),
-            vector_score: None,
-            vector_rank: None,
+            vector_score: vector_info.map(|i| i.0),
+            vector_rank: vector_info.map(|i| i.1),
             fused_score: Some(fused_score as f32),
             fused_rank: Some(fused_rank),
         });
+
+        hit_segment_bodies.push(body.clone());
 
         hits.push(SearchHit {
             result_id,
@@ -257,12 +334,60 @@ pub fn execute(
             scores: SearchScores {
                 bm25_score: bm25_info.map(|i| i.0),
                 bm25_rank: bm25_info.map(|i| i.1),
+                vector_score: vector_info.map(|i| i.0),
+                vector_rank: vector_info.map(|i| i.1),
                 fused_score,
                 fused_rank,
+                reranker_score: None,
+                reranker_rank: None,
             },
             context_window,
         });
     }
+
+    // -- Post-fusion reranking --
+    let reranker_model_name = if use_reranker && !hits.is_empty() {
+        let rr = reranker.ok_or_else(|| ShiroError::SearchFailed {
+            message: "reranker expected but missing".to_string(),
+        })?;
+        let model_name = rr.model_name().to_string();
+        let doc_texts: Vec<&str> = hit_segment_bodies.iter().map(|s| s.as_str()).collect();
+        let top_n = hits.len();
+
+        match rr.rerank(&input.query, &doc_texts, top_n) {
+            Ok(rerank_results) => {
+                // Build index→(score, rank) map from reranker output
+                let mut rerank_map: HashMap<usize, (f32, usize)> = HashMap::new();
+                for (rank, rr_result) in rerank_results.iter().enumerate() {
+                    rerank_map.insert(rr_result.index, (rr_result.score, rank + 1));
+                }
+
+                // Apply reranker scores to hits
+                for (i, hit) in hits.iter_mut().enumerate() {
+                    if let Some(&(score, rank)) = rerank_map.get(&i) {
+                        hit.scores.reranker_score = Some(score);
+                        hit.scores.reranker_rank = Some(rank);
+                    }
+                }
+
+                // Re-sort hits by reranker rank (ascending = best first)
+                hits.sort_by(|a, b| {
+                    let ra = a.scores.reranker_rank.unwrap_or(usize::MAX);
+                    let rb = b.scores.reranker_rank.unwrap_or(usize::MAX);
+                    ra.cmp(&rb)
+                });
+
+                Some(model_name)
+            }
+            Err(e) => {
+                // Reranking failure is non-fatal — fall back to RRF order
+                tracing::warn!(error = %e, "reranking failed, falling back to RRF order");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Persist search results for explain.
     if !search_cache.is_empty() {
@@ -273,11 +398,19 @@ pub fn execute(
         }
     }
 
+    let retrieval_info = RetrievalInfo {
+        bm25_active: use_bm25 && !bm25_hits.is_empty(),
+        vector_active: use_vector && !vector_hits.is_empty(),
+        reranker_active: reranker_model_name.is_some(),
+        reranker_model: reranker_model_name,
+    };
+
     Ok(SearchOutput {
         query: input.query.clone(),
         mode: input.mode.as_str().to_string(),
         fts_generation: fts_gen,
         hits,
+        retrieval_info,
     })
 }
 
@@ -539,5 +672,12 @@ mod tests {
         let id1 = make_result_id("hello", "seg_abc");
         let id2 = make_result_id("world", "seg_abc");
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn search_mode_str() {
+        assert_eq!(SearchMode::Hybrid.as_str(), "hybrid");
+        assert_eq!(SearchMode::Bm25.as_str(), "bm25");
+        assert_eq!(SearchMode::Vector.as_str(), "vector");
     }
 }

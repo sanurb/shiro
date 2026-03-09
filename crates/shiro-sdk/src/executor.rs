@@ -132,10 +132,10 @@ fn exec_search(store: &Store, fts: &FtsIndex, params: &Value) -> Result<Value, S
         expand,
         max_blocks: 12,
         max_chars: 8000,
+        rerank: false,
     };
-    to_json(ops::search::execute(store, fts, &input)?)
+    to_json(ops::search::execute(store, fts, None, None, None, &input)?)
 }
-
 fn exec_read(store: &Store, params: &Value) -> Result<Value, ShiroError> {
     let id = str_param(params, "id")?;
     let input = ops::read::ReadInput {
