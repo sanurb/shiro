@@ -7,8 +7,8 @@
 //! concrete types — only truly external/pluggable adapters get traits.
 
 use crate::error::ShiroError;
+use crate::fingerprint::EmbeddingFingerprint;
 use crate::ir::Document;
-
 use serde::{Deserialize, Serialize};
 
 /// Parse raw content into a structured [`Document`].
@@ -35,6 +35,10 @@ pub trait Parser {
 ///
 /// Implementations must be deterministic: identical input text must produce
 /// identical output vectors. This is required for reproducible retrieval.
+///
+/// Per ADR-012, every implementation MUST expose an [`EmbeddingFingerprint`]
+/// that uniquely identifies the embedding configuration. A fingerprint
+/// mismatch between the active embedder and a stored index is a hard error.
 pub trait Embedder: Send + Sync {
     /// Embed a single text string.
     fn embed(&self, text: &str) -> Result<Vec<f32>, ShiroError>;
@@ -49,6 +53,13 @@ pub trait Embedder: Send + Sync {
 
     /// Metadata about this embedding model.
     fn meta(&self) -> EmbeddingMeta;
+
+    /// Return the embedding fingerprint for this configuration (ADR-012).
+    ///
+    /// The fingerprint uniquely identifies the provider + model + dimensions +
+    /// normalization + truncation + chunk policy. A mismatch against a stored
+    /// index fingerprint is a hard error — the index must be rebuilt.
+    fn fingerprint(&self) -> EmbeddingFingerprint;
 }
 
 /// A single hit from a vector similarity search.
