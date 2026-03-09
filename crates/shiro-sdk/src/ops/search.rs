@@ -319,6 +319,8 @@ pub fn execute(
             vector_rank: vector_info.map(|i| i.1),
             fused_score: Some(fused_score as f32),
             fused_rank: Some(fused_rank),
+            reranker_score: None,
+            reranker_rank: None,
         });
 
         hit_segment_bodies.push(body.clone());
@@ -362,11 +364,16 @@ pub fn execute(
                     rerank_map.insert(rr_result.index, (rr_result.score, rank + 1));
                 }
 
-                // Apply reranker scores to hits
+                // Apply reranker scores to hits and search_cache
                 for (i, hit) in hits.iter_mut().enumerate() {
                     if let Some(&(score, rank)) = rerank_map.get(&i) {
                         hit.scores.reranker_score = Some(score);
                         hit.scores.reranker_rank = Some(rank);
+                        // Propagate to search_cache for explain persistence
+                        if i < search_cache.len() {
+                            search_cache[i].reranker_score = Some(score);
+                            search_cache[i].reranker_rank = Some(rank);
+                        }
                     }
                 }
 

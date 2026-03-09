@@ -36,6 +36,8 @@ pub struct ExplainOutput {
     pub bm25_rank: usize,
     pub vector_score: Option<f32>,
     pub vector_rank: Option<usize>,
+    pub reranker_score: Option<f32>,
+    pub reranker_rank: Option<usize>,
     pub fused_score: f32,
     pub fused_rank: usize,
     pub retrieval_trace: RetrievalTrace,
@@ -83,11 +85,12 @@ pub fn execute(store: &Store, input: &ExplainInput) -> Result<ExplainOutput, Shi
     let bm25_score = detail.bm25_score.unwrap_or(0.0);
     let vector_score = detail.vector_score;
     let vector_rank = detail.vector_rank;
+    let reranker_score = detail.reranker_score;
+    let reranker_rank = detail.reranker_rank;
     let fused_score = detail.fused_score.unwrap_or(0.0);
     let fused_rank = detail.fused_rank.unwrap_or(0);
     let fts_gen = detail.fts_gen.unwrap_or(0);
     let query_digest = detail.query_digest.clone().unwrap_or_default();
-
     // Build retrieval trace.
     let mut pipeline = Vec::new();
     let mut stages = Vec::new();
@@ -133,6 +136,25 @@ pub fn execute(store: &Store, input: &ExplainInput) -> Result<ExplainOutput, Shi
         );
     }
 
+    if let Some(rr_rank) = detail.reranker_rank {
+        pipeline.push("reranker".to_string());
+        stages.push(serde_json::json!({
+            "name": "reranker",
+            "input_query": &detail.query,
+            "this_result": {
+                "rank": rr_rank,
+                "raw_score": detail.reranker_score.unwrap_or(0.0),
+            },
+        }));
+        contributions.insert(
+            "reranker".to_string(),
+            serde_json::json!({
+                "rank": rr_rank,
+                "score": detail.reranker_score.unwrap_or(0.0),
+            }),
+        );
+    }
+
     let fusion = serde_json::json!({
         "method": "rrf",
         "k": RRF_K as u64,
@@ -160,6 +182,8 @@ pub fn execute(store: &Store, input: &ExplainInput) -> Result<ExplainOutput, Shi
         bm25_rank,
         vector_score,
         vector_rank,
+        reranker_score,
+        reranker_rank,
         fused_score,
         fused_rank,
         retrieval_trace,
