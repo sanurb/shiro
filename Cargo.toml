@@ -8,6 +8,7 @@ members = [
   "crates/shiro-embed",
   "crates/shiro-sdk",
   "crates/shiro-docling",
+  "crates/shiro-fastembed",
 ]
 resolver = "2"
 
@@ -54,3 +55,4 @@ shiro-parse = { path = "crates/shiro-parse", version = "0.4.0" }
 shiro-embed = { path = "crates/shiro-embed", version = "0.4.0" }
 shiro-sdk   = { path = "crates/shiro-sdk", version = "0.4.0" }
 shiro-docling = { path = "crates/shiro-docling", version = "0.4.0" }
+shiro-fastembed = { path = "crates/shiro-fastembed", version = "0.4.0" }

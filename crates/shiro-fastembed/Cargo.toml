@@ -1,0 +1,16 @@
+[package]
+name = "shiro-fastembed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "FastEmbed adapter for shiro — local embedding and reranking"
+
+[dependencies]
+shiro-core.workspace = true
+fastembed = "4"
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
