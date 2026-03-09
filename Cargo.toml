@@ -14,7 +14,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 rust-version = "1.75"
-version = "0.3.0"
+version = "0.4.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/sanurb/shiro"
 description = "Local-first PDF/Markdown knowledge engine"
@@ -47,10 +47,10 @@ pdf-extract = "0.7"
 ureq = { version = "2", features = ["json"] }
 
 # internal crates
-shiro-core = { path = "crates/shiro-core" }
-shiro-store = { path = "crates/shiro-store" }
-shiro-index = { path = "crates/shiro-index" }
-shiro-parse = { path = "crates/shiro-parse" }
-shiro-embed = { path = "crates/shiro-embed" }
-shiro-sdk   = { path = "crates/shiro-sdk" }
-shiro-docling = { path = "crates/shiro-docling" }
+shiro-core = { path = "crates/shiro-core", version = "0.4.0" }
+shiro-store = { path = "crates/shiro-store", version = "0.4.0" }
+shiro-index = { path = "crates/shiro-index", version = "0.4.0" }
+shiro-parse = { path = "crates/shiro-parse", version = "0.4.0" }
+shiro-embed = { path = "crates/shiro-embed", version = "0.4.0" }
+shiro-sdk   = { path = "crates/shiro-sdk", version = "0.4.0" }
+shiro-docling = { path = "crates/shiro-docling", version = "0.4.0" }

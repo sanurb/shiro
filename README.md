@@ -1,95 +1,272 @@
-<h1 align="center">🏯 shiro (城)</h1>
+<h1 align="center">shiro</h1>
 
 <p align="center">
-  <strong>The local-first knowledge engine for structured document retrieval.</strong>
+  <strong>Local-first knowledge engine for structured document retrieval.</strong>
 </p>
 
 <p align="center">
   <a href="https://github.com/sanurb/shiro/actions"><img src="https://img.shields.io/github/actions/workflow/status/sanurb/shiro/ci.yml?branch=master&style=flat-square&logo=github&color=181717" alt="CI Status"></a>
   <a href="https://github.com/sanurb/shiro/releases"><img src="https://img.shields.io/github/v/release/sanurb/shiro?style=flat-square&logo=rust&color=e44d26" alt="Latest Release"></a>
-  <img src="https://img.shields.io/badge/Architecture-Local--First-blue?style=flat-square" alt="Local-First">
   <img src="https://img.shields.io/badge/License-MIT%2FApache--2.0-4caf50?style=flat-square" alt="License">
 </p>
 
-> [!TIP]
-> **shiro** (Japanese for *castle*) is a high-performance, local-first knowledge engine designed to transform fragmented PDFs and Markdown files into a unified, structure-aware searchable base. 
+---
 
-Unlike traditional search tools that treat documents as flat strings, `shiro` parses content into a **Document Graph IR**, preserving reading order and block relationships. It exposes this data through a deterministic, JSON-native CLI, making your private library instantly accessible to AI agents like Claude and Cursor.
+Shiro transforms PDFs and Markdown files into a unified, structure-aware searchable base on your local machine. Documents are parsed into a BlockGraph intermediate representation that preserves reading order, heading hierarchy, and block relationships. Retrieval is powered by BM25 full-text search via Tantivy, with SKOS taxonomy support and heuristic enrichment. Every command emits deterministic JSON to stdout wrapped in a HATEOAS envelope, making shiro a first-class building block for AI agents, shell pipelines, and automation toolchains.
 
-## ✨ Key Differentiators
+## Key Differentiators
 
-* **Structure-Aware IR:** Documents are modeled as hierarchical blocks with byte-level spans, allowing for precise context windowing in LLM applications.
-* **Deterministic JSON CLI:** Built for the Unix philosophy. Every command outputs a structured JSON envelope, perfect for `jq` piping or automated agent consumption.
-* **HATEOAS Navigation:** Responses include `next_actions` with typed parameter templates, enabling AI agents to discover commands dynamically.
-* **Zero-API Dependency:** Everything—from parsing to BM25 indexing—runs on your hardware. No data leaves your machine.
-* **Pluggable Parsers:** Built-in support for Markdown (pulldown-cmark with block graph IR), PDF (pdf-extract), and plain text, with trait-based extensibility for custom formats.
+- **Structure-Aware IR** -- Documents are modeled as hierarchical blocks (headings, paragraphs, code, tables) with byte-level spans, enabling precise context windowing for LLM applications.
+- **Deterministic JSON CLI** -- Every command outputs a structured JSON envelope to stdout. No human-readable mode. Built for `jq`, scripts, and agent consumption.
+- **HATEOAS Navigation** -- Every response includes `next_actions` with typed parameter templates, enabling AI agents to discover and chain commands dynamically.
+- **Zero-API Dependency** -- Parsing, indexing, and search all run locally. No data leaves your machine.
+- **Pluggable Parsers** -- Built-in support for Markdown (pulldown-cmark), PDF (pdf-extract), and plain text, plus a Docling adapter for structured PDF extraction via external Python subprocess.
 
-## 🚀 Getting Started
+## Installation
 
-### 1. Installation
-
-You can install `shiro` either from a prebuilt release or via Cargo.
-
-#### Option A: Install via shell script (prebuilt binaries)
+### Option A: Shell script (prebuilt binaries)
 
 ```bash
-# macOS / Linux
 curl -sSfL https://raw.githubusercontent.com/sanurb/shiro/master/install.sh | sh
 ```
 
-The script:
-
-- **Detects your OS and CPU architecture.**
-- **Downloads the latest `shiro` GitHub release for your platform.**
-- **Installs the `shiro` binary into `~/.local/bin` by default.**
-
-To change the installation directory, set `SHIRO_INSTALL_DIR` before running the script, for example:
+Detects your OS and architecture, downloads the latest release from GitHub, and installs the `shiro` binary into `~/.local/bin`. Override with `SHIRO_INSTALL_DIR`:
 
 ```bash
 SHIRO_INSTALL_DIR=/usr/local/bin \
   curl -sSfL https://raw.githubusercontent.com/sanurb/shiro/master/install.sh | sh
 ```
 
-#### Option C: Install via npm
+### Option B: npm
 
 ```bash
-npx @sanurb/shiro-cli
-# or install globally
 npm install -g @sanurb/shiro-cli
 ```
 
+The npm package does not bundle the binary. A `postinstall` script automatically downloads the correct platform binary from GitHub Releases.
 
-#### Option B: Install via Cargo
-
-If you prefer building from source or are on an unsupported platform:
+### Option C: Cargo (build from source)
 
 ```bash
 cargo install shiro-cli
 ```
 
-This installs the `shiro` binary (the **crate name** is `shiro-cli`, the **npm package** is `@sanurb/shiro-cli`, but the **executable name** you run is still `shiro`).
+The crate name is `shiro-cli`, the npm package is `@sanurb/shiro-cli`, but the executable you run is `shiro`.
 
-### 2. Initialize your Fortress
+## Quick Start
+
+Initialize a knowledge base and ingest documents:
 
 ```bash
 shiro init
 shiro ingest ~/Documents/KnowledgeBase
-
 ```
 
-### 3. Query with JSON Output
+Search for a concept:
 
 ```bash
-# Search for specific concepts
-shiro search "distributed consensus" | jq '.result.results[0].snippet'
-
+shiro search "distributed consensus"
 ```
 
-## 🤖 AI Integration
+```json
+{
+  "ok": true,
+  "result": {
+    "query": "distributed consensus",
+    "results": [
+      {
+        "result_id": "r:a1b2c3",
+        "doc_id": "d:9f8e7d",
+        "block_idx": 4,
+        "block_kind": "paragraph",
+        "span_start": 1024,
+        "span_end": 1280,
+        "snippet": "Raft achieves consensus by electing a leader...",
+        "scores": {
+          "bm25_score": 12.34,
+          "bm25_rank": 1,
+          "fused_score": 12.34,
+          "fused_rank": 1
+        },
+        "context_window": null
+      }
+    ]
+  },
+  "next_actions": [
+    {"action": "read", "params": {"id": "d:9f8e7d"}},
+    {"action": "explain", "params": {"result_id": "r:a1b2c3"}}
+  ]
+}
+```
 
-`shiro`'s deterministic JSON CLI with HATEOAS navigation makes it ideal for AI agent consumption. Agents can discover available commands dynamically via `shiro` (root self-doc) or `shiro capabilities`, then parse structured responses with `jq` or directly.
+Read the full document:
 
-> See [Code Mode (MCP)](#code-mode-mcp) below for the two-tool stdio server.
+```bash
+shiro read d:9f8e7d
+```
+
+Explain how a result was scored:
+
+```bash
+shiro explain r:a1b2c3
+```
+
+```json
+{
+  "ok": true,
+  "result": {
+    "result_id": "r:a1b2c3",
+    "query": "distributed consensus",
+    "query_digest": "blake3:...",
+    "fts_generation": 7,
+    "doc_id": "d:9f8e7d",
+    "block_idx": 4,
+    "block_kind": "paragraph",
+    "span_start": 1024,
+    "span_end": 1280,
+    "bm25_score": 12.34,
+    "bm25_rank": 1,
+    "fused_score": 12.34,
+    "fused_rank": 1,
+    "retrieval_trace": {
+      "pipeline": "bm25_only",
+      "stages": ["tokenize", "bm25_rank"],
+      "fusion": null
+    }
+  },
+  "next_actions": [...]
+}
+```
+
+## Search and Retrieval
+
+Shiro search returns block-level results. Each hit identifies the exact block within a document (`block_idx`, `block_kind`) and byte span (`span_start`, `span_end`), along with BM25 scores and ranks.
+
+### Context expansion
+
+Use `--expand` to include surrounding blocks for richer context:
+
+```bash
+shiro search "error handling" --expand
+```
+
+Context expansion defaults to `max_blocks=12` and `max_chars=8000`. When enabled, each result includes a `context_window` field with the expanded text.
+
+### Scoring
+
+Every result carries a `scores` object:
+
+| Field | Description |
+|-------|-------------|
+| `bm25_score` | Raw BM25 relevance score |
+| `bm25_rank` | Rank position in BM25 results |
+| `fused_score` | Fused score (currently equals `bm25_score`) |
+| `fused_rank` | Fused rank (currently equals `bm25_rank`) |
+
+**Note:** Hybrid search mode is scaffolded with RRF fusion (k=60) but currently executes BM25-only. Vector embedding infrastructure is implemented (FlatIndex, HttpEmbedder) but not yet wired into the query path. When vector search becomes available, `fused_score` and `fused_rank` will reflect the combined ranking.
+
+## Explainability
+
+Every search result can be explained:
+
+```bash
+shiro explain <result_id>
+```
+
+The response includes a `retrieval_trace` object describing the full scoring pipeline:
+
+- **pipeline** -- Which retrieval path was used (e.g., `bm25_only`)
+- **stages** -- Ordered list of processing stages applied
+- **fusion** -- Fusion details when multiple sources contribute (null when single-source)
+
+Each source's contribution is recorded, enabling full audit of how results are ranked.
+
+## Parsing and Adapters
+
+### Built-in parsers
+
+| Parser | Format | Technology |
+|--------|--------|------------|
+| `markdown` | `.md` files | [pulldown-cmark](https://github.com/raphlinus/pulldown-cmark) with BlockGraph IR |
+| `pdf` | `.pdf` files | [pdf-extract](https://crates.io/crates/pdf-extract) |
+| `plaintext` | `.txt` and other text | Paragraph-boundary segmentation |
+
+### Docling adapter (structured PDF)
+
+The `shiro-docling` crate provides a high-fidelity PDF parser that delegates to the [Docling](https://github.com/DS4SD/docling) Python library via subprocess. It extracts tables, figures, and reading order that basic PDF extraction misses.
+
+**Setup:**
+
+```bash
+pip install docling
+```
+
+**Usage:**
+
+```bash
+shiro add document.pdf --parser premium
+shiro ingest ./papers --parser premium
+```
+
+Docling requires the external `docling` Python binary to be available on `PATH`. The adapter communicates via subprocess, not network calls.
+
+## SKOS Taxonomy
+
+Shiro supports SKOS-style taxonomies for organizing documents by concept:
+
+```bash
+# Add a concept
+shiro taxonomy add "Machine Learning"
+
+# List all concepts
+shiro taxonomy list
+
+# Define relationships between concepts
+shiro taxonomy relations "Machine Learning" --broader "Computer Science"
+
+# Assign a concept to a document
+shiro taxonomy assign d:9f8e7d "Machine Learning"
+
+# Import a SKOS taxonomy file
+shiro taxonomy import taxonomy.ttl
+```
+
+## Enrichment
+
+Heuristic enrichment extracts metadata from document content:
+
+```bash
+shiro enrich d:9f8e7d
+```
+
+The heuristic provider analyzes content to extract:
+
+- **title** -- Derived from headings or first significant text
+- **summary** -- Condensed description of the document
+- **tags** -- Keywords extracted from content analysis
+
+Enrichment is heuristic-only; no external AI services are called.
+
+## Configuration
+
+Manage configuration with `shiro config`:
+
+```bash
+shiro config get search.limit
+shiro config set search.limit 20
+```
+
+### Configuration keys
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `search.limit` | u32 | Maximum search results |
+| `embed.base_url` | string | Embedding service base URL |
+| `embed.model` | string | Embedding model name |
+| `embed.dimensions` | usize | Expected embedding dimensions |
+| `embed.api_key` | string | Embedding service API key |
+
+The `embed.*` keys configure the vector embedding infrastructure. They take effect once vector search is wired into the query path.
 
 ## Code Mode (MCP)
 
@@ -100,24 +277,36 @@ Shiro exposes a [Model Context Protocol](https://modelcontextprotocol.io) server
 | `shiro.search` | Discover SDK operations, schemas, and examples |
 | `shiro.execute` | Run a DSL program against the knowledge base |
 
-### Quick start
+Start the MCP server:
 
 ```bash
-# Start the MCP server
 shiro mcp
 ```
 
-### shiro.search example
+### DSL
 
-```json
-{"query": "search", "limit": 5}
-```
+The `shiro.execute` tool accepts a program written in a small deterministic DSL with these statements:
 
-Returns ranked results with operation specs, parameter schemas, and usage examples.
+| Statement | Description |
+|-----------|-------------|
+| `let` | Bind a variable to a call result |
+| `call` | Invoke an SDK operation |
+| `if` | Conditional branching |
+| `for_each` | Iterate over a collection |
+| `return` | Produce the program output |
 
-### shiro.execute example
+### Limits
 
-Multi-step program that searches, reads the top hit, then returns a summary:
+| Limit | Value |
+|-------|-------|
+| Max steps | 200 |
+| Max iterations | 100 |
+| Max output bytes | 1 MiB |
+| Timeout | 30s |
+
+### Example program
+
+Search, read the top hit, and return a summary:
 
 ```json
 {
@@ -132,41 +321,58 @@ Multi-step program that searches, reads the top hit, then returns a summary:
 ### Guarantees
 
 - **Two tools only** -- `shiro.search` and `shiro.execute`
-- **Typed SDK** -- all operations backed by schemars-derived JSON Schemas
-- **Deterministic outputs** -- search results are scored and name-sorted
-- **Strict validation** -- unknown fields rejected, all inputs schema-checked
-- **Stable error codes** -- every error maps to an `E_*` code
-- **Safe execution** -- no arbitrary code, hard limits on steps/iterations/bytes/time
+- **Typed SDK** -- All operations backed by schemars-derived JSON Schemas
+- **Deterministic outputs** -- Search results are scored and name-sorted
+- **Strict validation** -- Unknown fields rejected, all inputs schema-checked
+- **Stable error codes** -- Every error maps to an `E_*` code
+- **Safe execution** -- No arbitrary code; hard limits on steps, iterations, bytes, and time
 
-## 🛠 Project Status & Roadmap
+## Project Status
 
-We prioritize transparency. Here is the current implementation status of the engine:
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Markdown parsing | Stable | pulldown-cmark with BlockGraph IR |
+| PDF parsing | Stable | pdf-extract with loss detection |
+| Docling adapter | Stable | Structured PDF via Python subprocess (`pip install docling`) |
+| Plain text indexing | Stable | Paragraph-boundary segmentation |
+| BM25 full-text search | Stable | Tantivy engine |
+| JSON / HATEOAS layer | Stable | Structured output with `next_actions` on every response |
+| SKOS taxonomy | Implemented | Add, list, relations, assign, import |
+| Completions | Implemented | Shell completions generation |
+| Enrichment | Heuristic-only | Title, summary, tags from content analysis |
+| MCP server | Code Mode | Stdio JSON-RPC 2.0 with DSL interpreter |
+| Hybrid search | BM25-only (scaffold) | RRF fusion (k=60) scaffolded; falls back to BM25 at runtime |
+| Vector embedding | Infrastructure-only | FlatIndex and HttpEmbedder implemented; not wired into query path |
+| BlockGraph persistence | Stable | First-class stored representation (store schema v6) |
+| Context expansion | Stable | `--expand` with configurable max_blocks and max_chars |
+| Processing fingerprints | Stable | BLAKE3-based dedup on every add/ingest |
 
-| Feature | Status | Technology |
-| --- | --- | --- |
-| **Markdown Parsing** | ✅ Stable | [pulldown-cmark](https://github.com/raphlinus/pulldown-cmark) with Block Graph IR |
-| **PDF Parsing** | ✅ Stable | [pdf-extract](https://crates.io/crates/pdf-extract) with loss detection |
-| **Plain Text Indexing** | ✅ Stable | Paragraph-boundary segmentation |
-| **BM25 Full-Text Search** | ✅ Stable | [Tantivy](https://github.com/quickwit-oss/tantivy) engine |
-| **JSON/HATEOAS Layer** | ✅ Stable | Structured CLI output with `next_actions` |
-| **MCP Server** | `v0.3.0` | Stdio JSON-RPC 2.0 with DSL interpreter (see [docs/MCP.md](docs/MCP.md)) |
-| **Vector Search** | Planned | Traits defined; no embedder implementation yet |
-| **SKOS Taxonomy** | `v0.2.0` | SKOS-style concepts with add/list/relations/assign/import |
-| **AI Enrichment** | `v0.2.0` | Heuristic enrichment via `--enrich` flag |
+## Architecture
 
-## 🏗 Architecture
+Shiro is a Rust workspace with eight crates:
 
-`shiro` is built in Rust for memory safety and uncompromising performance.
+| Crate | Role |
+|-------|------|
+| `shiro-core` | Domain types, config, error handling |
+| `shiro-store` | SQLite persistence (schema v6), BlockGraph storage |
+| `shiro-index` | Tantivy BM25 full-text search, generation tracking, staging/promote |
+| `shiro-parse` | Markdown, PDF, and plaintext parsers |
+| `shiro-docling` | Docling subprocess adapter for structured PDF |
+| `shiro-embed` | FlatIndex (vector storage), HttpEmbedder, embedding traits |
+| `shiro-sdk` | Operation registry, DSL interpreter, RRF fusion |
+| `shiro-cli` | CLI entry point (16 commands), published to crates.io |
 
-* **Source of Truth:** [SQLite](https://sqlite.org) via `rusqlite` for metadata and state management.
-* **Search Core:** [Tantivy](https://github.com/quickwit-oss/tantivy) for world-class indexing speed.
-* **Deduplication:** Content-addressed IDs using [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) hashes.
+For design decisions and ADRs, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## 🤝 Contributing
+## Contributing
 
-We welcome contributions that adhere to our core principles of speed, privacy, and structural integrity.
+Contributions that uphold speed, privacy, and structural integrity are welcome.
 
-1. Review the [ARCHITECTURE.md](docs/ARCHITECTURE.md) for design patterns.
+1. Review the [Architecture](docs/ARCHITECTURE.md) for design patterns and ADRs.
 2. Review the [CLI Reference](docs/CLI.md) for the output contract.
 3. Ensure all changes pass the quality gate: `cargo test && cargo clippy`.
 4. Open a Pull Request with a clear description of the impact.
+
+## License
+
+Dual-licensed under MIT and Apache 2.0. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).

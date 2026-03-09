@@ -67,3 +67,6 @@ yarn-error.log*
 # Build outputs
 /dist/
 *.tsbuildinfo
+
+# npm postinstall binary
+/bin/
