@@ -41,7 +41,7 @@ Pure domain crate. Zero adapter dependencies. Every other crate depends on this;
 
 | Port | Impls | Contract |
 |------|-------|----------|
-| `Parser` | MarkdownParser (shiro-parse), PdfParser (shiro-parse) | `name()` + `parse()`. MUST be deterministic: identical input → identical output |
+| `Parser` | MarkdownParser, PdfParser (shiro-parse), DoclingParser (shiro-docling) | `name()` + `version()` + `parse()`. MUST be deterministic: identical input → identical output |
 | `Embedder` | HttpEmbedder (shiro-embed) | `embed()`/`embed_batch()`/`dimensions()`. MUST be deterministic: identical input → identical embedding |
 | `VectorIndex` | FlatIndex (shiro-embed) | `upsert()`/`search()`. MUST be idempotent on upsert, thread-safe (`&self` concurrent calls) |
 

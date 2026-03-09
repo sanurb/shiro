@@ -66,6 +66,10 @@ enum Commands {
     Add {
         /// Path or URL of the file to add.
         path: String,
+
+        /// Parser to use (auto, plaintext, markdown, pdf, docling).
+        #[arg(long, default_value = "auto")]
+        parser: String,
     },
 
     /// Batch-ingest documents from directories.
@@ -80,6 +84,10 @@ enum Commands {
         /// Stream NDJSON progress to stdout.
         #[arg(long)]
         follow: bool,
+
+        /// Parser to use (auto, plaintext, markdown, pdf, docling).
+        #[arg(long, default_value = "auto")]
+        parser: String,
     },
 
     /// Search indexed documents.
@@ -355,18 +363,19 @@ fn dispatch(cli: &Cli) -> Result<CmdOutput, ShiroError> {
             commands::init::run(&home)
         }
 
-        Some(Commands::Add { path, .. }) => {
+        Some(Commands::Add { path, parser }) => {
             let home = resolve_home(cli)?;
-            commands::add::run(&home, path)
+            commands::add::run(&home, path, parser)
         }
 
         Some(Commands::Ingest {
             dirs,
             max_files,
             follow,
+            parser,
         }) => {
             let home = resolve_home(cli)?;
-            commands::ingest::run(&home, dirs, *max_files, *follow)
+            commands::ingest::run(&home, dirs, *max_files, *follow, parser)
         }
 
         Some(Commands::Search {
@@ -516,6 +525,9 @@ fn suggest_fix(err: &ShiroError) -> Option<&'static str> {
             Some("Database may be corrupt. Run `shiro doctor` or re-init with `shiro init`.")
         }
         ShiroError::ParsePdf { .. } => Some("Ensure the file is a valid PDF."),
+        ShiroError::ParseExternal { .. } => Some(
+            "External parser failed. Check that the parser binary is installed and accessible.",
+        ),
         ShiroError::Config { .. } => Some("Check SHIRO_HOME or run `shiro init`."),
         _ => None,
     }

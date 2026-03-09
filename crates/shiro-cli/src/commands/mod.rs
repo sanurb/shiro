@@ -1,3 +1,4 @@
+use shiro_core::ports::Parser;
 use shiro_core::{DocId, ShiroError};
 use shiro_store::Store;
 
@@ -39,4 +40,30 @@ pub(crate) fn resolve_doc_id(store: &Store, id_or_title: &str) -> Result<DocId, 
     Err(ShiroError::NotFoundMsg {
         message: format!("no document matching '{id_or_title}'"),
     })
+}
+
+/// Select a parser by name.
+///
+/// Supported values: `"auto"`, `"plaintext"`, `"markdown"`, `"pdf"`, `"docling"`.
+/// `"auto"` picks based on file extension (default, preserves existing behavior).
+pub(crate) fn select_parser(name: &str, path: Option<&str>) -> Result<Box<dyn Parser>, ShiroError> {
+    match name {
+        "auto" => {
+            let ext = path.and_then(|p| p.rsplit('.').next()).unwrap_or("");
+            match ext {
+                "md" | "markdown" => Ok(Box::new(shiro_parse::MarkdownParser)),
+                "pdf" => Ok(Box::new(shiro_parse::PdfParser)),
+                _ => Ok(Box::new(shiro_parse::PlainTextParser)),
+            }
+        }
+        "plaintext" => Ok(Box::new(shiro_parse::PlainTextParser)),
+        "markdown" => Ok(Box::new(shiro_parse::MarkdownParser)),
+        "pdf" => Ok(Box::new(shiro_parse::PdfParser)),
+        "docling" => Ok(Box::new(shiro_docling::DoclingParser::new())),
+        other => Err(ShiroError::InvalidInput {
+            message: format!(
+                "unknown parser '{other}'. Supported: auto, plaintext, markdown, pdf, docling"
+            ),
+        }),
+    }
 }

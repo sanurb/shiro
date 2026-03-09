@@ -11,6 +11,7 @@ JSON-only CLI with HATEOAS envelope. clap v4 derive macros. All stdout is single
 | Change CLI args | `src/main.rs` | `Commands` enum (clap derive), type enums (`SearchModeArg`, `ReadView`, etc.) |
 | Fix error mapping | `src/main.rs` | `suggest_fix()` and `recovery_actions()` |
 | Title→DocId resolution | `src/commands/mod.rs` | `resolve_doc_id()` shared helper |
+| Parser selection | `src/commands/mod.rs` | `select_parser()` maps auto/plaintext/markdown/pdf/docling → `Box<dyn Parser>` |
 
 ## SDK ACCESS PATTERNS
 
@@ -46,7 +47,7 @@ Dispatch in `main.rs` calls the function, `print_success()` or `print_error()` h
 | init | `init.rs` | Create dirs + open Store (migrates) + open FtsIndex. Idempotent |
 | root | `root.rs` | No-subcommand: self-documenting JSON listing all commands |
 | taxonomy | `taxonomy.rs` | Sub-enum with 5 sub-commands: `add`/`list`/`relations`/`assign`/`import`. Each has `run_*` fn |
-| mcp | `mcp.rs` | JSON-RPC stdio server. 2 tools: search + execute |
+| mcp | `mcp.rs` | JSON-RPC stdio server. 2 tools: search + execute. Lazy-init ctx with `ensure_ctx()` |
 | capabilities | `capabilities.rs` | Static capability arrays + `schema_version` from Store |
 | reindex | `reindex.rs` | Rebuild FTS index from stored segments via `shiro_sdk::ops::reindex` |
 | enrich | `enrich.rs` | Run enrichment pipeline on a document via `shiro_sdk::ops::enrich` |
@@ -60,7 +61,9 @@ Dispatch in `main.rs` calls the function, `print_success()` or `print_error()` h
 
 ## TESTS
 
-- `tests/integration.rs` + `tests/performance.rs`: 26 tests total, each creates `TempDir`
-- Spawns real binary via `env!(CARGO_BIN_EXE_shiro)`, `--home` tempdir, `--log-level silent`
+- `tests/integration.rs`: 25 tests — full pipeline + envelope schema + ADR-007 field hiding + idempotency + JSON schema stability
+- `tests/mcp.rs`: 15 tests — JSON-RPC 2.0 stdio roundtrip via `mcp_roundtrip()` helper
+- `tests/performance.rs`: 2 latency smoke tests (P50/P95 ingest + search)
+- All spawn real binary via `env!(CARGO_BIN_EXE_shiro)` with `--home` tempdir + `--log-level silent`
 - All output parsed as JSON — tests validate envelope schema, exit codes, pipeline correctness
 - `cargo test -p shiro-cli` to run

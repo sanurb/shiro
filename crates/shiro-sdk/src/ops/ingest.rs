@@ -231,6 +231,6 @@ fn walk_dir(dir: &Path, out: &mut Vec<String>) -> Result<(), ShiroError> {
 fn is_supported(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()),
-        Some("txt" | "md" | "markdown")
+        Some("txt" | "md" | "markdown" | "pdf")
     )
 }

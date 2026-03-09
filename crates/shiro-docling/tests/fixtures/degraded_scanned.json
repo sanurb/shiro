@@ -1,0 +1,71 @@
+{
+  "schema_name": "DoclingDocument",
+  "version": "1.3.0",
+  "name": "scanned_document",
+  "texts": [
+    {
+      "self_ref": "#/texts/0",
+      "label": "paragraph",
+      "text": "Partially recognized text from OCR with some artifacts...",
+      "orig": "Partially recognized text from OCR with some artifacts...",
+      "prov": [
+        {
+          "page_no": 1,
+          "bbox": { "l": 72.0, "t": 72.0, "r": 540.0, "b": 200.0 }
+        }
+      ]
+    }
+  ],
+  "tables": [
+    {
+      "self_ref": "#/tables/0",
+      "label": "table",
+      "prov": [
+        {
+          "page_no": 1,
+          "bbox": { "l": 72.0, "t": 250.0, "r": 540.0, "b": 400.0 }
+        }
+      ],
+      "data": null
+    }
+  ],
+  "pictures": [
+    {
+      "self_ref": "#/pictures/0",
+      "label": "picture",
+      "prov": [
+        {
+          "page_no": 1,
+          "bbox": { "l": 72.0, "t": 420.0, "r": 540.0, "b": 600.0 }
+        }
+      ]
+    },
+    {
+      "self_ref": "#/pictures/1",
+      "label": "picture",
+      "prov": [
+        {
+          "page_no": 2,
+          "bbox": { "l": 72.0, "t": 72.0, "r": 540.0, "b": 400.0 }
+        }
+      ]
+    }
+  ],
+  "body": {
+    "self_ref": "#/body",
+    "children": [
+      { "$ref": "#/texts/0" },
+      { "$ref": "#/pictures/0" },
+      { "$ref": "#/tables/0" },
+      { "$ref": "#/pictures/1" }
+    ]
+  },
+  "furniture": {
+    "self_ref": "#/furniture",
+    "children": []
+  },
+  "pages": {
+    "1": { "page_no": 1, "size": { "width": 612.0, "height": 792.0 } },
+    "2": { "page_no": 2, "size": { "width": 612.0, "height": 792.0 } }
+  }
+}

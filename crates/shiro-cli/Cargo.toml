@@ -18,6 +18,7 @@ shiro-index.workspace = true
 shiro-parse.workspace = true
 shiro-embed.workspace = true
 shiro-sdk.workspace = true
+shiro-docling.workspace = true
 blake3.workspace = true
 camino.workspace = true
 clap.workspace = true

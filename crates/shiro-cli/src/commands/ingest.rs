@@ -1,5 +1,6 @@
 //! `shiro ingest` — batch-add documents from directories.
 
+use crate::commands::select_parser;
 use crate::envelope::{CmdOutput, NextAction};
 use shiro_core::{ShiroError, ShiroHome};
 use shiro_sdk::{Engine, IngestEvent, IngestInput};
@@ -9,9 +10,10 @@ pub fn run(
     dirs: &[std::path::PathBuf],
     max_files: Option<usize>,
     follow: bool,
+    parser_name: &str,
 ) -> Result<CmdOutput, ShiroError> {
     let engine = Engine::open(home.clone())?;
-    let parser = shiro_parse::PlainTextParser;
+    let parser = select_parser(parser_name, None)?;
 
     let input = IngestInput {
         dirs: dirs
@@ -24,7 +26,7 @@ pub fn run(
     let cb: &dyn Fn(&IngestEvent) = &emit_event;
     let on_event: Option<&dyn Fn(&IngestEvent)> = if follow { Some(cb) } else { None };
 
-    let output = engine.ingest(&parser, &input, on_event)?;
+    let output = engine.ingest(parser.as_ref(), &input, on_event)?;
 
     let result = serde_json::json!({
         "added": output.added,

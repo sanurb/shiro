@@ -1,16 +1,13 @@
-# SHIRO-EMBED
+# shiro-embed
 
-**Generated:** 2026-03-06 | **Branch:** master
-
-## OVERVIEW
-
-Vector embedding implementations: storage + generation.
+Vector embedding implementations: storage + generation management.
 
 | Type | Trait | File | Purpose |
 |------|-------|------|---------|
-| `FlatIndex` | `VectorIndex` | `src/flat.rs` (691 lines) | Brute-force cosine similarity, JSONL persistence, blake3 checksums |
-| `HttpEmbedder` | `Embedder` | `src/http.rs` (118 lines) | OpenAI-compatible `/v1/embeddings` HTTP endpoint |
-| `StubEmbedder` | `Embedder` | `src/stub.rs` (65 lines) | Returns zero vectors, test-only |
+| `FlatIndex` | `VectorIndex` | `src/flat.rs` (689 lines) | Brute-force cosine similarity, JSONL persistence, blake3 checksums |
+| `HttpEmbedder` | `Embedder` | `src/http.rs` | OpenAI-compatible `/v1/embeddings` HTTP endpoint |
+| `StubEmbedder` | `Embedder` | `src/stub.rs` | Returns zero vectors, test-only |
+| `DeterministicStubEmbedder` | `Embedder` | `src/stub.rs` | Deterministic hash-based vectors, test-only |
 
 ## FLAT INDEX INTERNALS
 
@@ -47,3 +44,8 @@ Callers use `gen_id()` to detect stale indexes.
 
 Config via `HttpEmbedderConfig`: `base_url`, `model`, `api_key` (optional), `dimensions`.
 Batches via `embed_batch()`. Single via `embed()` (delegates to batch).
+
+## KNOWN ISSUES
+
+- `flush()` uses `unwrap()` on `Vec<u8>` write (infallible but unguarded) — would panic if buffer ever replaced with fallible writer
+- `open()` silently drops entries on dimension mismatch — no error surface to caller

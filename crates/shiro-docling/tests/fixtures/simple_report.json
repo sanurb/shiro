@@ -1,0 +1,209 @@
+{
+  "schema_name": "DoclingDocument",
+  "version": "1.3.0",
+  "name": "simple_report",
+  "texts": [
+    {
+      "self_ref": "#/texts/0",
+      "label": "section_header",
+      "text": "Executive Summary",
+      "orig": "Executive Summary",
+      "prov": [
+        {
+          "page_no": 1,
+          "bbox": { "l": 72.0, "t": 72.0, "r": 300.0, "b": 90.0 }
+        }
+      ],
+      "level": 1
+    },
+    {
+      "self_ref": "#/texts/1",
+      "label": "paragraph",
+      "text": "This report presents the findings of our annual review. Key metrics showed improvement across all departments.",
+      "orig": "This report presents the findings of our annual review. Key metrics showed improvement across all departments.",
+      "prov": [
+        {
+          "page_no": 1,
+          "bbox": { "l": 72.0, "t": 100.0, "r": 540.0, "b": 140.0 }
+        }
+      ]
+    },
+    {
+      "self_ref": "#/texts/2",
+      "label": "section_header",
+      "text": "Methodology",
+      "orig": "Methodology",
+      "prov": [
+        {
+          "page_no": 1,
+          "bbox": { "l": 72.0, "t": 160.0, "r": 250.0, "b": 178.0 }
+        }
+      ],
+      "level": 1
+    },
+    {
+      "self_ref": "#/texts/3",
+      "label": "paragraph",
+      "text": "We employed a mixed-methods approach combining quantitative analysis with qualitative interviews.",
+      "orig": "We employed a mixed-methods approach combining quantitative analysis with qualitative interviews.",
+      "prov": [
+        {
+          "page_no": 1,
+          "bbox": { "l": 72.0, "t": 188.0, "r": 540.0, "b": 220.0 }
+        }
+      ]
+    },
+    {
+      "self_ref": "#/texts/4",
+      "label": "list_item",
+      "text": "Survey of 500 employees",
+      "orig": "Survey of 500 employees",
+      "prov": [
+        {
+          "page_no": 1,
+          "bbox": { "l": 90.0, "t": 230.0, "r": 400.0, "b": 245.0 }
+        }
+      ]
+    },
+    {
+      "self_ref": "#/texts/5",
+      "label": "list_item",
+      "text": "Financial data analysis (Q1-Q4)",
+      "orig": "Financial data analysis (Q1-Q4)",
+      "prov": [
+        {
+          "page_no": 1,
+          "bbox": { "l": 90.0, "t": 245.0, "r": 400.0, "b": 260.0 }
+        }
+      ]
+    },
+    {
+      "self_ref": "#/texts/6",
+      "label": "caption",
+      "text": "Table 1: Department Performance Metrics",
+      "orig": "Table 1: Department Performance Metrics",
+      "prov": [
+        {
+          "page_no": 2,
+          "bbox": { "l": 72.0, "t": 72.0, "r": 400.0, "b": 88.0 }
+        }
+      ]
+    },
+    {
+      "self_ref": "#/texts/7",
+      "label": "section_header",
+      "text": "Conclusions",
+      "orig": "Conclusions",
+      "prov": [
+        {
+          "page_no": 2,
+          "bbox": { "l": 72.0, "t": 300.0, "r": 250.0, "b": 318.0 }
+        }
+      ],
+      "level": 1
+    },
+    {
+      "self_ref": "#/texts/8",
+      "label": "paragraph",
+      "text": "Overall performance exceeded targets by 12%. Recommended actions include expanding the training program.",
+      "orig": "Overall performance exceeded targets by 12%. Recommended actions include expanding the training program.",
+      "prov": [
+        {
+          "page_no": 2,
+          "bbox": { "l": 72.0, "t": 328.0, "r": 540.0, "b": 368.0 }
+        }
+      ]
+    },
+    {
+      "self_ref": "#/texts/9",
+      "label": "footnote",
+      "text": "Based on fiscal year 2024 data.",
+      "orig": "Based on fiscal year 2024 data.",
+      "prov": [
+        {
+          "page_no": 2,
+          "bbox": { "l": 72.0, "t": 700.0, "r": 300.0, "b": 712.0 }
+        }
+      ]
+    }
+  ],
+  "tables": [
+    {
+      "self_ref": "#/tables/0",
+      "label": "table",
+      "prov": [
+        {
+          "page_no": 2,
+          "bbox": { "l": 72.0, "t": 95.0, "r": 540.0, "b": 280.0 }
+        }
+      ],
+      "data": {
+        "num_rows": 4,
+        "num_cols": 3,
+        "table_cells": [
+          { "text": "Department", "row_index": 0, "col_index": 0, "is_header": true },
+          { "text": "Target", "row_index": 0, "col_index": 1, "is_header": true },
+          { "text": "Actual", "row_index": 0, "col_index": 2, "is_header": true },
+          { "text": "Engineering", "row_index": 1, "col_index": 0 },
+          { "text": "85%", "row_index": 1, "col_index": 1 },
+          { "text": "92%", "row_index": 1, "col_index": 2 },
+          { "text": "Sales", "row_index": 2, "col_index": 0 },
+          { "text": "90%", "row_index": 2, "col_index": 1 },
+          { "text": "95%", "row_index": 2, "col_index": 2 },
+          { "text": "Support", "row_index": 3, "col_index": 0 },
+          { "text": "80%", "row_index": 3, "col_index": 1 },
+          { "text": "88%", "row_index": 3, "col_index": 2 }
+        ]
+      }
+    }
+  ],
+  "pictures": [
+    {
+      "self_ref": "#/pictures/0",
+      "label": "picture",
+      "prov": [
+        {
+          "page_no": 1,
+          "bbox": { "l": 300.0, "t": 72.0, "r": 540.0, "b": 200.0 }
+        }
+      ]
+    }
+  ],
+  "body": {
+    "self_ref": "#/body",
+    "children": [
+      { "$ref": "#/texts/0" },
+      { "$ref": "#/texts/1" },
+      { "$ref": "#/pictures/0" },
+      {
+        "self_ref": "#/groups/0",
+        "label": "group",
+        "children": [
+          { "$ref": "#/texts/2" },
+          { "$ref": "#/texts/3" },
+          {
+            "self_ref": "#/groups/1",
+            "label": "unordered_list",
+            "children": [
+              { "$ref": "#/texts/4" },
+              { "$ref": "#/texts/5" }
+            ]
+          }
+        ]
+      },
+      { "$ref": "#/texts/6" },
+      { "$ref": "#/tables/0" },
+      { "$ref": "#/texts/7" },
+      { "$ref": "#/texts/8" },
+      { "$ref": "#/texts/9" }
+    ]
+  },
+  "furniture": {
+    "self_ref": "#/furniture",
+    "children": []
+  },
+  "pages": {
+    "1": { "page_no": 1, "size": { "width": 612.0, "height": 792.0 } },
+    "2": { "page_no": 2, "size": { "width": 612.0, "height": 792.0 } }
+  }
+}

@@ -7,6 +7,7 @@ members = [
   "crates/shiro-cli",
   "crates/shiro-embed",
   "crates/shiro-sdk",
+  "crates/shiro-docling",
 ]
 resolver = "2"
 
@@ -52,3 +53,4 @@ shiro-index = { path = "crates/shiro-index" }
 shiro-parse = { path = "crates/shiro-parse" }
 shiro-embed = { path = "crates/shiro-embed" }
 shiro-sdk   = { path = "crates/shiro-sdk" }
+shiro-docling = { path = "crates/shiro-docling" }

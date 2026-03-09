@@ -25,7 +25,7 @@ const COMMANDS: &[&str] = &[
 ];
 
 /// Known parsers and their status.
-const PARSERS: &[&str] = &["plaintext", "markdown", "pdf"];
+const PARSERS: &[&str] = &["plaintext", "markdown", "pdf", "docling"];
 
 pub fn run(home: &ShiroHome) -> Result<CmdOutput, ShiroError> {
     let schema_version = Store::open(&home.db_path())

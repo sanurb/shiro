@@ -23,6 +23,9 @@ pub enum ShiroError {
     #[error("Markdown parse error: {message}")]
     ParseMd { message: String },
 
+    #[error("external parser error: {message}")]
+    ParseExternal { message: String },
+
     #[error("invalid IR: {message}")]
     InvalidIr { message: String },
 
@@ -87,6 +90,7 @@ pub enum ErrorCode {
     // Stable codes per CLI.md
     EParsePdf,
     EParseMd,
+    EParseExternal,
     EInvalidIr,
     EStoreCorrupt,
     EIndexBuildFts,
@@ -115,6 +119,7 @@ impl ErrorCode {
             ShiroError::Io(_) => Self::EIo,
             ShiroError::ParsePdf { .. } => Self::EParsePdf,
             ShiroError::ParseMd { .. } => Self::EParseMd,
+            ShiroError::ParseExternal { .. } => Self::EParseExternal,
             ShiroError::InvalidIr { .. } => Self::EInvalidIr,
             ShiroError::StoreCorrupt { .. } => Self::EStoreCorrupt,
             ShiroError::IndexBuildFts { .. } => Self::EIndexBuildFts,
@@ -140,6 +145,7 @@ impl ErrorCode {
         match self {
             Self::EParsePdf => "E_PARSE_PDF",
             Self::EParseMd => "E_PARSE_MD",
+            Self::EParseExternal => "E_PARSE_EXTERNAL",
             Self::EInvalidIr => "E_INVALID_IR",
             Self::EStoreCorrupt => "E_STORE_CORRUPT",
             Self::EIndexBuildFts => "E_INDEX_BUILD_FTS",
@@ -177,6 +183,7 @@ impl ErrorCode {
             Self::EInvalidInput | Self::EConfig | Self::EExecutionLimit | Self::EDslError => 2,
             Self::EParsePdf
             | Self::EParseMd
+            | Self::EParseExternal
             | Self::EInvalidIr
             | Self::EEmbedFail
             | Self::EEnrichFail => 10,
@@ -248,6 +255,9 @@ mod tests {
                 message: String::new(),
             },
             ShiroError::ParseMd {
+                message: String::new(),
+            },
+            ShiroError::ParseExternal {
                 message: String::new(),
             },
             ShiroError::InvalidIr {
