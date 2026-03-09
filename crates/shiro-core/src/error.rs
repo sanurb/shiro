@@ -59,6 +59,12 @@ pub enum ShiroError {
     #[error("generation conflict: {message}")]
     GenerationConflict { message: String },
 
+    #[error("reranking failed: {message}")]
+    RerankFail { message: String },
+
+    #[error("embedding fingerprint mismatch: {message}")]
+    FingerprintMismatch { message: String },
+
     // --- Extension codes (not in CLI.md stable list but needed internally) ---
     #[error("not found: {0}")]
     NotFound(DocId),
@@ -102,6 +108,8 @@ pub enum ErrorCode {
     EMcp,
     ESchemaMigration,
     EGenerationConflict,
+    ERerankFail,
+    EFingerprintMismatch,
     // Extension codes
     EIo,
     ENotFound,
@@ -136,6 +144,8 @@ impl ErrorCode {
             ShiroError::GenerationConflict { .. } => Self::EGenerationConflict,
             ShiroError::SearchFailed { .. } => Self::ESearchFailed,
             ShiroError::ExecutionLimit { .. } => Self::EExecutionLimit,
+            ShiroError::RerankFail { .. } => Self::ERerankFail,
+            ShiroError::FingerprintMismatch { .. } => Self::EFingerprintMismatch,
             ShiroError::DslError { .. } => Self::EDslError,
         }
     }
@@ -164,6 +174,8 @@ impl ErrorCode {
             Self::ESearchFailed => "E_SEARCH_FAILED",
             Self::EExecutionLimit => "E_EXECUTION_LIMIT",
             Self::EDslError => "E_DSL_ERROR",
+            Self::ERerankFail => "E_RERANK_FAIL",
+            Self::EFingerprintMismatch => "E_FINGERPRINT_MISMATCH",
         }
     }
 
@@ -187,8 +199,11 @@ impl ErrorCode {
             | Self::EInvalidIr
             | Self::EEmbedFail
             | Self::EEnrichFail => 10,
-            Self::EIndexBuildFts | Self::EIndexBuildVec | Self::EGenerationConflict => 11,
-            Self::ESearchFailed | Self::ENotFound => 12,
+            Self::EIndexBuildFts
+            | Self::EIndexBuildVec
+            | Self::EGenerationConflict
+            | Self::EFingerprintMismatch => 11,
+            Self::ESearchFailed | Self::ENotFound | Self::ERerankFail => 12,
             Self::EStoreCorrupt | Self::ESchemaMigration => 20,
             Self::ELockBusy => 21,
             // Unmapped codes default to 1 (generic failure).
@@ -310,6 +325,12 @@ mod tests {
                 message: String::new(),
             },
             ShiroError::DslError {
+                message: String::new(),
+            },
+            ShiroError::RerankFail {
+                message: String::new(),
+            },
+            ShiroError::FingerprintMismatch {
                 message: String::new(),
             },
         ];

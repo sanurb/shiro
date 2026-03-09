@@ -125,6 +125,10 @@ pub struct ShiroConfig {
     /// Embedding service settings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embed: Option<EmbedConfig>,
+
+    /// Reranking settings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerank: Option<RerankConfig>,
 }
 
 /// Search configuration.
@@ -140,6 +144,10 @@ pub struct SearchConfig {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct EmbedConfig {
+    /// Embedding provider (`"http"`, `"fastembed"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+
     /// Base URL of the embedding service (e.g., `http://localhost:11434/v1`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
@@ -155,6 +163,27 @@ pub struct EmbedConfig {
     /// Optional API key for authenticated endpoints.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+
+    /// FastEmbed model cache directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_dir: Option<String>,
+}
+
+/// Reranking configuration.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RerankConfig {
+    /// Reranking provider (`"fastembed"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+
+    /// Reranking model name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    /// Number of results to rerank.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<usize>,
 }
 
 /// The type a config field expects, used for schema-aware parsing.
@@ -208,6 +237,31 @@ pub const CONFIG_KEYS: &[ConfigKeyMeta] = &[
         kind: ConfigFieldKind::Str,
         description: "Embedding service API key",
     },
+    ConfigKeyMeta {
+        key: "embed.provider",
+        kind: ConfigFieldKind::Str,
+        description: "Embedding provider (http, fastembed)",
+    },
+    ConfigKeyMeta {
+        key: "embed.cache_dir",
+        kind: ConfigFieldKind::Str,
+        description: "FastEmbed model cache directory",
+    },
+    ConfigKeyMeta {
+        key: "rerank.provider",
+        kind: ConfigFieldKind::Str,
+        description: "Reranking provider (fastembed)",
+    },
+    ConfigKeyMeta {
+        key: "rerank.model",
+        kind: ConfigFieldKind::Str,
+        description: "Reranking model name",
+    },
+    ConfigKeyMeta {
+        key: "rerank.top_k",
+        kind: ConfigFieldKind::Usize,
+        description: "Number of results to rerank",
+    },
 ];
 
 /// Look up a config key's metadata. Returns `None` for unknown keys.
@@ -246,11 +300,14 @@ mod tests {
         let cfg = ShiroConfig {
             search: Some(SearchConfig { limit: Some(25) }),
             embed: Some(EmbedConfig {
+                provider: Some("http".into()),
                 base_url: Some("http://localhost:11434/v1".into()),
                 model: Some("all-minilm".into()),
                 dimensions: Some(384),
                 api_key: None,
+                cache_dir: None,
             }),
+            rerank: None,
         };
         // Round-trip via serde_json (dev-dep).
         let json = serde_json::to_string(&cfg).unwrap();

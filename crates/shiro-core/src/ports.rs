@@ -61,8 +61,10 @@ pub struct VectorHit {
 /// Metadata about an embedding model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingMeta {
-    pub dimensions: usize,
+    /// Embedding provider (e.g. `"http"`, `"fastembed"`).
+    pub provider: String,
     pub model_name: String,
+    pub dimensions: usize,
 }
 
 /// Store and query vector embeddings for semantic retrieval.
@@ -93,4 +95,30 @@ pub trait VectorIndex: Send + Sync {
 
     /// Persist any buffered writes to durable storage.
     fn flush(&self) -> Result<(), ShiroError>;
+}
+
+/// Result from a reranker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankResult {
+    /// Index of the document in the input list.
+    pub index: usize,
+    /// Relevance score from the reranker (higher = more relevant).
+    pub score: f32,
+}
+
+/// Rerank a set of documents against a query.
+///
+/// Implementations MUST be deterministic: identical inputs produce identical
+/// output ordering and scores.
+pub trait Reranker: Send + Sync {
+    /// Rerank documents against a query, returning top_n results.
+    fn rerank(
+        &self,
+        query: &str,
+        documents: &[&str],
+        top_n: usize,
+    ) -> Result<Vec<RerankResult>, ShiroError>;
+
+    /// Human-readable model name for logging/explain output.
+    fn model_name(&self) -> &str;
 }

@@ -47,6 +47,49 @@ impl ProcessingFingerprint {
     }
 }
 
+/// Identity of the embedding configuration used to produce vectors (ADR-012).
+///
+/// Stored with the vector index. A mismatch between active config and stored
+/// fingerprint is a hard error — the index must be rebuilt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingFingerprint {
+    pub provider: String,
+    pub model: String,
+    pub dimensions: usize,
+    pub normalization: String,
+    pub truncation_policy: String,
+    pub chunk_policy: String,
+    pub fingerprint_hash: String,
+}
+
+impl EmbeddingFingerprint {
+    /// Compute a new fingerprint from the given fields.
+    /// The hash is blake3 of the canonical representation of all non-secret fields.
+    pub fn new(
+        provider: String,
+        model: String,
+        dimensions: usize,
+        normalization: String,
+        truncation_policy: String,
+        chunk_policy: String,
+    ) -> Self {
+        let canonical = format!(
+            "{provider}:{model}:{dimensions}:{normalization}:{truncation_policy}:{chunk_policy}"
+        );
+        let hash = blake3::hash(canonical.as_bytes());
+        let fingerprint_hash = hash.to_hex().to_string();
+        Self {
+            provider,
+            model,
+            dimensions,
+            normalization,
+            truncation_policy,
+            chunk_policy,
+            fingerprint_hash,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
