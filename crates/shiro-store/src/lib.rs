@@ -107,7 +107,7 @@ fn parse_edge_relation(s: &str) -> Result<Relation, ShiroError> {
 }
 
 /// Current schema version this binary expects.
-pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+pub const CURRENT_SCHEMA_VERSION: u32 = 6;
 
 /// A row to be saved in the `search_results` table.
 pub struct SearchResultRow {
@@ -120,6 +120,8 @@ pub struct SearchResultRow {
     pub vector_rank: Option<usize>,
     pub fused_score: Option<f32>,
     pub fused_rank: Option<usize>,
+    pub reranker_score: Option<f32>,
+    pub reranker_rank: Option<usize>,
 }
 
 /// Detail returned from `get_search_result`.
@@ -136,6 +138,8 @@ pub struct SearchResultDetail {
     pub fused_rank: Option<usize>,
     pub fts_gen: Option<u64>,
     pub vec_gen: Option<u64>,
+    pub reranker_score: Option<f32>,
+    pub reranker_rank: Option<usize>,
 }
 
 /// V3 DDL for new tables (used in both fresh-create and migration).
@@ -354,6 +358,20 @@ fn run_migrations(conn: &rusqlite::Connection, from_version: u32) -> Result<(), 
             conn.execute_batch(V5_CREATE_TABLES).map_err(map_db)?;
         }
 
+        if version == 5 {
+            // v5 → v6: reranker score columns
+            let has_reranker = conn
+                .prepare("SELECT reranker_score FROM search_results LIMIT 0")
+                .is_ok();
+            if !has_reranker {
+                conn.execute_batch(
+                    "ALTER TABLE search_results ADD COLUMN reranker_score REAL;
+                     ALTER TABLE search_results ADD COLUMN reranker_rank INTEGER;",
+                )
+                .map_err(map_db)?;
+            }
+        }
+
         // Update version after each successful migration.
         conn.execute(
             "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -434,6 +452,8 @@ impl Store {
                 fts_gen INTEGER,
                 vec_gen INTEGER,
                 query_digest TEXT,
+                reranker_score REAL,
+                reranker_rank INTEGER,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
             );
 
@@ -1038,8 +1058,8 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "INSERT INTO search_results (result_id, query, doc_id, segment_id, bm25_score, bm25_rank, vector_score, vector_rank, fused_score, fused_rank, fts_gen, vec_gen, query_digest)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                "INSERT INTO search_results (result_id, query, doc_id, segment_id, bm25_score, bm25_rank, vector_score, vector_rank, fused_score, fused_rank, fts_gen, vec_gen, query_digest, reranker_score, reranker_rank)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             )
             .map_err(map_db)?;
 
@@ -1058,6 +1078,8 @@ impl Store {
                 fts_gen as i64,
                 vec_gen as i64,
                 query_digest,
+                r.reranker_score.map(|s| s as f64),
+                r.reranker_rank.map(|r| r as i64),
             ])
             .map_err(map_db)?;
         }
@@ -1070,7 +1092,7 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT query, doc_id, segment_id, bm25_score, bm25_rank, vector_score, vector_rank, fused_score, fused_rank, fts_gen, vec_gen, query_digest
+                "SELECT query, doc_id, segment_id, bm25_score, bm25_rank, vector_score, vector_rank, fused_score, fused_rank, fts_gen, vec_gen, query_digest, reranker_score, reranker_rank
                  FROM search_results WHERE result_id = ?1",
             )
             .map_err(map_db)?;
@@ -1089,6 +1111,8 @@ impl Store {
                 let fts_gen: Option<i64> = row.get(9)?;
                 let vec_gen: Option<i64> = row.get(10)?;
                 let query_digest: Option<String> = row.get(11)?;
+                let reranker_score: Option<f64> = row.get(12)?;
+                let reranker_rank: Option<i64> = row.get(13)?;
                 Ok((
                     query,
                     doc_id_str,
@@ -1102,6 +1126,8 @@ impl Store {
                     fts_gen,
                     vec_gen,
                     query_digest,
+                    reranker_score,
+                    reranker_rank,
                 ))
             })
             .map_err(|e| match e {
@@ -1124,6 +1150,8 @@ impl Store {
             fts_gen,
             vec_gen,
             query_digest,
+            reranker_score,
+            reranker_rank,
         ) = result;
 
         let doc_id = DocId::from_stored(doc_id_str).map_err(|e| ShiroError::StoreCorrupt {
@@ -1147,6 +1175,8 @@ impl Store {
             fused_rank: fused_rank.map(|r| r as usize),
             fts_gen: fts_gen.map(|g| g as u64),
             vec_gen: vec_gen.map(|g| g as u64),
+            reranker_score: reranker_score.map(|s| s as f32),
+            reranker_rank: reranker_rank.map(|r| r as usize),
         })
     }
 
@@ -3044,5 +3074,72 @@ mod tests {
         let graph = store.get_block_graph(&doc.id).unwrap();
         assert_eq!(graph.blocks.len(), 2, "blocks must survive purge_derived");
         assert_eq!(graph.edges.len(), 1, "edges must survive purge_derived");
+    }
+
+    #[test]
+    fn reranker_fields_roundtrip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = camino::Utf8PathBuf::try_from(dir.path().to_path_buf()).unwrap();
+        let db_path = path.join("test.db");
+        let store = Store::open(&db_path).unwrap();
+
+        // Create a minimal document so we have valid IDs.
+        let doc_id = DocId::from_content(b"test doc");
+        let seg_id = SegmentId::new(&doc_id, 0);
+
+        // Save a search result with reranker fields.
+        let row = SearchResultRow {
+            result_id: "res_test123".to_string(),
+            doc_id: doc_id.clone(),
+            segment_id: seg_id,
+            bm25_score: Some(1.5),
+            bm25_rank: Some(1),
+            vector_score: Some(0.85),
+            vector_rank: Some(2),
+            fused_score: Some(0.02),
+            fused_rank: Some(1),
+            reranker_score: Some(0.95),
+            reranker_rank: Some(1),
+        };
+        store
+            .save_search_results("test query", "abc123", 1, 0, &[row])
+            .unwrap();
+
+        // Retrieve and verify.
+        let detail = store.get_search_result("res_test123").unwrap();
+        assert_eq!(detail.reranker_score, Some(0.95));
+        assert_eq!(detail.reranker_rank, Some(1));
+    }
+
+    #[test]
+    fn reranker_fields_none_when_absent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = camino::Utf8PathBuf::try_from(dir.path().to_path_buf()).unwrap();
+        let db_path = path.join("test.db");
+        let store = Store::open(&db_path).unwrap();
+
+        let doc_id = DocId::from_content(b"test doc 2");
+        let seg_id = SegmentId::new(&doc_id, 0);
+
+        let row = SearchResultRow {
+            result_id: "res_test456".to_string(),
+            doc_id: doc_id.clone(),
+            segment_id: seg_id,
+            bm25_score: Some(1.0),
+            bm25_rank: Some(1),
+            vector_score: None,
+            vector_rank: None,
+            fused_score: Some(0.01),
+            fused_rank: Some(1),
+            reranker_score: None,
+            reranker_rank: None,
+        };
+        store
+            .save_search_results("test query 2", "def456", 1, 0, &[row])
+            .unwrap();
+
+        let detail = store.get_search_result("res_test456").unwrap();
+        assert_eq!(detail.reranker_score, None);
+        assert_eq!(detail.reranker_rank, None);
     }
 }
