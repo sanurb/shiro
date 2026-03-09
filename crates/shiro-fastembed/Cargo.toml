@@ -9,6 +9,7 @@ description = "FastEmbed adapter for shiro — local embedding and reranking"
 
 [dependencies]
 shiro-core.workspace = true
+camino.workspace = true
 fastembed = "4"
 tracing.workspace = true
 

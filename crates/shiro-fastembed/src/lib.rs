@@ -10,7 +10,3 @@ mod reranker;
 
 pub use embedder::{FastEmbedEmbedder, FastEmbedEmbedderConfig};
 pub use reranker::{FastEmbedReranker, FastEmbedRerankerConfig};
-
-// Re-export model enums so consumers don't need a direct fastembed dependency.
-pub use fastembed::EmbeddingModel;
-pub use fastembed::RerankerModel;
