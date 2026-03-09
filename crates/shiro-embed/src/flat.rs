@@ -4,6 +4,7 @@ use std::sync::RwLock;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
+use shiro_core::fingerprint::EmbeddingFingerprint;
 use shiro_core::ports::{VectorHit, VectorIndex};
 use shiro_core::{DocId, SegmentId, ShiroError};
 
@@ -33,6 +34,8 @@ pub struct FlatIndex {
     gen_id: u64,
     /// Blake3 checksum of the JSONL data computed on last flush.
     checksum: RwLock<Option<String>>,
+    /// Fingerprint sidecar for ADR-012 embedding provenance tracking.
+    stored_fingerprint: RwLock<Option<EmbeddingFingerprint>>,
 }
 
 impl FlatIndex {
@@ -114,13 +117,76 @@ impl FlatIndex {
             }
         }
 
+        // Load fingerprint sidecar if present.
+        let fp_path = fingerprint_path(&data_path);
+        let stored_fingerprint = if fp_path.as_std_path().is_file() {
+            match std::fs::read_to_string(fp_path.as_std_path()) {
+                Ok(json) => match serde_json::from_str::<EmbeddingFingerprint>(&json) {
+                    Ok(fp) => Some(fp),
+                    Err(e) => {
+                        tracing::warn!("malformed fingerprint sidecar {fp_path}: {e}");
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("failed to read fingerprint sidecar {fp_path}: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             dims,
             data_path,
             entries: RwLock::new(entries),
             gen_id: 0,
             checksum: RwLock::new(None),
+            stored_fingerprint: RwLock::new(stored_fingerprint),
         })
+    }
+
+    /// Return a clone of the stored fingerprint, if any.
+    pub fn stored_fingerprint(&self) -> Option<EmbeddingFingerprint> {
+        self.stored_fingerprint.read().ok().and_then(|g| g.clone())
+    }
+
+    /// Set the fingerprint for this index.
+    ///
+    /// If a fingerprint is already stored and differs, returns
+    /// `ShiroError::FingerprintMismatch`.
+    pub fn set_fingerprint(&self, fp: &EmbeddingFingerprint) -> Result<(), ShiroError> {
+        let mut guard = self
+            .stored_fingerprint
+            .write()
+            .map_err(|e| ShiroError::IndexBuildVec {
+                message: format!("RwLock poisoned: {e}"),
+            })?;
+        if let Some(ref existing) = *guard {
+            if existing.fingerprint_hash != fp.fingerprint_hash {
+                return Err(ShiroError::FingerprintMismatch {
+                    message: format!(
+                        "index fingerprint mismatch: stored {} vs incoming {}",
+                        existing.fingerprint_hash, fp.fingerprint_hash
+                    ),
+                });
+            }
+            // Already matches — no-op.
+            return Ok(());
+        }
+        // Persist sidecar.
+        let fp_path = fingerprint_path(&self.data_path);
+        let json = serde_json::to_string_pretty(fp).map_err(|e| ShiroError::IndexBuildVec {
+            message: format!("failed to serialize fingerprint: {e}"),
+        })?;
+        std::fs::write(fp_path.as_std_path(), json.as_bytes()).map_err(|e| {
+            ShiroError::IndexBuildVec {
+                message: format!("failed to write fingerprint sidecar {fp_path}: {e}"),
+            }
+        })?;
+        *guard = Some(fp.clone());
+        Ok(())
     }
 
     /// Insert or replace an embedding with an explicit [`DocId`].
@@ -204,6 +270,7 @@ impl FlatIndex {
             entries: RwLock::new(HashMap::new()),
             gen_id,
             checksum: RwLock::new(None),
+            stored_fingerprint: RwLock::new(None),
         };
         for (seg_id, doc_id, embedding) in entries {
             let seg =
@@ -233,8 +300,30 @@ impl FlatIndex {
                 message: format!("failed to rename {staging} -> {live}: {e}"),
             }
         })?;
+        // Promote fingerprint sidecar if present.
+        let staging_fp = fingerprint_path(staging);
+        let live_fp = fingerprint_path(live);
+        if staging_fp.as_std_path().is_file() {
+            if live_fp.as_std_path().exists() {
+                std::fs::remove_file(live_fp.as_std_path()).map_err(|e| {
+                    ShiroError::IndexBuildVec {
+                        message: format!("failed to remove live fingerprint {live_fp}: {e}"),
+                    }
+                })?;
+            }
+            std::fs::rename(staging_fp.as_std_path(), live_fp.as_std_path()).map_err(|e| {
+                ShiroError::IndexBuildVec {
+                    message: format!("failed to rename fingerprint {staging_fp} -> {live_fp}: {e}"),
+                }
+            })?;
+        }
         Ok(())
     }
+}
+
+fn fingerprint_path(data_path: &Utf8Path) -> Utf8PathBuf {
+    let stem = data_path.file_stem().unwrap_or("flat");
+    data_path.with_file_name(format!("{stem}.fingerprint.json"))
 }
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -393,6 +482,22 @@ impl VectorIndex for FlatIndex {
         let hash = blake3::hash(&buf).to_hex().to_string();
         if let Ok(mut guard) = self.checksum.write() {
             *guard = Some(hash);
+        }
+
+        // Persist fingerprint sidecar if one is set.
+        if let Ok(guard) = self.stored_fingerprint.read() {
+            if let Some(ref fp) = *guard {
+                let fp_path = fingerprint_path(&self.data_path);
+                let json =
+                    serde_json::to_string_pretty(fp).map_err(|e| ShiroError::IndexBuildVec {
+                        message: format!("failed to serialize fingerprint: {e}"),
+                    })?;
+                std::fs::write(fp_path.as_std_path(), json.as_bytes()).map_err(|e| {
+                    ShiroError::IndexBuildVec {
+                        message: format!("failed to write fingerprint sidecar {fp_path}: {e}"),
+                    }
+                })?;
+            }
         }
 
         Ok(())
@@ -685,5 +790,93 @@ mod tests {
     fn test_path_named(dir: &TempDir, name: &str) -> Utf8PathBuf {
         let p = dir.path().join(name);
         Utf8PathBuf::try_from(p.to_path_buf()).expect("tempdir path should be valid UTF-8")
+    }
+
+    #[test]
+    fn fingerprint_sidecar_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = test_path(&dir);
+
+        let fp = EmbeddingFingerprint::new(
+            "test".to_string(),
+            "model-a".to_string(),
+            384,
+            "l2".to_string(),
+            "none".to_string(),
+            "full_segment".to_string(),
+        );
+
+        {
+            let idx = FlatIndex::open(384, path.clone()).unwrap();
+            idx.set_fingerprint(&fp).unwrap();
+            idx.flush().unwrap();
+        }
+
+        let idx2 = FlatIndex::open(384, path).unwrap();
+        let stored = idx2
+            .stored_fingerprint()
+            .expect("fingerprint should persist");
+        assert_eq!(stored.fingerprint_hash, fp.fingerprint_hash);
+    }
+
+    #[test]
+    fn fingerprint_mismatch_is_hard_error() {
+        let dir = TempDir::new().unwrap();
+        let path = test_path(&dir);
+
+        let fp_a = EmbeddingFingerprint::new(
+            "test".to_string(),
+            "model-a".to_string(),
+            384,
+            "l2".to_string(),
+            "none".to_string(),
+            "full_segment".to_string(),
+        );
+        let fp_b = EmbeddingFingerprint::new(
+            "test".to_string(),
+            "model-b".to_string(),
+            768,
+            "l2".to_string(),
+            "none".to_string(),
+            "full_segment".to_string(),
+        );
+
+        let idx = FlatIndex::open(384, path).unwrap();
+        idx.set_fingerprint(&fp_a).unwrap();
+        idx.flush().unwrap();
+
+        let result = idx.set_fingerprint(&fp_b);
+        assert!(matches!(
+            result,
+            Err(ShiroError::FingerprintMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn fingerprint_same_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let path = test_path(&dir);
+
+        let fp = EmbeddingFingerprint::new(
+            "test".to_string(),
+            "model-a".to_string(),
+            384,
+            "l2".to_string(),
+            "none".to_string(),
+            "full_segment".to_string(),
+        );
+
+        let idx = FlatIndex::open(384, path).unwrap();
+        idx.set_fingerprint(&fp).unwrap();
+        idx.set_fingerprint(&fp).unwrap(); // second call should succeed
+    }
+
+    #[test]
+    fn fresh_index_has_no_fingerprint() {
+        let dir = TempDir::new().unwrap();
+        let path = test_path(&dir);
+
+        let idx = FlatIndex::open(384, path).unwrap();
+        assert!(idx.stored_fingerprint().is_none());
     }
 }
