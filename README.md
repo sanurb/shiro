@@ -12,14 +12,15 @@
 
 ---
 
-Shiro transforms PDFs and Markdown files into a unified, structure-aware searchable base on your local machine. Documents are parsed into a BlockGraph intermediate representation that preserves reading order, heading hierarchy, and block relationships. Retrieval is powered by BM25 full-text search via Tantivy, with SKOS taxonomy support and heuristic enrichment. Every command emits deterministic JSON to stdout wrapped in a HATEOAS envelope, making shiro a first-class building block for AI agents, shell pipelines, and automation toolchains.
+Shiro transforms PDFs and Markdown files into a unified, structure-aware searchable base on your local machine. Documents are parsed into a BlockGraph intermediate representation that preserves reading order, heading hierarchy, and block relationships. Retrieval combines BM25 full-text search (Tantivy) with local vector embeddings (FastEmbed/ONNX) and optional cross-encoder reranking, fused via Reciprocal Rank Fusion. Embeddings and reranking run entirely on-device — no data leaves your machine. Every command emits deterministic JSON to stdout wrapped in a HATEOAS envelope, making shiro a first-class building block for AI agents, shell pipelines, and automation toolchains.
 
 ## Key Differentiators
 
 - **Structure-Aware IR** -- Documents are modeled as hierarchical blocks (headings, paragraphs, code, tables) with byte-level spans, enabling precise context windowing for LLM applications.
 - **Deterministic JSON CLI** -- Every command outputs a structured JSON envelope to stdout. No human-readable mode. Built for `jq`, scripts, and agent consumption.
 - **HATEOAS Navigation** -- Every response includes `next_actions` with typed parameter templates, enabling AI agents to discover and chain commands dynamically.
-- **Zero-API Dependency** -- Parsing, indexing, and search all run locally. No data leaves your machine.
+- **Local Semantic Retrieval** -- Provider-agnostic embedding and reranking boundary with FastEmbed (ONNX Runtime) as the first local implementation. Hybrid search fuses BM25 + vector rankings; reranking refines top-k quality with cross-encoder models. No external service required.
+- **Zero-API Dependency** -- Parsing, indexing, embedding, reranking, and search all run locally. No data leaves your machine.
 - **Pluggable Parsers** -- Built-in support for Markdown (pulldown-cmark), PDF (pdf-extract), and plain text, plus a Docling adapter for structured PDF extraction via external Python subprocess.
 
 ## Installation
@@ -62,7 +63,7 @@ shiro init
 shiro ingest ~/Documents/KnowledgeBase
 ```
 
-Search for a concept:
+Search for a concept (defaults to hybrid mode when embeddings are configured):
 
 ```bash
 shiro search "distributed consensus"
@@ -73,28 +74,33 @@ shiro search "distributed consensus"
   "ok": true,
   "result": {
     "query": "distributed consensus",
+    "mode": "hybrid",
+    "retrieval_info": {
+      "bm25_active": true,
+      "vector_active": true,
+      "reranker_active": false,
+      "reranker_model": null
+    },
     "results": [
       {
-        "result_id": "r:a1b2c3",
+        "result_id": "res_a1b2c3d4e5f67890",
         "doc_id": "d:9f8e7d",
         "block_idx": 4,
-        "block_kind": "paragraph",
-        "span_start": 1024,
-        "span_end": 1280,
+        "block_kind": "PARAGRAPH",
+        "span": {"start": 1024, "end": 1280},
         "snippet": "Raft achieves consensus by electing a leader...",
         "scores": {
-          "bm25_score": 12.34,
-          "bm25_rank": 1,
-          "fused_score": 12.34,
-          "fused_rank": 1
+          "bm25": {"score": 12.34, "rank": 1},
+          "vector": {"score": 0.87, "rank": 3},
+          "fused": {"score": 0.0318, "rank": 1}
         },
-        "context_window": null
+        "context_window": []
       }
     ]
   },
   "next_actions": [
-    {"action": "read", "params": {"id": "d:9f8e7d"}},
-    {"action": "explain", "params": {"result_id": "r:a1b2c3"}}
+    {"action": "shiro explain <result_id>", "description": "Explain why this result matched"},
+    {"action": "shiro list", "description": "List all documents"}
   ]
 }
 ```
@@ -115,23 +121,22 @@ shiro explain r:a1b2c3
 {
   "ok": true,
   "result": {
-    "result_id": "r:a1b2c3",
+    "result_id": "res_a1b2c3d4e5f67890",
     "query": "distributed consensus",
-    "query_digest": "blake3:...",
+    "query_digest": "blake3:3a7f...",
     "fts_generation": 7,
     "doc_id": "d:9f8e7d",
     "block_idx": 4,
-    "block_kind": "paragraph",
-    "span_start": 1024,
-    "span_end": 1280,
-    "bm25_score": 12.34,
-    "bm25_rank": 1,
-    "fused_score": 12.34,
-    "fused_rank": 1,
+    "block_kind": "PARAGRAPH",
+    "scores": {
+      "bm25": {"score": 12.34, "rank": 1},
+      "vector": {"score": 0.87, "rank": 3},
+      "fused": {"score": 0.0318, "rank": 1}
+    },
     "retrieval_trace": {
-      "pipeline": "bm25_only",
-      "stages": ["tokenize", "bm25_rank"],
-      "fusion": null
+      "pipeline": "hybrid",
+      "stages": ["tokenize", "bm25_rank", "embed_query", "vector_rank", "rrf_fusion"],
+      "fusion": {"method": "rrf", "k": 60}
     }
   },
   "next_actions": [...]
@@ -140,7 +145,25 @@ shiro explain r:a1b2c3
 
 ## Search and Retrieval
 
-Shiro search returns block-level results. Each hit identifies the exact block within a document (`block_idx`, `block_kind`) and byte span (`span_start`, `span_end`), along with BM25 scores and ranks.
+Shiro search returns block-level results. Each hit identifies the exact block within a document (`block_idx`, `block_kind`) and byte span, along with per-source scores and a fused ranking. Markdown and PDF content remains the source material; SQLite is the authoritative store; search indices and vector embeddings are derived artifacts that can be rebuilt at any time.
+
+### Retrieval modes
+
+| Mode | Flag | Behavior |
+|------|------|----------|
+| **Hybrid** (default) | `--mode hybrid` | BM25 + vector search, merged via Reciprocal Rank Fusion (k=60). Falls back to BM25-only when no embedder is configured. |
+| **BM25** | `--mode bm25` | Keyword search only, even when embeddings are available. |
+| **Vector** | `--mode vector` | Semantic similarity only. Requires a configured embedding provider. |
+
+### Reranking
+
+Add `--rerank` to apply a cross-encoder model after fusion. Reranking re-scores the top-k fused candidates and re-sorts by cross-encoder relevance, improving precision on the final result set.
+
+```bash
+shiro search "error handling in async Rust" --rerank
+```
+
+Reranking is optional and non-fatal — if the reranker fails to initialize, search falls back to RRF order.
 
 ### Context expansion
 
@@ -150,20 +173,35 @@ Use `--expand` to include surrounding blocks for richer context:
 shiro search "error handling" --expand
 ```
 
-Context expansion defaults to `max_blocks=12` and `max_chars=8000`. When enabled, each result includes a `context_window` field with the expanded text.
+Context expansion defaults to `max_blocks=12` and `max_chars=8000`. When enabled, each result includes a `context_window` field with the expanded text from the document's BlockGraph reading order.
 
 ### Scoring
 
-Every result carries a `scores` object:
+Every result carries a `scores` object with per-source contributions:
 
-| Field | Description |
-|-------|-------------|
-| `bm25_score` | Raw BM25 relevance score |
-| `bm25_rank` | Rank position in BM25 results |
-| `fused_score` | Fused score (currently equals `bm25_score`) |
-| `fused_rank` | Fused rank (currently equals `bm25_rank`) |
+| Field | Present when | Description |
+|-------|-------------|-------------|
+| `bm25.score` / `bm25.rank` | BM25 active | Raw Tantivy BM25 relevance score and rank |
+| `vector.score` / `vector.rank` | Vector active | Cosine similarity score and rank from FlatIndex |
+| `fused.score` / `fused.rank` | Always | RRF-merged score across active sources |
+| `reranker.score` / `reranker.rank` | `--rerank` | Cross-encoder relevance score and final rank |
 
-**Note:** Hybrid search mode is scaffolded with RRF fusion (k=60) but currently executes BM25-only. Vector embedding infrastructure is implemented (FlatIndex, HttpEmbedder) but not yet wired into the query path. When vector search becomes available, `fused_score` and `fused_rank` will reflect the combined ranking.
+Scores are **ordinal within a single result set** — they are not calibrated probabilities and cannot be compared across queries or index generations.
+
+### Example: hybrid search with reranking
+
+```bash
+shiro search "distributed consensus" --rerank | jq '.result.results[0].scores'
+```
+
+```json
+{
+  "bm25": {"score": 12.34, "rank": 1},
+  "vector": {"score": 0.87, "rank": 3},
+  "fused": {"score": 0.0318, "rank": 1},
+  "reranker": {"score": 0.95, "rank": 1}
+}
+```
 
 ## Explainability
 
@@ -175,11 +213,11 @@ shiro explain <result_id>
 
 The response includes a `retrieval_trace` object describing the full scoring pipeline:
 
-- **pipeline** -- Which retrieval path was used (e.g., `bm25_only`)
-- **stages** -- Ordered list of processing stages applied
-- **fusion** -- Fusion details when multiple sources contribute (null when single-source)
+- **pipeline** -- Which retrieval path was used (`hybrid`, `bm25`, or `vector`)
+- **stages** -- Ordered list of processing stages applied (e.g., `tokenize → bm25_rank → embed_query → vector_rank → rrf_fusion`)
+- **fusion** -- Fusion method and parameters when multiple sources contribute (`{"method": "rrf", "k": 60}`)
 
-Each source's contribution is recorded, enabling full audit of how results are ranked.
+Each source's contribution (BM25 rank, vector rank, reranker score) is recorded per result, enabling full audit of how candidates were ranked and merged.
 
 ## Parsing and Adapters
 
@@ -256,17 +294,41 @@ shiro config get search.limit
 shiro config set search.limit 20
 ```
 
+Configuration is stored as TOML at `<shiro-home>/config.toml`.
+
+### Enabling local embeddings (FastEmbed)
+
+Set the embedding provider to `fastembed` to enable fully local vector search with no external service:
+
+```bash
+shiro config set embed.provider fastembed
+shiro config set embed.model AllMiniLML6V2    # 384-dim, fast default
+```
+
+After configuring the embedder, build the vector index from existing documents:
+
+```bash
+shiro reindex    # rebuilds FTS index (always safe to run)
+```
+
+**When you change the embedding model**, you must rebuild the vector index — vectors from different models live in incompatible spaces. Use `shiro reindex` after changing `embed.model`.
+
 ### Configuration keys
 
 | Key | Type | Description |
 |-----|------|-------------|
 | `search.limit` | u32 | Maximum search results |
-| `embed.base_url` | string | Embedding service base URL |
-| `embed.model` | string | Embedding model name |
-| `embed.dimensions` | usize | Expected embedding dimensions |
-| `embed.api_key` | string | Embedding service API key |
+| `embed.provider` | string | Embedding provider: `"fastembed"` (local ONNX) or `"http"` (OpenAI-compatible endpoint) |
+| `embed.model` | string | Embedding model name (e.g., `AllMiniLML6V2`, `BGEBaseENV15`, `NomicEmbedTextV15`) |
+| `embed.base_url` | string | Base URL for HTTP provider (e.g., `http://localhost:11434/v1`) |
+| `embed.dimensions` | usize | Expected embedding dimensions (auto-detected for FastEmbed) |
+| `embed.api_key` | string | API key for HTTP provider |
+| `embed.cache_dir` | string | Directory for cached ONNX models (FastEmbed) |
+| `rerank.provider` | string | Reranker provider: `"fastembed"` |
+| `rerank.model` | string | Reranker model name (default: `BGERerankerBase`) |
+| `rerank.top_k` | usize | Number of candidates to rerank |
 
-The `embed.*` keys configure the vector embedding infrastructure. They take effect once vector search is wired into the query path.
+The embedding and reranking boundaries are **provider-agnostic**: any implementation of the `Embedder` / `Reranker` traits works. FastEmbed is the first practical local implementation; the HTTP adapter supports Ollama, llama.cpp, vLLM, or any OpenAI-compatible embedding endpoint.
 
 ## Code Mode (MCP)
 
@@ -335,32 +397,36 @@ Search, read the top hit, and return a summary:
 | PDF parsing | Stable | pdf-extract with loss detection |
 | Docling adapter | Stable | Structured PDF via Python subprocess (`pip install docling`) |
 | Plain text indexing | Stable | Paragraph-boundary segmentation |
-| BM25 full-text search | Stable | Tantivy engine |
+| BM25 full-text search | Stable | Tantivy engine, block-level results |
+| Hybrid search | Stable | RRF fusion (k=60) merging BM25 + vector; graceful fallback to BM25-only |
+| Vector embedding | Stable | FlatIndex (cosine, JSONL-persisted) with FastEmbed (local ONNX) and HTTP adapters |
+| Reranking | Stable | Post-fusion cross-encoder reranking via FastEmbed (`--rerank`) |
 | JSON / HATEOAS layer | Stable | Structured output with `next_actions` on every response |
 | SKOS taxonomy | Implemented | Add, list, relations, assign, import |
 | Completions | Implemented | Shell completions generation |
 | Enrichment | Heuristic-only | Title, summary, tags from content analysis |
 | MCP server | Code Mode | Stdio JSON-RPC 2.0 with DSL interpreter |
-| Hybrid search | BM25-only (scaffold) | RRF fusion (k=60) scaffolded; falls back to BM25 at runtime |
-| Vector embedding | Infrastructure-only | FlatIndex and HttpEmbedder implemented; not wired into query path |
 | BlockGraph persistence | Stable | First-class stored representation (store schema v6) |
 | Context expansion | Stable | `--expand` with configurable max_blocks and max_chars |
 | Processing fingerprints | Stable | BLAKE3-based dedup on every add/ingest |
 
 ## Architecture
 
-Shiro is a Rust workspace with eight crates:
+Shiro is a Rust workspace with nine crates:
 
 | Crate | Role |
 |-------|------|
-| `shiro-core` | Domain types, config, error handling |
-| `shiro-store` | SQLite persistence (schema v6), BlockGraph storage |
+| `shiro-core` | Domain types, config, error handling, port traits (`Embedder`, `VectorIndex`, `Reranker`) |
+| `shiro-store` | SQLite persistence (schema v6), BlockGraph storage — the authoritative store |
 | `shiro-index` | Tantivy BM25 full-text search, generation tracking, staging/promote |
 | `shiro-parse` | Markdown, PDF, and plaintext parsers |
 | `shiro-docling` | Docling subprocess adapter for structured PDF |
-| `shiro-embed` | FlatIndex (vector storage), HttpEmbedder, embedding traits |
-| `shiro-sdk` | Operation registry, DSL interpreter, RRF fusion |
+| `shiro-embed` | FlatIndex (cosine-similarity vector store), HttpEmbedder, embedding port definitions |
+| `shiro-fastembed` | FastEmbed adapter — local ONNX embeddings and cross-encoder reranking |
+| `shiro-sdk` | Operation registry, DSL interpreter, RRF fusion, hybrid search orchestration |
 | `shiro-cli` | CLI entry point (16 commands), published to crates.io |
+
+Embedding providers implement the `Embedder` trait; reranking providers implement the `Reranker` trait. No provider is architecturally privileged — switching providers requires re-embedding (vector spaces are incompatible across models).
 
 For design decisions and ADRs, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
