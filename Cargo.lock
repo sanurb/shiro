@@ -2959,7 +2959,7 @@ dependencies = [
 
 [[package]]
 name = "shiro-cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "camino",
@@ -2984,7 +2984,7 @@ dependencies = [
 
 [[package]]
 name = "shiro-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "camino",
@@ -2998,7 +2998,7 @@ dependencies = [
 
 [[package]]
 name = "shiro-docling"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "serde",
@@ -3011,7 +3011,7 @@ dependencies = [
 
 [[package]]
 name = "shiro-embed"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "camino",
@@ -3025,7 +3025,7 @@ dependencies = [
 
 [[package]]
 name = "shiro-fastembed"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "camino",
  "fastembed",
@@ -3036,7 +3036,7 @@ dependencies = [
 
 [[package]]
 name = "shiro-index"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "camino",
  "shiro-core",
@@ -3047,7 +3047,7 @@ dependencies = [
 
 [[package]]
 name = "shiro-parse"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "camino",
@@ -3060,7 +3060,7 @@ dependencies = [
 
 [[package]]
 name = "shiro-sdk"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "camino",
@@ -3078,7 +3078,7 @@ dependencies = [
 
 [[package]]
 name = "shiro-store"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "camino",
