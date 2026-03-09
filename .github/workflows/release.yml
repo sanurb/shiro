@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.4.0)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -11,6 +17,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # Normalise: workflow_dispatch passes tag via input, push/tag has it in ref_name
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   # ── Quality gate (same as CI, runs from the tag commit) ─────────────
@@ -23,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -40,7 +48,7 @@ jobs:
 
       - name: Verify embedded version matches tag
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
+          TAG="${RELEASE_TAG#v}"
           BIN_VERSION=$(cargo run -q -- --version | awk '{print $2}')
           if [ "$TAG" != "$BIN_VERSION" ]; then
             echo "FATAL: tag=$TAG but binary reports $BIN_VERSION"
@@ -67,7 +75,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -89,8 +97,7 @@ jobs:
 
       - name: Package
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          ARCHIVE="shiro-cli-${TAG}-${{ matrix.target }}"
+          ARCHIVE="shiro-cli-${RELEASE_TAG}-${{ matrix.target }}"
           mkdir -p "dist/${ARCHIVE}"
           cp "target/${{ matrix.target }}/release/shiro" "dist/${ARCHIVE}/shiro"
           cp LICENSE* README.md CHANGELOG.md "dist/${ARCHIVE}/" 2>/dev/null || true
@@ -125,10 +132,10 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: "shiro ${{ github.ref_name }}"
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "shiro ${{ env.RELEASE_TAG }}"
           body: |
-            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md) for details.
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ env.RELEASE_TAG }}/CHANGELOG.md) for details.
 
             ## Checksums (SHA-256)
             ```
@@ -147,7 +154,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: actions/setup-node@v4
         with:
@@ -156,7 +163,7 @@ jobs:
 
       - name: Verify version alignment (tag ↔ package.json ↔ Cargo.toml)
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
+          TAG="${RELEASE_TAG#v}"
           PKG_VERSION=$(node -p "require('./package.json').version")
           CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
           echo "tag=$TAG pkg=$PKG_VERSION cargo=$CARGO_VERSION"
@@ -167,7 +174,7 @@ jobs:
 
       - name: Guard — version must be newer than npm latest
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
+          TAG="${RELEASE_TAG#v}"
           LATEST=$(npm view @sanurb/shiro-cli version 2>/dev/null || echo "0.0.0")
           echo "tag=$TAG npm-latest=$LATEST"
           if npx semver "$TAG" -r "<=$LATEST" 2>/dev/null; then
@@ -178,7 +185,7 @@ jobs:
 
       - name: Guard — GitHub Release must exist for tag
         run: |
-          gh release view "${GITHUB_REF_NAME}" --json tagName --jq .tagName
+          gh release view "${RELEASE_TAG}" --json tagName --jq .tagName
         env:
           GH_TOKEN: ${{ github.token }}
 

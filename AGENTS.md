@@ -6,7 +6,7 @@
 
 Local-first PDF/Markdown knowledge engine. Indexes documents into a unified searchable base using BM25 full-text search, SKOS taxonomy, and heuristic enrichment. Single Rust binary, JSON-only CLI + Code Mode MCP server (stdio). v0.3.0, MIT/Apache-2.0.
 
-Seven crates: **shiro-core** (domain types, ports, errors), **shiro-store** (SQLite persistence, schema v5), **shiro-index** (Tantivy BM25 full-text search), **shiro-parse** (Markdown + PDF parsers, emits ReadsBefore edges, SEGMENTER_VERSION=1), **shiro-embed** (vector embedding: FlatIndex with generation management + blake3 checksums, HttpEmbedder for OpenAI-compatible endpoints, StubEmbedder for tests), **shiro-sdk** (typed API surface, spec registry, executor), **shiro-cli** (JSON-only CLI + MCP server).
+Seven crates: **shiro-core** (domain types, ports, errors, EmbeddingFingerprint ADR-012), **shiro-store** (SQLite persistence, schema v6), **shiro-index** (Tantivy BM25 full-text search), **shiro-parse** (Markdown + PDF parsers, emits ReadsBefore edges, SEGMENTER_VERSION=1), **shiro-embed** (vector embedding: FlatIndex with generation management + blake3 checksums + fingerprint sidecar, HttpEmbedder for OpenAI-compatible endpoints, StubEmbedder + DeterministicStubEmbedder for tests), **shiro-sdk** (typed API surface, spec registry, executor — hybrid search via RRF fusion of BM25 + vector, returns EntryPoint results per ADR-007), **shiro-cli** (JSON-only CLI + MCP server).
 
 ## STRUCTURE
 
@@ -15,7 +15,7 @@ shiro/
 ├── crates/
 │   ├── shiro-core/     # Domain types, ports, errors — every crate depends on this
 │   ├── shiro-cli/      # JSON-only CLI (clap v4 derive) + HATEOAS envelope
-│   ├── shiro-store/    # SQLite persistence (rusqlite, no ORM) — Schema v4
+│   ├── shiro-store/    # SQLite persistence (rusqlite, no ORM) — Schema v6
 │   ├── shiro-index/    # Tantivy BM25 full-text search + generation tracking
 │   ├── shiro-parse/    # MarkdownParser, PdfParser (implements Parser trait, emits ReadsBefore edges)
 │   ├── shiro-embed/    # Vector embedding: FlatIndex (generation-managed), HttpEmbedder, StubEmbedder
@@ -33,13 +33,13 @@ shiro/
 |------|----------|-------|
 | Add a CLI command | `crates/shiro-cli/src/commands/` | Add file + register in `mod.rs` + add variant to `Commands` enum in `main.rs` |
 | Change domain types | `crates/shiro-core/src/` | Hub crate — changes propagate everywhere |
-| Modify storage schema | `crates/shiro-store/src/lib.rs` | DDL in `open()`, manual migrations, schema v4 |
+| Modify storage schema | `crates/shiro-store/src/lib.rs` | DDL in `open()`, manual migrations, schema v6 |
 | Change search behavior | `crates/shiro-index/src/lib.rs` | Tantivy schema + query in single file |
 | Change parsing | `crates/shiro-parse/src/lib.rs` | Implements `Parser` trait from core (MarkdownParser, PdfParser) |
 | Debug JSON output | `crates/shiro-cli/src/envelope.rs` | All stdout goes through `print_success`/`print_error` |
 | Integration tests | `crates/shiro-cli/tests/integration.rs` | Spawns real binary, validates JSON contract |
 | Architecture decisions | `docs/ARCHITECTURE.md` | ADRs at bottom, state machine diagrams |
-| Vector search / embeddings | `crates/shiro-embed/src/` | FlatIndex (generation-managed, blake3 checksums), HttpEmbedder (OpenAI-compatible), StubEmbedder (test-only) |
+| Vector search / embeddings | `crates/shiro-embed/src/` | FlatIndex (generation-managed, blake3 checksums, fingerprint sidecar ADR-012), HttpEmbedder (OpenAI-compatible), StubEmbedder + DeterministicStubEmbedder (test-only) |
 | Taxonomy operations | `crates/shiro-store/src/lib.rs` + `crates/shiro-cli/src/commands/taxonomy.rs` | SKOS model: concepts, relations, transitive closure, doc_concepts |
 | Enrichment | `crates/shiro-sdk/src/ops/enrich.rs` + `crates/shiro-store/src/lib.rs` | Heuristic provider only (title, summary, tags) |
 | MCP server | `crates/shiro-cli/src/commands/mcp.rs` | Code Mode: search(spec_query) + execute(program). JSON-RPC stdio |
@@ -52,9 +52,16 @@ File → Parser.parse() → Document(blake3 DocId, canonical_text, BlockGraph)
      → Store.put_document(Staged) → Store.put_segments()
      → FtsIndex.index_segments() → Store.set_state(Ready)
 
-Search → FtsIndex.search() → RRF fusion(k=60, BM25-only currently)
-       → Store.save_search_results() → expand_context()
-       → explain retrieves cached results by result_id
+Search → FtsIndex.search() + optional FlatIndex.search(embedder.embed(query))
+       → RRF fusion(k=60, BM25 + vector when available, ADR-014)
+       → resolve segment→block via BlockGraph overlap (ADR-007)
+       → build context window from reading order
+       → Store.save_search_results(with block_idx, block_kind, vector_score/rank)
+       → return Vec<EntryPoint> (ADR-007)
+
+Explain → Store.get_search_result(result_id) → stored block_idx/block_kind
+        → build retrieval_trace with per-source contributions (ADR-014)
+        → entry_point_selection + context_expansion reasoning
 ```
 
 ## CONVENTIONS
@@ -71,7 +78,8 @@ Search → FtsIndex.search() → RRF fusion(k=60, BM25-only currently)
 - **ShiroHome paths** — root, db_path, tantivy_dir, staging_tantivy_dir, vector_dir, staging_vector_dir, lock_dir, config_path.
 - **Config get/set** — fully implemented with dotted-key TOML support. `config get <key>` reads, `config set <key> <value>` writes.
 - **All 17 commands dispatched** — init, add, ingest, search, read, explain, list, remove, doctor, config, capabilities, taxonomy, reindex, mcp, completions, enrich, root.
-- **Search** — BM25-only (hybrid falls back to BM25 when no vector index). RRF fusion k=60, stable tie-break (score desc, id asc).
+- **Search returns EntryPoints (ADR-007)** — `EntryPoint` is the public retrieval result: best position in a document to begin reading, with block_idx, block_kind, span, snippet, scores, and context_window. Segment identifiers NEVER appear in public output. Segments are derived operational views (ADR-009).
+- **Search** — Hybrid: BM25 + vector cosine via RRF (ADR-014). BM25 always required; vector optional with graceful fallback. Three modes: `hybrid` (default), `bm25`, `vector`. RRF fusion k=60, stable tie-break (score desc, id asc).
 - **Processing fingerprints (ADR-004)** — `ProcessingFingerprint` (parser_name, parser_version, segmenter_version) persisted on every add/ingest. `Parser` trait requires `version()` method. `SEGMENTER_VERSION` constant in shiro-parse. Doctor checks for missing fingerprints.
 - **Context expansion** — `--expand` on search: alternating before/after from hit segment, budget (max_blocks default 12, max_chars default 8000).
 - **Staging→promote atomic rename** — FtsIndex and FlatIndex both build into staging dirs, then `fs::rename()` atomically into place. Prevents partial indices.
@@ -97,7 +105,7 @@ Search → FtsIndex.search() → RRF fusion(k=60, BM25-only currently)
 
 ## UNIMPLEMENTED / STUBS
 
-All previously exposed stubs have been removed from the CLI surface (Rule 0). New infrastructure (HttpEmbedder, vector reindex, spec registry) is fully implemented and tested but not all exposed as CLI commands yet. The `execute_vector` SDK function requires a running embedding server.
+Hybrid retrieval is fully wired: Engine auto-detects FlatIndex, accepts optional Embedder, and search fuses BM25 + vector via RRF. CLI embedder injection via config is not yet implemented — embedder must be injected programmatically or via a future `shiro embed` command. The `execute_vector` SDK function requires a running embedding server.
 ## GOTCHAS
 
 - `Store.put_segments()` does DELETE+INSERT loop without explicit transaction wrapping — partial segments possible on mid-loop failure

@@ -16,6 +16,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      actions: write          # needed to dispatch release workflow after tag push
     steps:
       - uses: actions/checkout@v4
 
@@ -37,7 +38,7 @@ jobs:
         id: changesets
         uses: changesets/action@v1
         with:
-          version: pnpm run version-sync
+          version: npx changeset version && pnpm run version-sync
           publish: pnpm run tag-release
           commit: 'chore: release versions'
           title: 'chore: release versions'

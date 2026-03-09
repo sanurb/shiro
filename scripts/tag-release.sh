@@ -45,3 +45,10 @@ echo "Creating tag ${TAG}..."
 git tag -f "${TAG}"
 git push origin "${TAG}"
 echo "Released ${TAG}."
+
+# In CI, GITHUB_TOKEN-pushed tags don't trigger `on: push: tags` workflows.
+# Explicitly dispatch the release workflow so it actually runs.
+if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+  echo "Dispatching release workflow for ${TAG}..."
+  gh workflow run release.yml -f tag="${TAG}"
+fi

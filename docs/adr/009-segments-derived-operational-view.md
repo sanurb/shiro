@@ -1,6 +1,6 @@
 # ADR-009: Segments Are a Derived Operational View, Not the Canonical Semantic Unit
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-03-07
 
 ## Context

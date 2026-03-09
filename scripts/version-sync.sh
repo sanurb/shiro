@@ -51,9 +51,15 @@ if [[ "$CARGO_VERSION" == "$PKG_VERSION" ]]; then
 fi
 
 if [[ "$WRITE" == true ]]; then
-  sed "s/\"version\": \".*\"/\"version\": \"${CARGO_VERSION}\"/" "$PACKAGE_JSON" > "$PACKAGE_JSON.tmp" \
-    && mv "$PACKAGE_JSON.tmp" "$PACKAGE_JSON"
-  echo "updated package.json version: $PKG_VERSION -> $CARGO_VERSION"
+  # Changesets bumps package.json — propagate that version to Cargo.toml (source of truth for Rust builds).
+  # Also sync Cargo.toml → package.json in case Cargo.toml was bumped manually.
+  if [[ "$CARGO_VERSION" != "$PKG_VERSION" ]]; then
+    # Prefer package.json as the authority when called from changesets (it was just bumped).
+    NEW_VERSION="$PKG_VERSION"
+    sed "s/^version = \"${CARGO_VERSION}\"/version = \"${NEW_VERSION}\"/" "$CARGO_TOML" > "$CARGO_TOML.tmp" \
+      && mv "$CARGO_TOML.tmp" "$CARGO_TOML"
+    echo "updated Cargo.toml workspace version: $CARGO_VERSION -> $NEW_VERSION"
+  fi
   exit 0
 fi
 
