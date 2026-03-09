@@ -12,6 +12,9 @@
 
 ---
 
+> [!TIP]
+> **shiro** (Japanese for *castle*) is a high-performance, local-first knowledge engine designed to transform fragmented PDFs and Markdown files into a unified, structure-aware searchable base. 
+
 Shiro transforms PDFs and Markdown files into a unified, structure-aware searchable base on your local machine. Documents are parsed into a BlockGraph intermediate representation that preserves reading order, heading hierarchy, and block relationships. Retrieval combines BM25 full-text search (Tantivy) with local vector embeddings (FastEmbed/ONNX) and optional cross-encoder reranking, fused via Reciprocal Rank Fusion. Embeddings and reranking run entirely on-device — no data leaves your machine. Every command emits deterministic JSON to stdout wrapped in a HATEOAS envelope, making shiro a first-class building block for AI agents, shell pipelines, and automation toolchains.
 
 ## Key Differentiators
