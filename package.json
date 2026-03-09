@@ -1,23 +1,30 @@
 {
   "name": "@sanurb/shiro-cli",
   "version": "0.4.0",
-  "description": "Shiro CLI — local-first PDF/Markdown knowledge engine",
+  "description": "Local-first PDF/Markdown knowledge engine — CLI distributed via GitHub Releases",
   "license": "MIT OR Apache-2.0",
   "author": "sanurb",
   "repository": {
     "type": "git",
-    "url": "https://github.com/sanurb/shiro.git"
+    "url": "git+https://github.com/sanurb/shiro.git"
   },
   "homepage": "https://github.com/sanurb/shiro",
   "bugs": {
     "url": "https://github.com/sanurb/shiro/issues"
   },
+  "keywords": [
+    "shiro",
+    "knowledge-base",
+    "pdf",
+    "markdown",
+    "search",
+    "cli"
+  ],
   "bin": {
     "shiro": "bin/shiro"
   },
   "files": [
     "README.md",
-    "LICENSE*",
     "install.js",
     "bin/"
   ],
@@ -27,7 +34,7 @@
   "engines": {
     "node": ">=18"
   },
-  "packageManager": "pnpm@10.0.0",
+  "os": ["linux", "darwin"],
   "scripts": {
     "postinstall": "node install.js",
     "test": "cargo test",

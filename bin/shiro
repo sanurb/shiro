@@ -1,0 +1,33 @@
+#!/usr/bin/env node
+"use strict";
+
+// Thin wrapper that delegates to the native shiro binary downloaded by postinstall.
+// This file MUST be checked into version control and included in the npm tarball
+// so that `"bin": { "shiro": "bin/shiro" }` resolves at install time.
+
+const { execFileSync } = require("child_process");
+const path = require("path");
+const fs = require("fs");
+
+const nativeBin = path.join(__dirname, "shiro-native");
+
+if (!fs.existsSync(nativeBin)) {
+  const pkg = require("../package.json");
+  process.stderr.write(
+    `shiro: native binary not found at ${nativeBin}\n` +
+      `shiro: run "node ${path.join(__dirname, "..", "install.js")}" to download it,\n` +
+      `shiro: or install from source: cargo install shiro-cli --version ${pkg.version}\n`
+  );
+  process.exit(127);
+}
+
+// exec the native binary with inherited stdio — transparent pass-through.
+try {
+  const result = execFileSync(nativeBin, process.argv.slice(2), {
+    stdio: "inherit",
+    env: process.env,
+  });
+} catch (err) {
+  // execFileSync throws on non-zero exit; forward the exit code.
+  process.exit(err.status != null ? err.status : 1);
+}

@@ -52,10 +52,12 @@ async function main() {
   const tarball = `${archive}.tar.gz`;
   const url = `https://github.com/${REPO}/releases/download/${TAG}/${tarball}`;
 
-  const binDir = path.join(__dirname, "bin");
-  fs.mkdirSync(binDir, { recursive: true });
+  const pkgDir = __dirname;
+  const binDir = path.join(pkgDir, "bin");
+  const tmpDir = path.join(pkgDir, ".install-tmp");
+  fs.mkdirSync(tmpDir, { recursive: true });
 
-  const tmpFile = path.join(binDir, tarball);
+  const tmpFile = path.join(tmpDir, tarball);
 
   console.log(`shiro: downloading ${tarball}...`);
 
@@ -63,19 +65,20 @@ async function main() {
   const writeStream = createWriteStream(tmpFile);
   await pipeline(res, writeStream);
 
-  // Extract the binary from the tarball
-  execSync(`tar xzf "${tmpFile}" -C "${binDir}" --strip-components=1 "${archive}/shiro"`, {
+  // Extract the native binary into tmp dir, then move to bin/shiro-native.
+  // bin/shiro is the checked-in Node.js wrapper — we must never overwrite it.
+  execSync(`tar xzf "${tmpFile}" -C "${tmpDir}" --strip-components=1 "${archive}/shiro"`, {
     stdio: "inherit",
   });
 
-  // Clean up tarball
-  fs.unlinkSync(tmpFile);
+  const nativePath = path.join(binDir, "shiro-native");
+  fs.renameSync(path.join(tmpDir, "shiro"), nativePath);
+  fs.chmodSync(nativePath, 0o755);
 
-  // Make executable
-  const binPath = path.join(binDir, "shiro");
-  fs.chmodSync(binPath, 0o755);
+  // Clean up
+  fs.rmSync(tmpDir, { recursive: true, force: true });
 
-  console.log(`shiro: installed to ${binPath}`);
+  console.log(`shiro: native binary installed to ${nativePath}`);
 }
 
 main().catch((err) => {

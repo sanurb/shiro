@@ -68,5 +68,6 @@ yarn-error.log*
 /dist/
 *.tsbuildinfo
 
-# npm postinstall binary
-/bin/
+# npm postinstall native binary (bin/shiro wrapper is checked in)
+/bin/shiro-native
+/.install-tmp/
