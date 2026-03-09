@@ -1,3 +1,4 @@
+use shiro_core::fingerprint::EmbeddingFingerprint;
 use shiro_core::ports::{Embedder, EmbeddingMeta};
 use shiro_core::ShiroError;
 
@@ -31,6 +32,17 @@ impl Embedder for StubEmbedder {
             model_name: "stub".to_string(),
             provider: "stub".to_string(),
         }
+    }
+
+    fn fingerprint(&self) -> EmbeddingFingerprint {
+        EmbeddingFingerprint::new(
+            "stub".to_string(),
+            "stub".to_string(),
+            self.dims,
+            "none".to_string(),
+            "none".to_string(),
+            "full_segment".to_string(),
+        )
     }
 }
 
@@ -79,6 +91,17 @@ impl Embedder for DeterministicStubEmbedder {
             model_name: "deterministic-stub".to_string(),
             provider: "stub".to_string(),
         }
+    }
+
+    fn fingerprint(&self) -> EmbeddingFingerprint {
+        EmbeddingFingerprint::new(
+            "stub".to_string(),
+            "deterministic-stub".to_string(),
+            self.dims,
+            "l2".to_string(),
+            "none".to_string(),
+            "full_segment".to_string(),
+        )
     }
 }
 

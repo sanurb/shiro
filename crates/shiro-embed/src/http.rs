@@ -3,6 +3,7 @@
 //! Works with: ollama, llama.cpp server, text-embeddings-inference, vLLM,
 //! or any server implementing POST /v1/embeddings with the OpenAI schema.
 
+use shiro_core::fingerprint::EmbeddingFingerprint;
 use shiro_core::ports::{Embedder, EmbeddingMeta};
 use shiro_core::ShiroError;
 
@@ -20,11 +21,23 @@ pub struct HttpEmbedderConfig {
 
 pub struct HttpEmbedder {
     config: HttpEmbedderConfig,
+    fingerprint: EmbeddingFingerprint,
 }
 
 impl HttpEmbedder {
     pub fn new(config: HttpEmbedderConfig) -> Self {
-        Self { config }
+        let fingerprint = EmbeddingFingerprint::new(
+            "http".to_string(),
+            config.model.clone(),
+            config.dimensions,
+            "unknown".to_string(),
+            "model_default".to_string(),
+            "full_segment".to_string(),
+        );
+        Self {
+            config,
+            fingerprint,
+        }
     }
 
     fn post_embeddings(&self, input: Vec<String>) -> Result<Vec<Vec<f32>>, ShiroError> {
@@ -115,5 +128,9 @@ impl Embedder for HttpEmbedder {
             model_name: self.config.model.clone(),
             provider: "http".to_string(),
         }
+    }
+
+    fn fingerprint(&self) -> EmbeddingFingerprint {
+        self.fingerprint.clone()
     }
 }
