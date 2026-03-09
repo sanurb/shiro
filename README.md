@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://github.com/sanurb/shiro/actions"><img src="https://img.shields.io/github/actions/workflow/status/sanurb/shiro/ci.yml?branch=master&style=flat-square&logo=github&color=181717" alt="CI Status"></a>
   <a href="https://github.com/sanurb/shiro/releases"><img src="https://img.shields.io/github/v/release/sanurb/shiro?style=flat-square&logo=rust&color=e44d26" alt="Latest Release"></a>
-  <img src="https://img.shields.io/badge/License-MIT%2FApache--2.0-4caf50?style=flat-square" alt="License">
+  <img src="https://img.shields.io/badge/License-MIT-4caf50?style=flat-square" alt="License">
 </p>
 
 ---
@@ -375,4 +375,4 @@ Contributions that uphold speed, privacy, and structural integrity are welcome.
 
 ## License
 
-Dual-licensed under MIT and Apache 2.0. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
+Licensed under the MIT License. See [LICENSE](LICENSE).
