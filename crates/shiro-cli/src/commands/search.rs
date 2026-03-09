@@ -7,7 +7,8 @@ use std::collections::BTreeMap;
 
 use crate::envelope::{CmdOutput, NextAction, ParamMeta};
 use shiro_core::config::ShiroConfig;
-use shiro_core::ports::Embedder;
+use shiro_core::fingerprint::EmbeddingFingerprint;
+use shiro_core::ports::{Embedder, VectorIndex};
 use shiro_core::{ShiroError, ShiroHome};
 use shiro_sdk::{Engine, SearchInput};
 
@@ -35,24 +36,27 @@ fn open_engine(home: &ShiroHome) -> Result<Engine, ShiroError> {
         match provider {
             "fastembed" => {
                 let model_name = embed.model.as_deref().unwrap_or("AllMiniLML6V2");
-                let fe_model = parse_fastembed_model(model_name);
-                let cache_dir = embed.cache_dir.as_ref().map(std::path::PathBuf::from);
-
+                let cache_dir = embed.cache_dir.as_ref().map(camino::Utf8PathBuf::from);
                 let fe_config = shiro_fastembed::FastEmbedEmbedderConfig {
-                    model: fe_model,
+                    model: model_name.to_string(),
                     cache_dir,
                     show_download_progress: false,
                 };
-
                 match shiro_fastembed::FastEmbedEmbedder::try_new(fe_config) {
                     Ok(embedder) => {
+                        let fp = embedder.fingerprint();
                         let dims = embedder.dimensions();
                         engine = engine.with_embedder(Box::new(embedder));
 
-                        // Open or create the flat vector index.
+                        // Open or create the flat vector index with fingerprint enforcement (ADR-012).
                         let vector_path = home.vector_dir().join("flat.jsonl");
-                        if let Ok(index) = shiro_embed::FlatIndex::open(dims, vector_path) {
-                            engine = engine.with_vector_index(Box::new(index));
+                        match open_vector_index(dims, vector_path, &fp) {
+                            Ok(index) => {
+                                engine = engine.with_vector_index(Box::new(index));
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "vector index fingerprint mismatch or open failed");
+                            }
                         }
                     }
                     Err(e) => {
@@ -73,11 +77,19 @@ fn open_engine(home: &ShiroHome) -> Result<Engine, ShiroError> {
                         api_key: embed.api_key.clone(),
                     };
                     let embedder = shiro_embed::HttpEmbedder::new(http_config);
+                    let fp = embedder.fingerprint();
+                    let dims = embedder.dimensions();
                     engine = engine.with_embedder(Box::new(embedder));
 
+                    // Open or create the flat vector index with fingerprint enforcement (ADR-012).
                     let vector_path = home.vector_dir().join("flat.jsonl");
-                    if let Ok(index) = shiro_embed::FlatIndex::open(dims, vector_path) {
-                        engine = engine.with_vector_index(Box::new(index));
+                    match open_vector_index(dims, vector_path, &fp) {
+                        Ok(index) => {
+                            engine = engine.with_vector_index(Box::new(index));
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "vector index fingerprint mismatch or open failed");
+                        }
                     }
                 }
             }
@@ -92,9 +104,8 @@ fn open_engine(home: &ShiroHome) -> Result<Engine, ShiroError> {
         let provider = rerank.provider.as_deref().unwrap_or("fastembed");
         if provider == "fastembed" {
             let model_name = rerank.model.as_deref().unwrap_or("BGERerankerBase");
-            let rr_model = parse_reranker_model(model_name);
             let rr_config = shiro_fastembed::FastEmbedRerankerConfig {
-                model: rr_model,
+                model: model_name.to_string(),
                 cache_dir: None,
                 show_download_progress: false,
             };
@@ -241,46 +252,42 @@ pub fn run(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Model name parsing helpers
-// ---------------------------------------------------------------------------
+/// Open a FlatIndex and enforce fingerprint consistency (ADR-012).
+///
+/// If the index has a stored fingerprint, verify it matches the active
+/// embedder's fingerprint. A mismatch is a hard error — the index must
+/// be rebuilt with `shiro reindex`. If no fingerprint is stored (legacy
+/// data or fresh index), the active fingerprint is recorded.
+fn open_vector_index(
+    dims: usize,
+    vector_path: camino::Utf8PathBuf,
+    embedder_fp: &EmbeddingFingerprint,
+) -> Result<shiro_embed::FlatIndex, ShiroError> {
+    let index = shiro_embed::FlatIndex::open(dims, vector_path)?;
 
-/// Parse a fastembed embedding model name from config string.
-/// Falls back to AllMiniLML6V2 for unknown names.
-fn parse_fastembed_model(name: &str) -> shiro_fastembed::EmbeddingModel {
-    use shiro_fastembed::EmbeddingModel;
-    match name {
-        "AllMiniLML6V2" | "all-minilm-l6-v2" => EmbeddingModel::AllMiniLML6V2,
-        "AllMiniLML6V2Q" => EmbeddingModel::AllMiniLML6V2Q,
-        "AllMiniLML12V2" | "all-minilm-l12-v2" => EmbeddingModel::AllMiniLML12V2,
-        "BGEBaseENV15" | "bge-base-en-v1.5" => EmbeddingModel::BGEBaseENV15,
-        "BGESmallENV15" | "bge-small-en-v1.5" => EmbeddingModel::BGESmallENV15,
-        "BGELargeENV15" | "bge-large-en-v1.5" => EmbeddingModel::BGELargeENV15,
-        "NomicEmbedTextV1" | "nomic-embed-text-v1" => EmbeddingModel::NomicEmbedTextV1,
-        "NomicEmbedTextV15" | "nomic-embed-text-v1.5" => EmbeddingModel::NomicEmbedTextV15,
-        "MxbaiEmbedLargeV1" | "mxbai-embed-large-v1" => EmbeddingModel::MxbaiEmbedLargeV1,
-        _ => {
-            tracing::warn!(
-                name,
-                "unknown fastembed model, falling back to AllMiniLML6V2"
-            );
-            EmbeddingModel::AllMiniLML6V2
+    // ADR-012: fingerprint mismatch is a hard error.
+    if let Some(stored_fp) = index.stored_fingerprint() {
+        if stored_fp.fingerprint_hash != embedder_fp.fingerprint_hash {
+            return Err(ShiroError::FingerprintMismatch {
+                message: format!(
+                    "embedding model changed: stored={}/{}({}d), active={}/{}({}d). Run `shiro reindex` to rebuild.",
+                    stored_fp.provider, stored_fp.model, stored_fp.dimensions,
+                    embedder_fp.provider, embedder_fp.model, embedder_fp.dimensions,
+                ),
+            });
         }
+    } else if index.count()? == 0 {
+        // Fresh index — record the fingerprint.
+        index.set_fingerprint(embedder_fp)?;
+    } else {
+        // Non-empty index without fingerprint — legacy data.
+        // Record the fingerprint but warn.
+        tracing::warn!(
+            "vector index has {} entries but no fingerprint sidecar; assuming current config is correct",
+            index.count().unwrap_or(0)
+        );
+        index.set_fingerprint(embedder_fp)?;
     }
-}
 
-/// Parse a fastembed reranker model name from config string.
-fn parse_reranker_model(name: &str) -> shiro_fastembed::RerankerModel {
-    use shiro_fastembed::RerankerModel;
-    match name {
-        "BGERerankerBase" | "bge-reranker-base" => RerankerModel::BGERerankerBase,
-        "BGERerankerV2M3" | "bge-reranker-v2-m3" => RerankerModel::BGERerankerV2M3,
-        _ => {
-            tracing::warn!(
-                name,
-                "unknown reranker model, falling back to BGERerankerBase"
-            );
-            RerankerModel::BGERerankerBase
-        }
-    }
+    Ok(index)
 }

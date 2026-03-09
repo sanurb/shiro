@@ -46,6 +46,12 @@ pub fn run(home: &ShiroHome, result_id: &str) -> Result<CmdOutput, ShiroError> {
                     "rank": vector_rank,
                 }));
             }
+            if let Some(reranker_rank) = output.reranker_rank {
+                scores.insert("reranker".to_string(), serde_json::json!({
+                    "score": output.reranker_score,
+                    "rank": reranker_rank,
+                }));
+            }
             scores.insert("fused".to_string(), serde_json::json!({
                 "score": output.fused_score,
                 "rank": output.fused_rank,
