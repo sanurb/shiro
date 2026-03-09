@@ -6,7 +6,7 @@
 
 use crate::envelope::{CmdOutput, NextAction};
 use shiro_core::config::{
-    lookup_key, ConfigFieldKind, EmbedConfig, SearchConfig, ShiroConfig, CONFIG_KEYS,
+    lookup_key, ConfigFieldKind, EmbedConfig, RerankConfig, SearchConfig, ShiroConfig, CONFIG_KEYS,
 };
 use shiro_core::{ShiroError, ShiroHome};
 
@@ -118,6 +118,31 @@ fn get_field(config: &ShiroConfig, key: &str) -> Option<serde_json::Value> {
             .as_ref()
             .and_then(|e| e.api_key.as_deref())
             .map(|v| serde_json::json!(v)),
+        "embed.provider" => config
+            .embed
+            .as_ref()
+            .and_then(|e| e.provider.as_deref())
+            .map(|v| serde_json::json!(v)),
+        "embed.cache_dir" => config
+            .embed
+            .as_ref()
+            .and_then(|e| e.cache_dir.as_deref())
+            .map(|v| serde_json::json!(v)),
+        "rerank.provider" => config
+            .rerank
+            .as_ref()
+            .and_then(|r| r.provider.as_deref())
+            .map(|v| serde_json::json!(v)),
+        "rerank.model" => config
+            .rerank
+            .as_ref()
+            .and_then(|r| r.model.as_deref())
+            .map(|v| serde_json::json!(v)),
+        "rerank.top_k" => config
+            .rerank
+            .as_ref()
+            .and_then(|r| r.top_k)
+            .map(|v| serde_json::json!(v)),
         _ => None,
     }
 }
@@ -160,8 +185,38 @@ fn set_field(
                 .get_or_insert_with(EmbedConfig::default)
                 .api_key = Some(raw.to_string());
         }
+        "embed.provider" => {
+            config
+                .embed
+                .get_or_insert_with(EmbedConfig::default)
+                .provider = Some(raw.to_string());
+        }
+        "embed.cache_dir" => {
+            config
+                .embed
+                .get_or_insert_with(EmbedConfig::default)
+                .cache_dir = Some(raw.to_string());
+        }
+        "rerank.provider" => {
+            config
+                .rerank
+                .get_or_insert_with(RerankConfig::default)
+                .provider = Some(raw.to_string());
+        }
+        "rerank.model" => {
+            config
+                .rerank
+                .get_or_insert_with(RerankConfig::default)
+                .model = Some(raw.to_string());
+        }
+        "rerank.top_k" => {
+            let v = parse_value::<usize>(raw, kind)?;
+            config
+                .rerank
+                .get_or_insert_with(RerankConfig::default)
+                .top_k = Some(v);
+        }
         _ => {
-            // Should never reach here — validate_key guards the entry.
             return Err(ShiroError::InvalidInput {
                 message: format!("unhandled config key '{key}'"),
             });

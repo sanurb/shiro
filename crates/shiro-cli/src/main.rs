@@ -115,6 +115,10 @@ enum Commands {
         #[arg(long, default_value = "8000")]
         max_chars: usize,
 
+        /// Apply reranker to fused results.
+        #[arg(long)]
+        rerank: bool,
+
         /// Filter by tag.
         #[arg(long)]
         tag: Option<String>,
@@ -214,6 +218,7 @@ enum Commands {
 enum SearchModeArg {
     Hybrid,
     Bm25,
+    Vector,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -385,14 +390,25 @@ fn dispatch(cli: &Cli) -> Result<CmdOutput, ShiroError> {
             expand,
             max_blocks,
             max_chars,
+            rerank,
             ..
         }) => {
             let home = resolve_home(cli)?;
             let m = match mode {
                 SearchModeArg::Hybrid => commands::search::SearchMode::Hybrid,
                 SearchModeArg::Bm25 => commands::search::SearchMode::Bm25,
+                SearchModeArg::Vector => commands::search::SearchMode::Vector,
             };
-            commands::search::run(&home, query, m, *limit, *expand, *max_blocks, *max_chars)
+            commands::search::run(
+                &home,
+                query,
+                m,
+                *limit,
+                *expand,
+                *max_blocks,
+                *max_chars,
+                *rerank,
+            )
         }
 
         Some(Commands::Read { id, view }) => {

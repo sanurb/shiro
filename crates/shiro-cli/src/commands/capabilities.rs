@@ -34,6 +34,8 @@ pub fn run(home: &ShiroHome) -> Result<CmdOutput, ShiroError> {
 
     // Check what's actually available
     let fts_available = home.tantivy_dir().as_std_path().is_dir();
+    let vector_available = home.vector_dir().as_std_path().is_dir()
+        && home.vector_dir().join("flat.jsonl").as_std_path().is_file();
 
     let result = serde_json::json!({
         "schemaVersion": 2,
@@ -60,17 +62,25 @@ pub fn run(home: &ShiroHome) -> Result<CmdOutput, ShiroError> {
         "parsers": PARSERS,
         "features": {
             "fts_bm25":       "implemented",
-            "hybrid_search":  "bm25_only",
+            "hybrid_search":  "implemented",
+            "vector_embed":   "implemented",
+            "reranking":      "implemented",
             "taxonomy":       "implemented",
             "enrichment":     "heuristic_only",
             "mcp_server":     "code_mode",
             "completions":    "implemented",
-            "vector_embed":   "infrastructure_only",
+        },
+        "embedding": {
+            "providers": ["fastembed", "http"],
+            "vector_index": "flat",
+            "fusion": "rrf",
+            "reranker_providers": ["fastembed"],
         },
         "storage": {
             "engine":     "sqlite",
             "fts_engine": "tantivy",
             "fts_present": fts_available,
+            "vector_present": vector_available,
         },
     });
 

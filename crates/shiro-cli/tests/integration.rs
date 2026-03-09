@@ -351,6 +351,7 @@ fn capabilities_schema_stable() {
                 "id_schemes",
                 "parsers",
                 "features",
+                "embedding",
                 "storage",
             ];
             s.sort();
@@ -385,11 +386,12 @@ fn capabilities_schema_stable() {
             let mut s = vec![
                 "fts_bm25",
                 "hybrid_search",
+                "vector_embed",
+                "reranking",
                 "taxonomy",
                 "enrichment",
                 "mcp_server",
                 "completions",
-                "vector_embed",
             ];
             s.sort();
             s
@@ -1033,8 +1035,8 @@ fn contract_capabilities_json() {
     );
     assert_eq!(
         v["result"]["features"]["vector_embed"].as_str(),
-        Some("infrastructure_only"),
-        "vector_embed must equal infrastructure_only"
+        Some("implemented"),
+        "vector_embed must equal implemented"
     );
 }
 
