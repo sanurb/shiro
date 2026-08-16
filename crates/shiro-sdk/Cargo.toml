@@ -12,7 +12,6 @@ shiro-core  = { workspace = true }
 shiro-store = { workspace = true }
 shiro-index = { workspace = true }
 shiro-parse = { workspace = true }
-shiro-embed = { workspace = true }
 
 serde       = { workspace = true }
 serde_json  = { workspace = true }
@@ -22,4 +21,5 @@ camino      = { workspace = true }
 tracing     = { workspace = true }
 
 [dev-dependencies]
+shiro-embed = { workspace = true }
 tempfile = { workspace = true }

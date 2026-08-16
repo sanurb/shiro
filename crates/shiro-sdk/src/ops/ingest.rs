@@ -4,13 +4,12 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use shiro_core::fingerprint::ProcessingFingerprint;
-use shiro_core::manifest::DocState;
 use shiro_core::ports::Parser;
 use shiro_core::{ErrorCode, ShiroError};
 use shiro_index::FtsIndex;
-use shiro_parse::{segment_document, SEGMENTER_VERSION};
 use shiro_store::Store;
+
+use super::document_ingestion::{publish_staged_documents, stage_document_bytes};
 
 // ── Inputs ──────────────────────────────────────────────────────────────────
 
@@ -98,65 +97,49 @@ pub fn execute(
     let mut ready = 0usize;
     let mut failed = 0usize;
     let mut failures = Vec::new();
-    let mut all_segments = Vec::new();
+    let mut staged = Vec::new();
+    let mut staged_doc_ids = HashSet::new();
 
-    // Phase 1: parse files and write docs to SQLite in a single transaction.
-    store.begin()?;
     for file_path in &files {
-        match parse_and_store(store, parser, file_path) {
-            Ok(Some(segments)) => {
-                emit(&IngestEvent::Indexed {
-                    path: file_path.clone(),
-                    doc_id: segments
-                        .first()
-                        .map(|s| s.doc_id.as_str().to_string())
-                        .unwrap_or_default(),
-                    segments: segments.len(),
-                });
-                all_segments.extend(segments);
-                added += 1;
-                ready += 1;
+        let result = std::fs::read(file_path)
+            .map_err(ShiroError::from)
+            .and_then(|content| stage_document_bytes(store, parser, file_path, &content));
+
+        match result {
+            Ok(document) if document.changed && staged_doc_ids.insert(document.doc_id.clone()) => {
+                staged.push((file_path.clone(), document));
             }
-            Ok(None) => {
+            Ok(_) => {
                 emit(&IngestEvent::Skipped {
                     path: file_path.clone(),
                     reason: "already_exists".to_string(),
                 });
                 ready += 1;
             }
-            Err(e) => {
-                let code = ErrorCode::from_error(&e);
-                emit(&IngestEvent::Failed {
+            Err(error) => {
+                record_ingest_failure(&emit, file_path, &error, &mut failures, &mut failed);
+            }
+        }
+    }
+
+    let staged_refs: Vec<_> = staged.iter().map(|(_, document)| document).collect();
+    match publish_staged_documents(store, fts, &staged_refs) {
+        Ok(()) => {
+            for (file_path, document) in &staged {
+                emit(&IngestEvent::Indexed {
                     path: file_path.clone(),
-                    error: e.to_string(),
+                    doc_id: document.doc_id.as_str().to_string(),
+                    segments: document.segments.len(),
                 });
-                failures.push(IngestFailure {
-                    source: file_path.clone(),
-                    code: code.as_str().to_string(),
-                    message: e.to_string(),
-                });
-                failed += 1;
-                tracing::warn!(path = %file_path, error = %e, "ingest failed");
+                added += 1;
+                ready += 1;
             }
         }
-    }
-    store.commit()?;
-
-    // Phase 2: index all segments in a single Tantivy writer+commit.
-    if !all_segments.is_empty() {
-        fts.index_segments(&all_segments)?;
-    }
-
-    // Phase 3: mark all added docs as READY in one transaction.
-    if added > 0 {
-        store.begin()?;
-        let mut seen = HashSet::new();
-        for seg in &all_segments {
-            if seen.insert(seg.doc_id.clone()) {
-                store.set_state(&seg.doc_id, DocState::Ready)?;
+        Err(error) => {
+            for (file_path, _) in &staged {
+                record_ingest_failure(&emit, file_path, &error, &mut failures, &mut failed);
             }
         }
-        store.commit()?;
     }
 
     emit(&IngestEvent::Complete {
@@ -175,31 +158,25 @@ pub fn execute(
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Parse a file and store its document + segments. Returns segments if new.
-fn parse_and_store(
-    store: &Store,
-    parser: &dyn Parser,
-    path: &str,
-) -> Result<Option<Vec<shiro_core::ir::Segment>>, ShiroError> {
-    let content = std::fs::read(path)?;
-    let doc = parser.parse(path, &content)?;
-
-    if store.exists(&doc.id)? {
-        return Ok(None);
-    }
-
-    store.put_document(&doc, DocState::Indexing)?;
-
-    // Persist processing fingerprint (ADR-004) for staleness detection.
-    let fingerprint =
-        ProcessingFingerprint::new(parser.name(), parser.version(), SEGMENTER_VERSION);
-    store.set_fingerprint(&doc.id, &fingerprint)?;
-
-    let segments = segment_document(&doc)?;
-    store.put_segments(&segments)?;
-
-    tracing::info!(doc_id = %doc.id, path = %path, "ingested");
-    Ok(Some(segments))
+fn record_ingest_failure(
+    emit: &impl Fn(&IngestEvent),
+    file_path: &str,
+    error: &ShiroError,
+    failures: &mut Vec<IngestFailure>,
+    failed: &mut usize,
+) {
+    let code = ErrorCode::from_error(error);
+    emit(&IngestEvent::Failed {
+        path: file_path.to_string(),
+        error: error.to_string(),
+    });
+    failures.push(IngestFailure {
+        source: file_path.to_string(),
+        code: code.as_str().to_string(),
+        message: error.to_string(),
+    });
+    *failed += 1;
+    tracing::warn!(path = %file_path, error = %error, "ingest failed");
 }
 
 /// Collect supported files from a directory via recursive walk.
@@ -233,4 +210,62 @@ fn is_supported(path: &Path) -> bool {
         path.extension().and_then(|e| e.to_str()),
         Some("txt" | "md" | "markdown" | "pdf")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shiro_core::ir::Document;
+    use shiro_parse::PlainTextParser;
+
+    struct SelectiveFailureParser;
+
+    impl Parser for SelectiveFailureParser {
+        fn name(&self) -> &str {
+            "selective_failure"
+        }
+
+        fn version(&self) -> u32 {
+            1
+        }
+
+        fn parse(&self, source_uri: &str, content: &[u8]) -> Result<Document, ShiroError> {
+            if source_uri.ends_with("a_bad.txt") {
+                return Err(ShiroError::ParseMd {
+                    message: "selective ingestion test parse failure".to_string(),
+                });
+            }
+            PlainTextParser.parse(source_uri, content)
+        }
+    }
+
+    #[test]
+    fn batch_ingestion_continues_after_document_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).unwrap();
+        let corpus = root.join("corpus");
+        std::fs::create_dir_all(corpus.as_std_path()).unwrap();
+        std::fs::write(corpus.join("a_bad.txt").as_std_path(), b"bad content").unwrap();
+        std::fs::write(
+            corpus.join("b_good.txt").as_std_path(),
+            b"successful searchable content",
+        )
+        .unwrap();
+
+        let store = Store::open(&root.join("shiro.db")).unwrap();
+        let fts = FtsIndex::open(&root.join("tantivy")).unwrap();
+        let input = IngestInput {
+            dirs: vec![corpus.as_str().to_string()],
+            max_files: None,
+        };
+
+        let output = execute(&store, &fts, &SelectiveFailureParser, &input, None).unwrap();
+
+        assert_eq!(output.added, 1);
+        assert_eq!(output.ready, 1);
+        assert_eq!(output.failed, 1);
+        assert_eq!(output.failures.len(), 1);
+        assert_eq!(output.failures[0].source, corpus.join("a_bad.txt").as_str());
+        assert!(!fts.search("searchable", 10).unwrap().is_empty());
+    }
 }

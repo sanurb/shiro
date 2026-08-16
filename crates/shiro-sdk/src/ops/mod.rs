@@ -1,5 +1,6 @@
 pub mod add;
 pub mod doctor;
+pub(crate) mod document_ingestion;
 pub mod enrich;
 pub mod explain;
 pub mod ingest;

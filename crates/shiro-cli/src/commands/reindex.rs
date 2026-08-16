@@ -2,21 +2,35 @@
 
 use crate::envelope::{CmdOutput, NextAction};
 use shiro_core::{ShiroError, ShiroHome};
-use shiro_store::Store;
 
 pub fn run(home: &ShiroHome) -> Result<CmdOutput, ShiroError> {
-    let store = Store::open(&home.db_path())?;
-    let output = shiro_sdk::ops::reindex::execute(home, &store)?;
+    let engine = crate::runtime::open_engine_for_reindex(home)?;
+    let output = engine.reindex()?;
+    let vector_output = if engine.embedder().is_some() {
+        Some(crate::runtime::reindex_vector(&engine)?)
+    } else {
+        None
+    };
 
-    let result = serde_json::json!({
-        "actions": [serde_json::json!({
+    let mut actions = vec![serde_json::json!({
+        "index": output.index,
+        "status": output.status,
+        "documents": output.documents,
+        "segments": output.segments,
+        "generation": output.generation,
+    })];
+
+    if let Some(output) = vector_output {
+        actions.push(serde_json::json!({
             "index": output.index,
             "status": output.status,
             "documents": output.documents,
             "segments": output.segments,
             "generation": output.generation,
-        })]
-    });
+        }));
+    }
+
+    let result = serde_json::json!({ "actions": actions });
 
     Ok(CmdOutput {
         result,

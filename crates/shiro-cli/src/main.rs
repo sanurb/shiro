@@ -8,6 +8,7 @@ use shiro_core::{ShiroError, ShiroHome};
 
 mod commands;
 mod envelope;
+mod runtime;
 mod schema;
 
 use commands::completions::CompletionShell;

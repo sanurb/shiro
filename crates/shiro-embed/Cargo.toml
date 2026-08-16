@@ -5,14 +5,12 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "Vector embedding index implementations for shiro"
+description = "Embedding provider adapters and test doubles for shiro"
 
 [dependencies]
 shiro-core.workspace = true
-serde.workspace = true
+shiro-index.workspace = true
 serde_json.workspace = true
-camino.workspace = true
-tracing.workspace = true
 ureq.workspace = true
 blake3.workspace = true
 

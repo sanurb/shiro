@@ -222,14 +222,51 @@ pub fn execute_program(
     program: &Value,
     limits: Limits,
 ) -> Result<ExecutionResult, ShiroError> {
+    execute_program_with_ports(
+        home,
+        store,
+        fts,
+        parser,
+        executor::ExecutorPorts::default(),
+        program,
+        limits,
+    )
+}
+
+/// Parse and execute a DSL program with optional retrieval adapters.
+pub fn execute_program_with_ports(
+    home: &ShiroHome,
+    store: &Store,
+    fts: &FtsIndex,
+    parser: &dyn shiro_core::ports::Parser,
+    ports: executor::ExecutorPorts<'_>,
+    program: &Value,
+    limits: Limits,
+) -> Result<ExecutionResult, ShiroError> {
+    let mut call_handler = |op: &str, params: &Value| {
+        let call = serde_json::json!({ "op": op, "params": params });
+        executor::execute_with_ports(home, store, fts, parser, ports, &call)
+    };
+    execute_program_with_call_handler(program, limits, &mut call_handler)
+}
+
+/// Execute a DSL program through an operation-time call handler.
+///
+/// Parameters have completed variable substitution before the handler runs,
+/// allowing composition roots to initialize only the adapters needed by calls
+/// that actually execute.
+pub fn execute_program_with_call_handler(
+    program: &Value,
+    limits: Limits,
+    call_handler: &mut dyn FnMut(&str, &Value) -> Result<Value, ShiroError>,
+) -> Result<ExecutionResult, ShiroError> {
     let nodes: Vec<Node> =
         serde_json::from_value(program.clone()).map_err(|e| ShiroError::DslError {
             message: format!("invalid program: {e}"),
         })?;
 
     let mut env = Env::new(limits);
-
-    execute_nodes(home, store, fts, parser, &nodes, &mut env)?;
+    execute_nodes(call_handler, &nodes, &mut env)?;
 
     let value = env.return_value.take().unwrap_or(Value::Null);
     let serialized_len = serde_json::to_string(&value).map(|s| s.len()).unwrap_or(0);
@@ -244,10 +281,7 @@ pub fn execute_program(
 }
 
 fn execute_nodes(
-    home: &ShiroHome,
-    store: &Store,
-    fts: &FtsIndex,
-    parser: &dyn shiro_core::ports::Parser,
+    call_handler: &mut dyn FnMut(&str, &Value) -> Result<Value, ShiroError>,
     nodes: &[Node],
     env: &mut Env,
 ) -> Result<(), ShiroError> {
@@ -255,16 +289,13 @@ fn execute_nodes(
         if env.return_value.is_some() {
             break; // early exit after return
         }
-        execute_node(home, store, fts, parser, node, env)?;
+        execute_node(call_handler, node, env)?;
     }
     Ok(())
 }
 
 fn execute_node(
-    home: &ShiroHome,
-    store: &Store,
-    fts: &FtsIndex,
-    parser: &dyn shiro_core::ports::Parser,
+    call_handler: &mut dyn FnMut(&str, &Value) -> Result<Value, ShiroError>,
     node: &Node,
     env: &mut Env,
 ) -> Result<(), ShiroError> {
@@ -276,11 +307,11 @@ fn execute_node(
 
     match node {
         Node::Let { name, call } => {
-            let result = execute_call(home, store, fts, parser, call, env, step_idx, step_start)?;
+            let result = execute_call(call_handler, call, env, step_idx, step_start)?;
             env.vars.insert(name.clone(), result);
         }
         Node::Call(call) => {
-            execute_call(home, store, fts, parser, call, env, step_idx, step_start)?;
+            execute_call(call_handler, call, env, step_idx, step_start)?;
         }
         Node::If {
             condition,
@@ -301,9 +332,9 @@ fn execute_node(
             });
 
             if is_truthy {
-                execute_nodes(home, store, fts, parser, then, env)?;
+                execute_nodes(call_handler, then, env)?;
             } else {
-                execute_nodes(home, store, fts, parser, r#else, env)?;
+                execute_nodes(call_handler, r#else, env)?;
             }
         }
         Node::ForEach {
@@ -343,7 +374,7 @@ fn execute_node(
                     break;
                 }
                 env.vars.insert(item.clone(), elem.clone());
-                execute_nodes(home, store, fts, parser, body, env)?;
+                execute_nodes(call_handler, body, env)?;
             }
             // Clean up loop variable
             env.vars.remove(item);
@@ -368,10 +399,7 @@ fn execute_node(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_call(
-    home: &ShiroHome,
-    store: &Store,
-    fts: &FtsIndex,
-    parser: &dyn shiro_core::ports::Parser,
+    call_handler: &mut dyn FnMut(&str, &Value) -> Result<Value, ShiroError>,
     call: &CallTarget,
     env: &mut Env,
     step_idx: u32,
@@ -380,18 +408,12 @@ fn execute_call(
     // Substitute variables in params
     let resolved_params = substitute_vars_in_map(&call.params, &env.vars)?;
 
-    // Build the executor program
-    let program = serde_json::json!({
-        "op": call.op,
-        "params": resolved_params,
-    });
-
     // Hash the args for trace
     let args_json = serde_json::to_string(&resolved_params).unwrap_or_default();
     let args_hash = blake3::hash(args_json.as_bytes()).to_hex()[..16].to_string();
 
-    // Execute via the existing SDK executor
-    match executor::execute(home, store, fts, parser, &program) {
+    // Execute after control flow and variable substitution determine the call.
+    match call_handler(&call.op, &resolved_params) {
         Ok(result) => {
             let result_bytes = serde_json::to_string(&result).map(|s| s.len()).unwrap_or(0);
             env.output_bytes += result_bytes;
@@ -601,6 +623,40 @@ mod tests {
         let result = run_program("if-true", program).unwrap();
         // Empty store → empty array → falsy
         assert_eq!(result.value, Value::String("empty".into()));
+    }
+
+    #[test]
+    fn call_handler_sees_only_executed_calls_with_resolved_parameters() {
+        let program = serde_json::json!([
+            {"type": "let", "name": "mode", "call": {"op": "selected_mode", "params": {}}},
+            {"type": "let", "name": "enabled", "call": {"op": "vector_enabled", "params": {}}},
+            {"type": "if", "condition": "$enabled", "then": [
+                {"type": "call", "op": "search", "params": {"mode": "vector"}}
+            ], "else": [
+                {"type": "call", "op": "search", "params": {"mode": "$mode"}}
+            ]},
+            {"type": "return", "value": "$mode"}
+        ]);
+        let mut calls = Vec::new();
+        let mut handler = |op: &str, params: &Value| {
+            calls.push((op.to_string(), params.clone()));
+            match op {
+                "selected_mode" => Ok(serde_json::json!("bm25")),
+                "vector_enabled" => Ok(serde_json::json!(false)),
+                "search" => Ok(serde_json::json!({ "hits": [] })),
+                _ => Err(ShiroError::InvalidInput {
+                    message: format!("unexpected test operation: {op}"),
+                }),
+            }
+        };
+
+        let result =
+            execute_program_with_call_handler(&program, Limits::default(), &mut handler).unwrap();
+
+        assert_eq!(result.value, serde_json::json!("bm25"));
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[2].0, "search");
+        assert_eq!(calls[2].1, serde_json::json!({ "mode": "bm25" }));
     }
 
     #[test]

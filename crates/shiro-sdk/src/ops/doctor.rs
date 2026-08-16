@@ -1,9 +1,7 @@
 //! `doctor` — consistency checks and diagnostics.
 
 use serde::{Deserialize, Serialize};
-use shiro_core::ports::VectorIndex;
 use shiro_core::{ShiroError, ShiroHome};
-use shiro_embed::FlatIndex;
 use shiro_index::FtsIndex;
 use shiro_store::Store;
 
@@ -237,34 +235,75 @@ pub fn execute(home: &ShiroHome, input: &DoctorInput) -> Result<DoctorOutput, Sh
 
     // Check 7: vector index (optional)
     if input.verify_vector {
-        let vector_dir = home.vector_dir();
-        let vec_data = vector_dir.join("vectors.jsonl");
-        if !vector_dir.as_std_path().is_dir() || !vec_data.as_std_path().exists() {
-            checks.push(DoctorCheck {
-                name: "vector_index".into(),
-                status: "warn".into(),
-                message: "no vector index found — vector search not yet configured".into(),
-                details: None,
-            });
-        } else {
-            match FlatIndex::open(384, vec_data) {
-                Ok(idx) => {
-                    let count = idx.count().unwrap_or(0);
-                    checks.push(DoctorCheck {
-                        name: "vector_index".into(),
-                        status: "ok".into(),
-                        message: format!("{count} vectors indexed, dims={}", idx.dimensions()),
-                        details: None,
-                    });
-                }
-                Err(e) => {
-                    checks.push(DoctorCheck {
-                        name: "vector_index".into(),
-                        status: "fail".into(),
-                        message: format!("cannot open vector index: {e}"),
-                        details: None,
-                    });
-                }
+        let vector_data_path = home.vector_dir().join("flat.jsonl");
+        let fingerprint_path = home.vector_dir().join("flat.fingerprint.json");
+        match std::fs::read_to_string(vector_data_path.as_std_path()) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                checks.push(DoctorCheck {
+                    name: "vector_index".into(),
+                    status: "warn".into(),
+                    message: "no vector index found — vector search not yet configured".into(),
+                    details: None,
+                });
+            }
+            Err(error) => {
+                checks.push(DoctorCheck {
+                    name: "vector_index".into(),
+                    status: "fail".into(),
+                    message: format!("cannot read vector index: {error}"),
+                    details: Some(serde_json::json!({
+                        "data_path": vector_data_path.as_str(),
+                    })),
+                });
+            }
+            Ok(content) => {
+                let vector_count = content
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .count();
+                let fingerprint_read = std::fs::read_to_string(fingerprint_path.as_std_path());
+                let (status, message, fingerprint_hash) = match fingerprint_read {
+                    Ok(json) => {
+                        match serde_json::from_str::<shiro_core::EmbeddingFingerprint>(&json) {
+                            Ok(fingerprint) => (
+                                "ok",
+                                format!(
+                                    "{vector_count} vectors indexed with embedding fingerprint"
+                                ),
+                                Some(fingerprint.fingerprint_hash),
+                            ),
+                            Err(error) => (
+                                "fail",
+                                format!(
+                                    "{vector_count} vectors indexed with malformed embedding fingerprint: {error}"
+                                ),
+                                None,
+                            ),
+                        }
+                    }
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound && vector_count == 0 =>
+                    {
+                        ("ok", "empty vector index".to_string(), None)
+                    }
+                    Err(error) => (
+                        "fail",
+                        format!(
+                            "{vector_count} vectors indexed without a readable embedding fingerprint: {error}"
+                        ),
+                        None,
+                    ),
+                };
+                checks.push(DoctorCheck {
+                    name: "vector_index".into(),
+                    status: status.into(),
+                    message,
+                    details: Some(serde_json::json!({
+                        "data_path": vector_data_path.as_str(),
+                        "fingerprint_path": fingerprint_path.as_str(),
+                        "fingerprint_hash": fingerprint_hash,
+                    })),
+                });
             }
         }
     }

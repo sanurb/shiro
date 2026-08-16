@@ -90,6 +90,9 @@ fn end_to_end_pipeline() {
     let first = &results[0];
     assert_eq!(first["doc_id"].as_str().unwrap(), doc_id);
     let result_id = first["result_id"].as_str().unwrap().to_string();
+    let entry_block_idx = first["block_idx"].as_u64().unwrap();
+    let entry_block_kind = first["block_kind"].as_str().unwrap().to_string();
+    let entry_span = first["span"].clone();
     assert!(
         result_id.starts_with("res_"),
         "result_id should have res_ prefix"
@@ -142,6 +145,12 @@ fn end_to_end_pipeline() {
         v["result"]["block_kind"].is_string(),
         "block_kind must be present in explain output"
     );
+    assert_eq!(v["result"]["block_idx"].as_u64().unwrap(), entry_block_idx);
+    assert_eq!(
+        v["result"]["block_kind"].as_str().unwrap(),
+        entry_block_kind
+    );
+    assert_eq!(v["result"]["span"], entry_span);
 
     // 10. Doctor check.
     let (stdout, code) = shiro(&home, &["doctor"]);

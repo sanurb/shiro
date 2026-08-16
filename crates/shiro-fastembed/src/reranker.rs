@@ -89,6 +89,16 @@ impl Reranker for FastEmbedReranker {
     }
 }
 
+fn parse_reranker_model(name: &str) -> Result<RerankerModel, ShiroError> {
+    match name {
+        "BGERerankerBase" | "bge-reranker-base" => Ok(RerankerModel::BGERerankerBase),
+        "BGERerankerV2M3" | "bge-reranker-v2-m3" => Ok(RerankerModel::BGERerankerV2M3),
+        _ => Err(ShiroError::InvalidInput {
+            message: format!("unknown reranker model: {name}"),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,15 +133,5 @@ mod tests {
             ..Default::default()
         };
         assert!(FastEmbedReranker::try_new(cfg).is_err());
-    }
-}
-
-fn parse_reranker_model(name: &str) -> Result<RerankerModel, ShiroError> {
-    match name {
-        "BGERerankerBase" | "bge-reranker-base" => Ok(RerankerModel::BGERerankerBase),
-        "BGERerankerV2M3" | "bge-reranker-v2-m3" => Ok(RerankerModel::BGERerankerV2M3),
-        _ => Err(ShiroError::InvalidInput {
-            message: format!("unknown reranker model: {name}"),
-        }),
     }
 }

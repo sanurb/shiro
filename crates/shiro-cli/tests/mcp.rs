@@ -230,6 +230,50 @@ fn mcp_execute_list_operation() {
 }
 
 #[test]
+fn mcp_execute_skips_adapters_for_unexecuted_vector_branch() {
+    let tmp = init_home();
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "version = 1\n[embed]\nprovider = \"http\"\n",
+    )
+    .unwrap();
+    let responses = mcp_roundtrip(
+        tmp.path(),
+        &[
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                "name": "shiro.execute",
+                "arguments": {
+                    "program": [
+                        {"type": "let", "name": "docs", "call": {"op": "list", "params": {"limit": 1}}},
+                        {"type": "if", "condition": "$docs.documents", "then": [
+                            {"type": "call", "op": "search", "params": {"query": "unused", "mode": "vector"}}
+                        ], "else": [
+                            {"type": "call", "op": "list", "params": {"limit": 1}}
+                        ]},
+                        {"type": "return", "value": "ok"}
+                    ]
+                }
+            }}),
+        ],
+    );
+
+    let response = &responses[1];
+    assert_eq!(
+        response["result"]["isError"], false,
+        "execute failed: {response}"
+    );
+    let content = response["result"]["content"][0]["text"].as_str().unwrap();
+    let result: serde_json::Value = serde_json::from_str(content).unwrap();
+    assert_eq!(result["value"], "ok");
+    assert!(result["trace"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|step| step["op"] != "search"));
+}
+
+#[test]
 fn mcp_execute_trace_has_correct_structure() {
     let tmp = init_home();
     let responses = mcp_roundtrip(

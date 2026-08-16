@@ -17,6 +17,7 @@ mod engine;
 pub mod executor;
 mod fusion;
 pub mod ops;
+mod retrieval_result;
 pub mod spec;
 
 pub use dsl::{CallTarget, ExecutionResult, Limits, Node, StepTrace};

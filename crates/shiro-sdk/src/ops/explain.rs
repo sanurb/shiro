@@ -7,18 +7,12 @@ use serde::{Deserialize, Serialize};
 use shiro_core::ShiroError;
 use shiro_store::Store;
 
-use crate::RRF_K;
+use crate::retrieval_result::build_retrieval_trace;
+pub use crate::retrieval_result::RetrievalTrace;
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExplainInput {
     pub result_id: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct RetrievalTrace {
-    pub pipeline: Vec<String>,
-    pub stages: Vec<serde_json::Value>,
-    pub fusion: serde_json::Value,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -46,41 +40,6 @@ pub struct ExplainOutput {
 pub fn execute(store: &Store, input: &ExplainInput) -> Result<ExplainOutput, ShiroError> {
     let detail = store.get_search_result(&input.result_id)?;
 
-    // Load segment to get span info.
-    let segments = store.get_segments(&detail.doc_id)?;
-    let segment = segments
-        .iter()
-        .find(|s| s.id == detail.segment_id)
-        .ok_or_else(|| ShiroError::NotFoundMsg {
-            message: format!("segment {} not in store", detail.segment_id),
-        })?;
-
-    // Resolve segment to block via BlockGraph (ADR-007).
-    let graph = store.get_block_graph(&detail.doc_id)?;
-    let (block_idx, block_kind) = if graph.blocks.is_empty() {
-        (segment.index, "PARAGRAPH".to_string())
-    } else {
-        let seg_start = segment.span.start();
-        let seg_end = segment.span.end();
-        let mut best_idx = 0;
-        let mut best_overlap: usize = 0;
-        for (i, block) in graph.blocks.iter().enumerate() {
-            let b_start = block.span.start();
-            let b_end = block.span.end();
-            let overlap_start = seg_start.max(b_start);
-            let overlap_end = seg_end.min(b_end);
-            if overlap_start < overlap_end {
-                let overlap = overlap_end - overlap_start;
-                if overlap > best_overlap {
-                    best_overlap = overlap;
-                    best_idx = i;
-                }
-            }
-        }
-        let kind_str = format!("{:?}", graph.blocks[best_idx].kind).to_uppercase();
-        (best_idx, kind_str)
-    };
-
     let bm25_rank = detail.bm25_rank.unwrap_or(0);
     let bm25_score = detail.bm25_score.unwrap_or(0.0);
     let vector_score = detail.vector_score;
@@ -91,82 +50,7 @@ pub fn execute(store: &Store, input: &ExplainInput) -> Result<ExplainOutput, Shi
     let fused_rank = detail.fused_rank.unwrap_or(0);
     let fts_gen = detail.fts_gen.unwrap_or(0);
     let query_digest = detail.query_digest.clone().unwrap_or_default();
-    // Build retrieval trace.
-    let mut pipeline = Vec::new();
-    let mut stages = Vec::new();
-    let mut contributions = serde_json::Map::new();
-
-    if detail.bm25_rank.is_some() {
-        pipeline.push("fts_bm25".to_string());
-        let bm25_rrf = 1.0 / (RRF_K + bm25_rank as f64);
-        stages.push(serde_json::json!({
-            "name": "fts_bm25",
-            "input_query": &detail.query,
-            "this_result": {
-                "rank": bm25_rank,
-                "raw_score": bm25_score,
-            },
-        }));
-        contributions.insert(
-            "bm25".to_string(),
-            serde_json::json!({
-                "rank": bm25_rank,
-                "rrf_contribution": bm25_rrf,
-            }),
-        );
-    }
-
-    if let Some(v_rank) = detail.vector_rank {
-        pipeline.push("vector".to_string());
-        let vector_rrf = 1.0 / (RRF_K + v_rank as f64);
-        stages.push(serde_json::json!({
-            "name": "vector",
-            "input_query": &detail.query,
-            "this_result": {
-                "rank": v_rank,
-                "raw_score": detail.vector_score.unwrap_or(0.0),
-            },
-        }));
-        contributions.insert(
-            "vector".to_string(),
-            serde_json::json!({
-                "rank": v_rank,
-                "rrf_contribution": vector_rrf,
-            }),
-        );
-    }
-
-    if let Some(rr_rank) = detail.reranker_rank {
-        pipeline.push("reranker".to_string());
-        stages.push(serde_json::json!({
-            "name": "reranker",
-            "input_query": &detail.query,
-            "this_result": {
-                "rank": rr_rank,
-                "raw_score": detail.reranker_score.unwrap_or(0.0),
-            },
-        }));
-        contributions.insert(
-            "reranker".to_string(),
-            serde_json::json!({
-                "rank": rr_rank,
-                "score": detail.reranker_score.unwrap_or(0.0),
-            }),
-        );
-    }
-
-    let fusion = serde_json::json!({
-        "method": "rrf",
-        "k": RRF_K as u64,
-        "contributions": contributions,
-        "final_score": fused_score,
-    });
-
-    let retrieval_trace = RetrievalTrace {
-        pipeline,
-        stages,
-        fusion,
-    };
+    let retrieval_trace = build_retrieval_trace(&detail);
 
     Ok(ExplainOutput {
         result_id: input.result_id.clone(),
@@ -174,10 +58,10 @@ pub fn execute(store: &Store, input: &ExplainInput) -> Result<ExplainOutput, Shi
         query_digest,
         fts_generation: fts_gen,
         doc_id: detail.doc_id.as_str().to_string(),
-        block_idx,
-        block_kind,
-        span_start: segment.span.start(),
-        span_end: segment.span.end(),
+        block_idx: detail.block_idx,
+        block_kind: detail.block_kind,
+        span_start: detail.span_start,
+        span_end: detail.span_end,
         bm25_score,
         bm25_rank,
         vector_score,

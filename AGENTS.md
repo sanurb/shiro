@@ -6,7 +6,7 @@
 
 Local-first PDF/Markdown knowledge engine. Indexes documents into a unified searchable base using BM25 full-text search, SKOS taxonomy, and heuristic enrichment. Single Rust binary, JSON-only CLI + Code Mode MCP server (stdio). v0.3.0, MIT/Apache-2.0.
 
-Eight crates: **shiro-core** (domain types, ports, errors, EmbeddingFingerprint ADR-012), **shiro-store** (SQLite persistence, schema v5), **shiro-index** (Tantivy BM25 full-text search), **shiro-parse** (Markdown + PDF parsers, emits ReadsBefore edges, SEGMENTER_VERSION=1), **shiro-embed** (vector embedding: FlatIndex with generation management + blake3 checksums + fingerprint sidecar, HttpEmbedder for OpenAI-compatible endpoints, StubEmbedder + DeterministicStubEmbedder for tests), **shiro-sdk** (typed API surface, spec registry, executor — hybrid search via RRF fusion of BM25 + vector, returns EntryPoint results per ADR-007), **shiro-cli** (JSON-only CLI + MCP server), **shiro-docling** (Docling-based structured PDF parser adapter).
+Eight crates: **shiro-core** (domain types, ports, errors, EmbeddingFingerprint ADR-012), **shiro-store** (SQLite persistence, schema v5), **shiro-index** (Tantivy BM25 plus FlatIndex vector search and generation management), **shiro-parse** (Markdown + PDF parsers, emits ReadsBefore edges, SEGMENTER_VERSION=1), **shiro-embed** (HttpEmbedder for OpenAI-compatible endpoints plus StubEmbedder and DeterministicStubEmbedder test doubles), **shiro-sdk** (typed API surface, spec registry, executor — hybrid search via RRF fusion of BM25 + vector, returns EntryPoint results per ADR-007), **shiro-cli** (JSON-only CLI + MCP server), **shiro-docling** (Docling-based structured PDF parser adapter).
 
 ## STRUCTURE
 
@@ -16,9 +16,9 @@ shiro/
 │   ├── shiro-core/     # Domain types, ports, errors — every crate depends on this
 │   ├── shiro-cli/      # JSON-only CLI (clap v4 derive) + HATEOAS envelope
 │   ├── shiro-store/    # SQLite persistence (rusqlite, no ORM) — Schema v5
-│   ├── shiro-index/    # Tantivy BM25 full-text search + generation tracking
+│   ├── shiro-index/    # Tantivy BM25 + FlatIndex vector search and generation tracking
 │   ├── shiro-parse/    # MarkdownParser, PdfParser (implements Parser trait, emits ReadsBefore edges)
-│   ├── shiro-embed/    # Vector embedding: FlatIndex (generation-managed), HttpEmbedder, StubEmbedder
+│   ├── shiro-embed/    # HttpEmbedder + deterministic embedding test doubles
 │   ├── shiro-sdk/      # Typed API surface, spec registry, executor — CLI is thin adapter
 │   └── shiro-docling/  # Docling-based structured PDF parser — subprocess boundary, crate-private schema
 ├── docs/
@@ -44,7 +44,7 @@ shiro/
 | Integration tests | `crates/shiro-cli/tests/integration.rs` | Spawns real binary, validates JSON contract |
 | MCP tests | `crates/shiro-cli/tests/mcp.rs` | JSON-RPC stdio roundtrip tests (15 tests) |
 | Architecture decisions | `docs/ARCHITECTURE.md` | ADRs in `docs/adr/`, state machine diagrams |
-| Vector search / embeddings | `crates/shiro-embed/src/` | FlatIndex (generation-managed, blake3 checksums, fingerprint sidecar ADR-012), HttpEmbedder (OpenAI-compatible), StubEmbedder + DeterministicStubEmbedder (test-only) |
+| Vector search / embeddings | `crates/shiro-index/src/flat_vector_index.rs` + `crates/shiro-embed/src/` | FlatIndex persistence and fingerprint sidecar live with indices; provider adapters and test doubles live in shiro-embed |
 | Taxonomy operations | `crates/shiro-store/src/lib.rs` + `crates/shiro-cli/src/commands/taxonomy.rs` | SKOS model: concepts, relations, transitive closure, doc_concepts |
 | Enrichment | `crates/shiro-sdk/src/ops/enrich.rs` + `crates/shiro-store/src/lib.rs` | Heuristic provider only (title, summary, tags) |
 | MCP server | `crates/shiro-cli/src/commands/mcp.rs` | Code Mode: search(spec_query) + execute(program). JSON-RPC stdio |
@@ -79,7 +79,7 @@ Explain → Store.get_search_result(result_id) → stored block_idx/block_kind
 - **State machine** — `STAGED → INDEXING → READY`, `INDEXING → FAILED`, `any → DELETED`. Documents searchable ONLY in `Ready`.
 - **Ports only for truly external adapters** — `Parser`, `Embedder`, `VectorIndex` traits. SQLite/Tantivy are concrete infrastructure, NOT behind traits.
 - **Half-open byte spans** — `[start, end)` invariant enforced at `Span::new()`. Adjacent spans do NOT overlap.
-- **Zero unsafe, zero unwrap in production** — all error propagation uses `?`. `unwrap()`/`expect()` confined to `#[cfg(test)]`. Two known exceptions: `flat.rs` flush (Vec write — infallible), `mcp.rs` ensure_ctx (post-init invariant).
+- **Zero unsafe, zero unwrap in production** — all error propagation uses `?`. `unwrap()`/`expect()` confined to `#[cfg(test)]`. Two known exceptions: `flat_vector_index.rs` flush (Vec write — infallible), `mcp.rs` ensure_ctx (post-init invariant).
 - **ErrorCode dual-tracking** — every `ShiroError` variant maps to an `ErrorCode` with both `as_str()` (JSON) and `exit_code()` (CLI). 21 variants total (including E_EXECUTION_LIMIT, E_DSL_ERROR).
 - **ShiroHome paths** — root, db_path, tantivy_dir, staging_tantivy_dir, vector_dir, staging_vector_dir, lock_dir, config_path.
 - **Config get/set** — fully implemented with dotted-key TOML support. `config get <key>` reads, `config set <key> <value>` writes.

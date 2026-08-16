@@ -29,9 +29,9 @@ Workspace crates and architectural role:
 
 - `shiro-core`: domain types, IDs, errors, ports, invariants
 - `shiro-store`: SQLite persistence, schema migration, document lifecycle state
-- `shiro-index`: Tantivy BM25 indexing and search
+- `shiro-index`: Tantivy BM25 and flat vector indexing/search implementations
 - `shiro-parse`: Markdown/PDF parsers that produce IR + segmentation inputs
-- `shiro-embed`: embedding adapters and vector index implementations
+- `shiro-embed`: embedding provider adapters and test doubles
 - `shiro-sdk`: orchestration, typed operations, retrieval contracts, DSL/spec execution
 - `shiro-cli`: JSON envelope adapter and MCP command surface
 

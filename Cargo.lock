@@ -2994,6 +2994,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "toml",
 ]
 
 [[package]]
@@ -3014,12 +3015,10 @@ name = "shiro-embed"
 version = "0.5.0"
 dependencies = [
  "blake3",
- "camino",
- "serde",
  "serde_json",
  "shiro-core",
+ "shiro-index",
  "tempfile",
- "tracing",
  "ureq",
 ]
 
@@ -3038,7 +3037,10 @@ dependencies = [
 name = "shiro-index"
 version = "0.5.0"
 dependencies = [
+ "blake3",
  "camino",
+ "serde",
+ "serde_json",
  "shiro-core",
  "tantivy",
  "tempfile",

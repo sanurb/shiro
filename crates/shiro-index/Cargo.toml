@@ -5,13 +5,16 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description.workspace = true
+description = "BM25 and vector search index implementations for shiro"
 
 [dependencies]
 shiro-core.workspace = true
 camino.workspace = true
 tantivy.workspace = true
 tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

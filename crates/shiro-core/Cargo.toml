@@ -13,6 +13,7 @@ camino.workspace = true
 serde.workspace = true
 schemars.workspace = true
 thiserror.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

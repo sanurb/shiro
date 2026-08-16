@@ -107,7 +107,7 @@ fn parse_edge_relation(s: &str) -> Result<Relation, ShiroError> {
 }
 
 /// Current schema version this binary expects.
-pub const CURRENT_SCHEMA_VERSION: u32 = 6;
+pub const CURRENT_SCHEMA_VERSION: u32 = 7;
 
 /// A row to be saved in the `search_results` table.
 pub struct SearchResultRow {
@@ -122,6 +122,10 @@ pub struct SearchResultRow {
     pub fused_rank: Option<usize>,
     pub reranker_score: Option<f32>,
     pub reranker_rank: Option<usize>,
+    pub block_idx: usize,
+    pub block_kind: String,
+    pub span_start: usize,
+    pub span_end: usize,
 }
 
 /// Detail returned from `get_search_result`.
@@ -140,6 +144,10 @@ pub struct SearchResultDetail {
     pub vec_gen: Option<u64>,
     pub reranker_score: Option<f32>,
     pub reranker_rank: Option<usize>,
+    pub block_idx: usize,
+    pub block_kind: String,
+    pub span_start: usize,
+    pub span_end: usize,
 }
 
 /// V3 DDL for new tables (used in both fresh-create and migration).
@@ -372,6 +380,22 @@ fn run_migrations(conn: &rusqlite::Connection, from_version: u32) -> Result<(), 
             }
         }
 
+        if version == 6 {
+            // v6 → v7: persist the canonical EntryPoint selected at query time.
+            let has_entry_point = conn
+                .prepare("SELECT block_idx FROM search_results LIMIT 0")
+                .is_ok();
+            if !has_entry_point {
+                conn.execute_batch(
+                    "ALTER TABLE search_results ADD COLUMN block_idx INTEGER NOT NULL DEFAULT 0;
+                     ALTER TABLE search_results ADD COLUMN block_kind TEXT NOT NULL DEFAULT 'PARAGRAPH';
+                     ALTER TABLE search_results ADD COLUMN span_start INTEGER NOT NULL DEFAULT 0;
+                     ALTER TABLE search_results ADD COLUMN span_end INTEGER NOT NULL DEFAULT 0;",
+                )
+                .map_err(map_db)?;
+            }
+        }
+
         // Update version after each successful migration.
         conn.execute(
             "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -454,6 +478,10 @@ impl Store {
                 query_digest TEXT,
                 reranker_score REAL,
                 reranker_rank INTEGER,
+                block_idx INTEGER NOT NULL DEFAULT 0,
+                block_kind TEXT NOT NULL DEFAULT 'PARAGRAPH',
+                span_start INTEGER NOT NULL DEFAULT 0,
+                span_end INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
             );
 
@@ -527,37 +555,45 @@ impl Store {
 
     // ── Document CRUD ──────────────────────────────────────────────────
 
-    /// Insert or update a document. Returns `true` if newly inserted.
+    /// Insert or update a document and its canonical BlockGraph atomically.
     pub fn put_document(&self, doc: &Document, state: DocState) -> Result<bool, ShiroError> {
-        // Check existence first to determine insert vs replace.
-        let existed = self.exists(&doc.id)?;
+        self.with_savepoint("put_document", || {
+            let existed = self.exists(&doc.id)?;
 
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO documents (doc_id, canonical_text, rendered_text, source_uri, source_hash, title, state, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-                rusqlite::params![
-                    doc.id.as_str(),
-                    doc.canonical_text,
-                    doc.rendered_text,
-                    doc.metadata.source_uri,
-                    doc.metadata.source_hash,
-                    doc.metadata.title,
-                    state.as_str(),
-                ],
-            )
-            .map_err(map_db)?;
+            self.conn
+                .execute(
+                    "INSERT INTO documents (doc_id, canonical_text, rendered_text, source_uri, source_hash, title, state, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                     ON CONFLICT(doc_id) DO UPDATE SET
+                         canonical_text = excluded.canonical_text,
+                         rendered_text = excluded.rendered_text,
+                         source_uri = excluded.source_uri,
+                         source_hash = excluded.source_hash,
+                         title = excluded.title,
+                         state = excluded.state,
+                         updated_at = excluded.updated_at",
+                    rusqlite::params![
+                        doc.id.as_str(),
+                        doc.canonical_text,
+                        doc.rendered_text,
+                        doc.metadata.source_uri,
+                        doc.metadata.source_hash,
+                        doc.metadata.title,
+                        state.as_str(),
+                    ],
+                )
+                .map_err(map_db)?;
 
-        // Persist BlockGraph atomically with document (ADR-006).
-        self.put_block_graph(&doc.id, &doc.blocks)?;
+            self.put_block_graph(&doc.id, &doc.blocks)?;
 
-        if !existed {
-            let version_id = VersionId::new(&doc.id, 1);
-            self.create_version(&doc.id, &version_id, None)?;
-            self.set_active_version(&doc.id, &version_id)?;
-        }
+            if !existed {
+                let version_id = VersionId::new(&doc.id, 1);
+                self.create_version(&doc.id, &version_id, None)?;
+                self.set_active_version(&doc.id, &version_id)?;
+            }
 
-        Ok(!existed)
+            Ok(!existed)
+        })
     }
 
     /// Get a document by ID.
@@ -692,6 +728,16 @@ impl Store {
         })
     }
 
+    /// Mark a batch of Indexing documents Ready in one SQLite savepoint.
+    pub fn set_documents_ready(&self, doc_ids: &[DocId]) -> Result<(), ShiroError> {
+        self.with_savepoint("set_documents_ready", || {
+            for doc_id in doc_ids {
+                self.set_state(doc_id, DocState::Ready)?;
+            }
+            Ok(())
+        })
+    }
+
     // ── Segment CRUD ───────────────────────────────────────────────────
 
     /// Insert segments for a document (replaces existing).
@@ -699,11 +745,27 @@ impl Store {
     /// Wrapped in a savepoint so a mid-loop failure does not leave the
     /// document with partial or zero segments.
     pub fn put_segments(&self, segments: &[Segment]) -> Result<(), ShiroError> {
-        if segments.is_empty() {
+        let Some(first_segment) = segments.first() else {
             return Ok(());
-        }
+        };
+        self.with_savepoint("put_segments", || {
+            self.replace_document_segments(&first_segment.doc_id, segments)
+        })
+    }
 
-        let doc_id = &segments[0].doc_id;
+    fn replace_document_segments(
+        &self,
+        doc_id: &DocId,
+        segments: &[Segment],
+    ) -> Result<(), ShiroError> {
+        if let Some(foreign_segment) = segments.iter().find(|segment| segment.doc_id != *doc_id) {
+            return Err(ShiroError::InvalidInput {
+                message: format!(
+                    "document segment ownership mismatch: expected {doc_id}, got {}",
+                    foreign_segment.doc_id
+                ),
+            });
+        }
 
         let version_id_str: Option<String> = self
             .conn
@@ -712,38 +774,88 @@ impl Store {
                 rusqlite::params![doc_id.as_str()],
                 |row| row.get(0),
             )
-            .ok();
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => ShiroError::NotFound(doc_id.clone()),
+                other => map_db(other),
+            })?;
 
-        self.with_savepoint("put_segments", || {
-            self.conn
-                .execute(
-                    "DELETE FROM segments WHERE doc_id = ?1",
-                    rusqlite::params![doc_id.as_str()],
-                )
-                .map_err(map_db)?;
+        self.conn
+            .execute(
+                "DELETE FROM segments WHERE doc_id = ?1",
+                rusqlite::params![doc_id.as_str()],
+            )
+            .map_err(map_db)?;
 
-            let mut stmt = self
+        let mut stmt = self
+            .conn
+            .prepare(
+                "INSERT INTO segments (segment_id, doc_id, seg_index, span_start, span_end, body, version_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .map_err(map_db)?;
+
+        for segment in segments {
+            stmt.execute(rusqlite::params![
+                segment.id.as_str(),
+                segment.doc_id.as_str(),
+                segment.index as i64,
+                segment.span.start() as i64,
+                segment.span.end() as i64,
+                segment.body,
+                version_id_str,
+            ])
+            .map_err(map_db)?;
+        }
+
+        Ok(())
+    }
+
+    /// Stage a document's graph, processing fingerprint, and segments atomically.
+    ///
+    /// Ready content-addressed documents are left unchanged. Staged, indexing,
+    /// and failed documents are reset through the lifecycle to Staged so an
+    /// interrupted ingestion can be retried safely.
+    pub fn stage_document_processing(
+        &self,
+        doc: &Document,
+        fingerprint: &ProcessingFingerprint,
+        segments: &[Segment],
+    ) -> Result<bool, ShiroError> {
+        self.with_savepoint("stage_document_processing", || {
+            let stored_state: Option<String> = self
                 .conn
-                .prepare(
-                    "INSERT INTO segments (segment_id, doc_id, seg_index, span_start, span_end, body, version_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                .query_row(
+                    "SELECT state FROM documents WHERE doc_id = ?1",
+                    rusqlite::params![doc.id.as_str()],
+                    |row| row.get(0),
                 )
+                .optional()
                 .map_err(map_db)?;
 
-            for seg in segments {
-                stmt.execute(rusqlite::params![
-                    seg.id.as_str(),
-                    seg.doc_id.as_str(),
-                    seg.index as i64,
-                    seg.span.start() as i64,
-                    seg.span.end() as i64,
-                    seg.body,
-                    version_id_str,
-                ])
-                .map_err(map_db)?;
+            match stored_state.as_deref().map(parse_state).transpose()? {
+                Some(DocState::Ready) => return Ok(false),
+                Some(DocState::Staged) | None => {}
+                Some(DocState::Indexing) => {
+                    self.set_state(&doc.id, DocState::Failed)?;
+                    self.set_state(&doc.id, DocState::Staged)?;
+                }
+                Some(DocState::Failed) => {
+                    self.set_state(&doc.id, DocState::Staged)?;
+                }
+                Some(DocState::Deleted) => {
+                    return Err(ShiroError::InvalidInput {
+                        message: format!(
+                            "document ingestion retry rejected for deleted document {}",
+                            doc.id
+                        ),
+                    });
+                }
             }
 
-            Ok(())
+            self.put_document(doc, DocState::Staged)?;
+            self.set_fingerprint(&doc.id, fingerprint)?;
+            self.replace_document_segments(&doc.id, segments)?;
+            Ok(true)
         })
     }
 
@@ -1058,8 +1170,8 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "INSERT INTO search_results (result_id, query, doc_id, segment_id, bm25_score, bm25_rank, vector_score, vector_rank, fused_score, fused_rank, fts_gen, vec_gen, query_digest, reranker_score, reranker_rank)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                "INSERT INTO search_results (result_id, query, doc_id, segment_id, bm25_score, bm25_rank, vector_score, vector_rank, fused_score, fused_rank, fts_gen, vec_gen, query_digest, reranker_score, reranker_rank, block_idx, block_kind, span_start, span_end)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             )
             .map_err(map_db)?;
 
@@ -1080,6 +1192,10 @@ impl Store {
                 query_digest,
                 r.reranker_score.map(|s| s as f64),
                 r.reranker_rank.map(|r| r as i64),
+                r.block_idx as i64,
+                r.block_kind,
+                r.span_start as i64,
+                r.span_end as i64,
             ])
             .map_err(map_db)?;
         }
@@ -1092,7 +1208,7 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT query, doc_id, segment_id, bm25_score, bm25_rank, vector_score, vector_rank, fused_score, fused_rank, fts_gen, vec_gen, query_digest, reranker_score, reranker_rank
+                "SELECT query, doc_id, segment_id, bm25_score, bm25_rank, vector_score, vector_rank, fused_score, fused_rank, fts_gen, vec_gen, query_digest, reranker_score, reranker_rank, block_idx, block_kind, span_start, span_end
                  FROM search_results WHERE result_id = ?1",
             )
             .map_err(map_db)?;
@@ -1113,6 +1229,10 @@ impl Store {
                 let query_digest: Option<String> = row.get(11)?;
                 let reranker_score: Option<f64> = row.get(12)?;
                 let reranker_rank: Option<i64> = row.get(13)?;
+                let block_idx: i64 = row.get(14)?;
+                let block_kind: String = row.get(15)?;
+                let span_start: i64 = row.get(16)?;
+                let span_end: i64 = row.get(17)?;
                 Ok((
                     query,
                     doc_id_str,
@@ -1128,6 +1248,10 @@ impl Store {
                     query_digest,
                     reranker_score,
                     reranker_rank,
+                    block_idx,
+                    block_kind,
+                    span_start,
+                    span_end,
                 ))
             })
             .map_err(|e| match e {
@@ -1152,6 +1276,10 @@ impl Store {
             query_digest,
             reranker_score,
             reranker_rank,
+            block_idx,
+            block_kind,
+            span_start,
+            span_end,
         ) = result;
 
         let doc_id = DocId::from_stored(doc_id_str).map_err(|e| ShiroError::StoreCorrupt {
@@ -1177,6 +1305,10 @@ impl Store {
             vec_gen: vec_gen.map(|g| g as u64),
             reranker_score: reranker_score.map(|s| s as f32),
             reranker_rank: reranker_rank.map(|r| r as usize),
+            block_idx: block_idx as usize,
+            block_kind,
+            span_start: span_start as usize,
+            span_end: span_end as usize,
         })
     }
 
@@ -2143,6 +2275,104 @@ mod tests {
     }
 
     #[test]
+    fn set_documents_ready_rolls_back_partial_batch() {
+        let (store, _f) = tmp_store();
+        let first = test_doc("first ready batch document");
+        let second = test_doc("second ready batch document");
+        store.put_document(&first, DocState::Indexing).unwrap();
+        store.put_document(&second, DocState::Staged).unwrap();
+
+        let error = store
+            .set_documents_ready(&[first.id.clone(), second.id.clone()])
+            .unwrap_err();
+
+        assert!(matches!(error, ShiroError::InvalidInput { .. }));
+        assert_eq!(store.get_document(&first.id).unwrap().1, DocState::Indexing);
+        assert_eq!(store.get_document(&second.id).unwrap().1, DocState::Staged);
+    }
+
+    #[test]
+    fn stage_document_processing_rolls_back_entire_canonical_aggregate() {
+        let (store, _f) = tmp_store();
+        let existing = test_doc("existing document");
+        store.put_document(&existing, DocState::Staged).unwrap();
+        let existing_segment = Segment {
+            id: SegmentId::new(&existing.id, 0),
+            doc_id: existing.id.clone(),
+            index: 0,
+            span: Span::new(0, existing.canonical_text.len()).unwrap(),
+            body: existing.canonical_text.clone(),
+        };
+        store
+            .put_segments(std::slice::from_ref(&existing_segment))
+            .unwrap();
+
+        let target = test_doc("target document");
+        let conflicting_segment = Segment {
+            id: existing_segment.id,
+            doc_id: target.id.clone(),
+            index: 0,
+            span: Span::new(0, target.canonical_text.len()).unwrap(),
+            body: target.canonical_text.clone(),
+        };
+        let fingerprint = ProcessingFingerprint::new("test", 1, 1);
+
+        let result = store.stage_document_processing(
+            &target,
+            &fingerprint,
+            std::slice::from_ref(&conflicting_segment),
+        );
+
+        assert!(result.is_err(), "conflicting segment ID must fail staging");
+        assert!(
+            !store.exists(&target.id).unwrap(),
+            "document, graph, fingerprint, and segments must roll back together"
+        );
+        assert_eq!(store.get_segments(&existing.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn schema_v6_migrates_entry_point_columns() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = camino::Utf8PathBuf::try_from(dir.path().to_path_buf()).unwrap();
+        let db_path = path.join("v6.db");
+        let connection = rusqlite::Connection::open(db_path.as_std_path()).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO schema_meta (key, value) VALUES ('schema_version', '6');
+                 CREATE TABLE search_results (
+                    result_id TEXT PRIMARY KEY,
+                    query TEXT NOT NULL,
+                    doc_id TEXT NOT NULL,
+                    segment_id TEXT NOT NULL,
+                    bm25_score REAL,
+                    bm25_rank INTEGER,
+                    vector_score REAL,
+                    vector_rank INTEGER,
+                    fused_score REAL,
+                    fused_rank INTEGER,
+                    fts_gen INTEGER,
+                    vec_gen INTEGER,
+                    query_digest TEXT,
+                    reranker_score REAL,
+                    reranker_rank INTEGER
+                 );",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = Store::open(&db_path).unwrap();
+        store
+            .conn
+            .prepare(
+                "SELECT block_idx, block_kind, span_start, span_end FROM search_results LIMIT 0",
+            )
+            .unwrap();
+        assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
     fn test_migration_framework() {
         let (store, _f) = tmp_store();
         assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
@@ -3100,6 +3330,10 @@ mod tests {
             fused_rank: Some(1),
             reranker_score: Some(0.95),
             reranker_rank: Some(1),
+            block_idx: 3,
+            block_kind: "PARAGRAPH".to_string(),
+            span_start: 10,
+            span_end: 20,
         };
         store
             .save_search_results("test query", "abc123", 1, 0, &[row])
@@ -3109,6 +3343,10 @@ mod tests {
         let detail = store.get_search_result("res_test123").unwrap();
         assert_eq!(detail.reranker_score, Some(0.95));
         assert_eq!(detail.reranker_rank, Some(1));
+        assert_eq!(detail.block_idx, 3);
+        assert_eq!(detail.block_kind, "PARAGRAPH");
+        assert_eq!(detail.span_start, 10);
+        assert_eq!(detail.span_end, 20);
     }
 
     #[test]
@@ -3133,6 +3371,10 @@ mod tests {
             fused_rank: Some(1),
             reranker_score: None,
             reranker_rank: None,
+            block_idx: 0,
+            block_kind: "HEADING".to_string(),
+            span_start: 0,
+            span_end: 4,
         };
         store
             .save_search_results("test query 2", "def456", 1, 0, &[row])

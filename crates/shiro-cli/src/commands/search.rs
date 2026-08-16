@@ -6,122 +6,10 @@
 use std::collections::BTreeMap;
 
 use crate::envelope::{CmdOutput, NextAction, ParamMeta};
-use shiro_core::config::ShiroConfig;
-use shiro_core::fingerprint::EmbeddingFingerprint;
-use shiro_core::ports::{Embedder, VectorIndex};
 use shiro_core::{ShiroError, ShiroHome};
-use shiro_sdk::{Engine, SearchInput};
+use shiro_sdk::SearchInput;
 
 pub use shiro_sdk::SearchMode;
-
-/// Build an Engine with optional embedder, vector index, and reranker
-/// derived from the config file.
-fn open_engine(home: &ShiroHome) -> Result<Engine, ShiroError> {
-    let mut engine = Engine::open(home.clone())?;
-
-    // Load config.
-    let config_path = home.config_path();
-    let config: ShiroConfig = if config_path.as_std_path().is_file() {
-        let text = std::fs::read_to_string(config_path.as_std_path())?;
-        toml::from_str(&text).map_err(|e| ShiroError::Config {
-            message: format!("config parse error: {e}"),
-        })?
-    } else {
-        ShiroConfig::default()
-    };
-
-    // Wire embedder + vector index if configured.
-    if let Some(ref embed) = config.embed {
-        let provider = embed.provider.as_deref().unwrap_or("http");
-        match provider {
-            "fastembed" => {
-                let model_name = embed.model.as_deref().unwrap_or("AllMiniLML6V2");
-                let cache_dir = embed.cache_dir.as_ref().map(camino::Utf8PathBuf::from);
-                let fe_config = shiro_fastembed::FastEmbedEmbedderConfig {
-                    model: model_name.to_string(),
-                    cache_dir,
-                    show_download_progress: false,
-                };
-                match shiro_fastembed::FastEmbedEmbedder::try_new(fe_config) {
-                    Ok(embedder) => {
-                        let fp = embedder.fingerprint();
-                        let dims = embedder.dimensions();
-                        engine = engine.with_embedder(Box::new(embedder));
-
-                        // Open or create the flat vector index with fingerprint enforcement (ADR-012).
-                        let vector_path = home.vector_dir().join("flat.jsonl");
-                        match open_vector_index(dims, vector_path, &fp) {
-                            Ok(index) => {
-                                engine = engine.with_vector_index(Box::new(index));
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "vector index fingerprint mismatch or open failed");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to init FastEmbed embedder");
-                    }
-                }
-            }
-            "http" => {
-                // HttpEmbedder requires base_url and model.
-                if let (Some(base_url), Some(model)) =
-                    (embed.base_url.as_deref(), embed.model.as_deref())
-                {
-                    let dims = embed.dimensions.unwrap_or(384);
-                    let http_config = shiro_embed::HttpEmbedderConfig {
-                        base_url: base_url.to_string(),
-                        model: model.to_string(),
-                        dimensions: dims,
-                        api_key: embed.api_key.clone(),
-                    };
-                    let embedder = shiro_embed::HttpEmbedder::new(http_config);
-                    let fp = embedder.fingerprint();
-                    let dims = embedder.dimensions();
-                    engine = engine.with_embedder(Box::new(embedder));
-
-                    // Open or create the flat vector index with fingerprint enforcement (ADR-012).
-                    let vector_path = home.vector_dir().join("flat.jsonl");
-                    match open_vector_index(dims, vector_path, &fp) {
-                        Ok(index) => {
-                            engine = engine.with_vector_index(Box::new(index));
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "vector index fingerprint mismatch or open failed");
-                        }
-                    }
-                }
-            }
-            other => {
-                tracing::warn!(provider = other, "unknown embed provider in config");
-            }
-        }
-    }
-
-    // Wire reranker if configured.
-    if let Some(ref rerank) = config.rerank {
-        let provider = rerank.provider.as_deref().unwrap_or("fastembed");
-        if provider == "fastembed" {
-            let model_name = rerank.model.as_deref().unwrap_or("BGERerankerBase");
-            let rr_config = shiro_fastembed::FastEmbedRerankerConfig {
-                model: model_name.to_string(),
-                cache_dir: None,
-                show_download_progress: false,
-            };
-            match shiro_fastembed::FastEmbedReranker::try_new(rr_config) {
-                Ok(reranker) => {
-                    engine = engine.with_reranker(Box::new(reranker));
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to init FastEmbed reranker");
-                }
-            }
-        }
-    }
-
-    Ok(engine)
-}
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -134,7 +22,13 @@ pub fn run(
     max_chars: usize,
     rerank: bool,
 ) -> Result<CmdOutput, ShiroError> {
-    let engine = open_engine(home)?;
+    let runtime_profile = match (mode, rerank) {
+        (SearchMode::Bm25, false) => crate::runtime::RuntimeProfile::Base,
+        (SearchMode::Bm25, true) => crate::runtime::RuntimeProfile::RerankOnly,
+        (_, false) => crate::runtime::RuntimeProfile::Vector,
+        (_, true) => crate::runtime::RuntimeProfile::Full,
+    };
+    let engine = crate::runtime::open_engine(home, runtime_profile)?;
 
     let input = SearchInput {
         query: query.to_string(),
@@ -250,44 +144,4 @@ pub fn run(
         result,
         next_actions,
     })
-}
-
-/// Open a FlatIndex and enforce fingerprint consistency (ADR-012).
-///
-/// If the index has a stored fingerprint, verify it matches the active
-/// embedder's fingerprint. A mismatch is a hard error — the index must
-/// be rebuilt with `shiro reindex`. If no fingerprint is stored (legacy
-/// data or fresh index), the active fingerprint is recorded.
-fn open_vector_index(
-    dims: usize,
-    vector_path: camino::Utf8PathBuf,
-    embedder_fp: &EmbeddingFingerprint,
-) -> Result<shiro_embed::FlatIndex, ShiroError> {
-    let index = shiro_embed::FlatIndex::open(dims, vector_path)?;
-
-    // ADR-012: fingerprint mismatch is a hard error.
-    if let Some(stored_fp) = index.stored_fingerprint() {
-        if stored_fp.fingerprint_hash != embedder_fp.fingerprint_hash {
-            return Err(ShiroError::FingerprintMismatch {
-                message: format!(
-                    "embedding model changed: stored={}/{}({}d), active={}/{}({}d). Run `shiro reindex` to rebuild.",
-                    stored_fp.provider, stored_fp.model, stored_fp.dimensions,
-                    embedder_fp.provider, embedder_fp.model, embedder_fp.dimensions,
-                ),
-            });
-        }
-    } else if index.count()? == 0 {
-        // Fresh index — record the fingerprint.
-        index.set_fingerprint(embedder_fp)?;
-    } else {
-        // Non-empty index without fingerprint — legacy data.
-        // Record the fingerprint but warn.
-        tracing::warn!(
-            "vector index has {} entries but no fingerprint sidecar; assuming current config is correct",
-            index.count().unwrap_or(0)
-        );
-        index.set_fingerprint(embedder_fp)?;
-    }
-
-    Ok(index)
 }

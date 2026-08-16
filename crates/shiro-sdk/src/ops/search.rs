@@ -9,11 +9,13 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use shiro_core::ports::{Embedder, Reranker, VectorIndex};
-use shiro_core::{DocId, SegmentId, ShiroError};
+use shiro_core::{DocId, Segment, SegmentId, ShiroError, Span};
 use shiro_index::FtsIndex;
 use shiro_store::Store;
 
 use crate::fusion::{reciprocal_rank_fusion, RankedHit};
+use crate::retrieval_result::materialize_entry_point;
+pub use crate::retrieval_result::ContextBlock;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -60,16 +62,6 @@ pub struct SearchScores {
     pub fused_rank: usize,
     pub reranker_score: Option<f32>,
     pub reranker_rank: Option<usize>,
-}
-
-/// A block in the context window surrounding the matched block.
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct ContextBlock {
-    pub block_idx: usize,
-    pub kind: String,
-    pub span_start: usize,
-    pub span_end: usize,
-    pub text: String,
 }
 
 /// The public retrieval result — per ADR-007, this is the single type
@@ -136,10 +128,60 @@ pub fn execute(
     }
 
     // -- Determine active sources based on mode and availability --
+    let vector_pair_available = embedder.is_some() && vector_index.is_some();
+    let vector_pair_incomplete = embedder.is_some() != vector_index.is_some();
+    if !matches!(input.mode, SearchMode::Bm25) && vector_pair_incomplete {
+        return Err(ShiroError::SearchFailed {
+            message: "Vector search configuration incomplete: embedder and vector index must be attached together"
+                .to_string(),
+        });
+    }
+    if matches!(input.mode, SearchMode::Vector) && !vector_pair_available {
+        return Err(ShiroError::SearchFailed {
+            message:
+                "Vector search requested but no compatible embedder and vector index are configured"
+                    .to_string(),
+        });
+    }
+
     let use_bm25 = !matches!(input.mode, SearchMode::Vector);
-    let use_vector =
-        !matches!(input.mode, SearchMode::Bm25) && embedder.is_some() && vector_index.is_some();
+    let use_vector = !matches!(input.mode, SearchMode::Bm25) && vector_pair_available;
     let use_reranker = input.rerank && reranker.is_some();
+
+    if use_vector {
+        let active = embedder
+            .ok_or_else(|| ShiroError::EmbedFail {
+                message: "Vector compatibility check missing embedder".to_string(),
+            })?
+            .fingerprint();
+        let stored = vector_index
+            .ok_or_else(|| ShiroError::SearchFailed {
+                message: "Vector compatibility check missing index".to_string(),
+            })?
+            .embedding_fingerprint()?;
+        match stored {
+            Some(stored) if stored.fingerprint_hash == active.fingerprint_hash => {}
+            Some(stored) => {
+                return Err(ShiroError::FingerprintMismatch {
+                    message: format!(
+                        "Embedding fingerprint mismatch: stored={}/{}({}d), active={}/{}({}d). Rebuild the vector index.",
+                        stored.provider,
+                        stored.model,
+                        stored.dimensions,
+                        active.provider,
+                        active.model,
+                        active.dimensions,
+                    ),
+                });
+            }
+            None => {
+                return Err(ShiroError::FingerprintMismatch {
+                    message: "Vector index has no embedding fingerprint; rebuild the vector index"
+                        .to_string(),
+                });
+            }
+        }
+    }
 
     // -- FTS results --
     let bm25_hits = if use_bm25 {
@@ -163,10 +205,12 @@ pub fn execute(
     };
 
     // -- Generation tracking --
-    let fts_gen = store
-        .active_generation("fts")
-        .map(|g| g.as_u64())
-        .unwrap_or(0);
+    let fts_gen = store.active_generation("fts")?.as_u64();
+    let vector_gen = if use_vector {
+        store.active_generation("vector")?.as_u64()
+    } else {
+        0
+    };
 
     // -- Build RRF ranked list --
     let mut ranked_map: HashMap<String, RankedHit> = HashMap::new();
@@ -263,56 +307,54 @@ pub fn execute(
             .copied()
             .unwrap_or((0.0, 0));
 
-        // Get segment info from FTS hit or store.
-        let (body, _seg_index, span_start, span_end) =
-            if let Some(fts_hit) = fts_body_map.get(seg_id_str) {
-                (
-                    fts_hit.body.clone(),
-                    fts_hit.seg_index,
-                    fts_hit.span_start,
-                    fts_hit.span_end,
-                )
-            } else {
-                match load_segment_info(store, seg_id_str) {
-                    Ok(info) => info,
-                    Err(e) => {
-                        tracing::warn!(
-                            segment_id = seg_id_str,
-                            error = %e,
-                            "skipping: can't load segment"
-                        );
-                        continue;
-                    }
-                }
-            };
-
-        let snippet = truncate_snippet(&body, 200);
-
-        // -- Resolve segment to block position via BlockGraph (ADR-006/007) --
         let doc_id = DocId::from_stored(&doc_id_str).map_err(|e| ShiroError::SearchFailed {
             message: e.to_string(),
         })?;
-
-        let (block_idx, block_kind) =
-            resolve_segment_to_block(store, &doc_id, span_start, span_end);
-
-        // -- Build context window from BlockGraph reading order --
-        let context_window = if input.expand && input.max_blocks > 0 && input.max_chars > 0 {
-            build_context_window(store, &doc_id, block_idx, input.max_blocks, input.max_chars)
+        let segment = if let Some(fts_hit) = fts_body_map.get(seg_id_str) {
+            let segment_id =
+                SegmentId::from_stored(seg_id_str).map_err(|e| ShiroError::SearchFailed {
+                    message: e.to_string(),
+                })?;
+            Segment {
+                id: segment_id,
+                doc_id: doc_id.clone(),
+                index: fts_hit.seg_index,
+                span: Span::new(fts_hit.span_start, fts_hit.span_end).map_err(|e| {
+                    ShiroError::SearchFailed {
+                        message: format!("Invalid indexed segment span for {seg_id_str}: {e}"),
+                    }
+                })?,
+                body: fts_hit.body.clone(),
+            }
         } else {
-            Vec::new()
+            match load_segment_info(store, &doc_id, seg_id_str) {
+                Ok(segment) => segment,
+                Err(e) => {
+                    tracing::warn!(
+                        segment_id = seg_id_str,
+                        error = %e,
+                        "skipping result: segment data unavailable"
+                    );
+                    continue;
+                }
+            }
         };
 
-        // -- Persist row for explain (internal, still uses segment_id) --
-        let segment_id =
-            SegmentId::from_stored(seg_id_str).map_err(|e| ShiroError::SearchFailed {
-                message: e.to_string(),
-            })?;
+        let snippet = truncate_snippet(&segment.body, 200);
+        let entry_point = materialize_entry_point(
+            store,
+            &doc_id,
+            &segment,
+            input.expand,
+            input.max_blocks,
+            input.max_chars,
+        )?;
 
+        // Persist the internal segment evidence and the canonical public position.
         search_cache.push(shiro_store::SearchResultRow {
             result_id: result_id.clone(),
             doc_id: doc_id.clone(),
-            segment_id,
+            segment_id: segment.id.clone(),
             bm25_score: bm25_info.map(|i| i.0),
             bm25_rank: bm25_info.map(|i| i.1),
             vector_score: vector_info.map(|i| i.0),
@@ -321,17 +363,21 @@ pub fn execute(
             fused_rank: Some(fused_rank),
             reranker_score: None,
             reranker_rank: None,
+            block_idx: entry_point.block_idx,
+            block_kind: entry_point.block_kind.clone(),
+            span_start: entry_point.span_start,
+            span_end: entry_point.span_end,
         });
 
-        hit_segment_bodies.push(body.clone());
+        hit_segment_bodies.push(segment.body.clone());
 
         hits.push(SearchHit {
             result_id,
             doc_id: doc_id_str,
-            block_idx,
-            block_kind,
-            span_start,
-            span_end,
+            block_idx: entry_point.block_idx,
+            block_kind: entry_point.block_kind,
+            span_start: entry_point.span_start,
+            span_end: entry_point.span_end,
             snippet,
             scores: SearchScores {
                 bm25_score: bm25_info.map(|i| i.0),
@@ -343,7 +389,7 @@ pub fn execute(
                 reranker_score: None,
                 reranker_rank: None,
             },
-            context_window,
+            context_window: entry_point.context_window,
         });
     }
 
@@ -398,9 +444,13 @@ pub fn execute(
 
     // Persist search results for explain.
     if !search_cache.is_empty() {
-        if let Err(e) =
-            store.save_search_results(&input.query, &query_digest, fts_gen, 0, &search_cache)
-        {
+        if let Err(e) = store.save_search_results(
+            &input.query,
+            &query_digest,
+            fts_gen,
+            vector_gen,
+            &search_cache,
+        ) {
             tracing::warn!(error = %e, "failed to cache search results for explain");
         }
     }
@@ -419,142 +469,6 @@ pub fn execute(
         hits,
         retrieval_info,
     })
-}
-
-// ---------------------------------------------------------------------------
-// Segment-to-block resolution (ADR-007)
-// ---------------------------------------------------------------------------
-
-/// Resolve a segment's byte span to the best-matching block in the
-/// document's persisted BlockGraph. Returns (block_idx, block_kind_str).
-///
-/// Falls back to (0, "PARAGRAPH") if the graph is empty or no block overlaps.
-fn resolve_segment_to_block(
-    store: &Store,
-    doc_id: &DocId,
-    seg_span_start: usize,
-    seg_span_end: usize,
-) -> (usize, String) {
-    let graph = match store.get_block_graph(doc_id) {
-        Ok(g) if !g.blocks.is_empty() => g,
-        _ => return (0, "PARAGRAPH".to_string()),
-    };
-
-    // Find the block whose span best contains the segment's start.
-    // Prefer the block with the largest overlap.
-    let mut best_idx = 0;
-    let mut best_overlap: usize = 0;
-
-    for (i, block) in graph.blocks.iter().enumerate() {
-        let b_start = block.span.start();
-        let b_end = block.span.end();
-
-        // Calculate overlap between [seg_span_start, seg_span_end) and [b_start, b_end).
-        let overlap_start = seg_span_start.max(b_start);
-        let overlap_end = seg_span_end.min(b_end);
-        if overlap_start < overlap_end {
-            let overlap = overlap_end - overlap_start;
-            if overlap > best_overlap {
-                best_overlap = overlap;
-                best_idx = i;
-            }
-        }
-    }
-
-    let kind_str = format!("{:?}", graph.blocks[best_idx].kind).to_uppercase();
-    (best_idx, kind_str)
-}
-
-/// Build a context window from the BlockGraph's reading order, centered
-/// on the matched block. Respects max_blocks and max_chars budgets.
-fn build_context_window(
-    store: &Store,
-    doc_id: &DocId,
-    hit_block_idx: usize,
-    max_blocks: usize,
-    max_chars: usize,
-) -> Vec<ContextBlock> {
-    let graph = match store.get_block_graph(doc_id) {
-        Ok(g) if !g.blocks.is_empty() => g,
-        _ => return Vec::new(),
-    };
-
-    // Find position of hit_block_idx in reading order.
-    let hit_pos = graph
-        .reading_order
-        .iter()
-        .position(|idx| idx.0 == hit_block_idx)
-        .unwrap_or(0);
-
-    let hit_block = &graph.blocks[hit_block_idx];
-    let mut included: Vec<usize> = vec![hit_pos];
-    let mut total_chars = hit_block.canonical_text.len();
-
-    // Expand outward alternating before/after in reading order.
-    let mut before = hit_pos.wrapping_sub(1);
-    let mut after = hit_pos + 1;
-    let ro_len = graph.reading_order.len();
-
-    loop {
-        if included.len() >= max_blocks || total_chars >= max_chars {
-            break;
-        }
-
-        let can_before = before < ro_len;
-        let can_after = after < ro_len;
-
-        if !can_before && !can_after {
-            break;
-        }
-
-        if can_before {
-            let block_idx = graph.reading_order[before].0;
-            let block = &graph.blocks[block_idx];
-            let block_len = block.canonical_text.len();
-            if total_chars + block_len <= max_chars && included.len() < max_blocks {
-                included.push(before);
-                total_chars += block_len;
-            } else {
-                break;
-            }
-            before = before.wrapping_sub(1);
-        }
-
-        if included.len() >= max_blocks || total_chars >= max_chars {
-            break;
-        }
-
-        if can_after {
-            let block_idx = graph.reading_order[after].0;
-            let block = &graph.blocks[block_idx];
-            let block_len = block.canonical_text.len();
-            if total_chars + block_len <= max_chars && included.len() < max_blocks {
-                included.push(after);
-                total_chars += block_len;
-            } else {
-                break;
-            }
-            after += 1;
-        }
-    }
-
-    // Sort by reading order position so context is in document order.
-    included.sort_unstable();
-
-    included
-        .into_iter()
-        .map(|ro_pos| {
-            let block_idx = graph.reading_order[ro_pos].0;
-            let block = &graph.blocks[block_idx];
-            ContextBlock {
-                block_idx,
-                kind: format!("{:?}", block.kind).to_uppercase(),
-                span_start: block.span.start(),
-                span_end: block.span.end(),
-                text: block.canonical_text.clone(),
-            }
-        })
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -604,32 +518,16 @@ fn load_doc_id_for_segment(store: &Store, segment_id: &str) -> Result<String, Sh
 /// Load segment body and metadata from the store.
 fn load_segment_info(
     store: &Store,
+    doc_id: &DocId,
     segment_id: &str,
-) -> Result<(String, usize, usize, usize), ShiroError> {
-    let seg_id = SegmentId::from_stored(segment_id).map_err(|e| ShiroError::SearchFailed {
-        message: e.to_string(),
-    })?;
-    let doc_id_str = store
-        .segment_doc_id(&seg_id)
-        .map_err(|e| ShiroError::SearchFailed {
-            message: format!("cannot find doc for segment {segment_id}: {e}"),
-        })?;
-    let doc_id = DocId::from_stored(&doc_id_str).map_err(|e| ShiroError::SearchFailed {
-        message: e.to_string(),
-    })?;
-    let segments = store.get_segments(&doc_id)?;
-    let seg = segments
-        .iter()
-        .find(|s| s.id.as_str() == segment_id)
+) -> Result<Segment, ShiroError> {
+    let segments = store.get_segments(doc_id)?;
+    segments
+        .into_iter()
+        .find(|segment| segment.id.as_str() == segment_id)
         .ok_or_else(|| ShiroError::SearchFailed {
-            message: format!("segment {segment_id} not in store"),
-        })?;
-    Ok((
-        seg.body.clone(),
-        seg.index,
-        seg.span.start(),
-        seg.span.end(),
-    ))
+            message: format!("Segment data unavailable for {segment_id}"),
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -686,5 +584,57 @@ mod tests {
         assert_eq!(SearchMode::Hybrid.as_str(), "hybrid");
         assert_eq!(SearchMode::Bm25.as_str(), "bm25");
         assert_eq!(SearchMode::Vector.as_str(), "vector");
+    }
+
+    #[test]
+    fn incompatible_vector_fingerprint_blocks_hybrid_but_not_bm25() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).unwrap();
+        let store = Store::open(&root.join("shiro.db")).unwrap();
+        let fts = FtsIndex::open(&root.join("tantivy")).unwrap();
+        let embedder = shiro_embed::DeterministicStubEmbedder::new(4);
+        let incompatible = shiro_core::EmbeddingFingerprint::new(
+            "stub".to_string(),
+            "different-model".to_string(),
+            4,
+            "l2".to_string(),
+            "none".to_string(),
+            "full_segment".to_string(),
+        );
+        let vector_index =
+            shiro_index::FlatIndex::open_compatible(4, root.join("vector.jsonl"), &incompatible)
+                .unwrap();
+        let mut input = SearchInput {
+            query: "query".to_string(),
+            mode: SearchMode::Hybrid,
+            limit: 10,
+            expand: false,
+            max_blocks: 12,
+            max_chars: 8000,
+            rerank: false,
+        };
+
+        let error = execute(
+            &store,
+            &fts,
+            Some(&embedder),
+            Some(&vector_index),
+            None,
+            &input,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ShiroError::FingerprintMismatch { .. }));
+
+        input.mode = SearchMode::Bm25;
+        let output = execute(
+            &store,
+            &fts,
+            Some(&embedder),
+            Some(&vector_index),
+            None,
+            &input,
+        )
+        .unwrap();
+        assert!(output.hits.is_empty());
     }
 }

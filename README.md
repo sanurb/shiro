@@ -421,10 +421,10 @@ Shiro is a Rust workspace with nine crates:
 |-------|------|
 | `shiro-core` | Domain types, config, error handling, port traits (`Embedder`, `VectorIndex`, `Reranker`) |
 | `shiro-store` | SQLite persistence (schema v6), BlockGraph storage — the authoritative store |
-| `shiro-index` | Tantivy BM25 full-text search, generation tracking, staging/promote |
+| `shiro-index` | Tantivy BM25 and FlatIndex vector search, generation tracking, staging/promote |
 | `shiro-parse` | Markdown, PDF, and plaintext parsers |
 | `shiro-docling` | Docling subprocess adapter for structured PDF |
-| `shiro-embed` | FlatIndex (cosine-similarity vector store), HttpEmbedder, embedding port definitions |
+| `shiro-embed` | HttpEmbedder plus deterministic embedding test doubles |
 | `shiro-fastembed` | FastEmbed adapter — local ONNX embeddings and cross-encoder reranking |
 | `shiro-sdk` | Operation registry, DSL interpreter, RRF fusion, hybrid search orchestration |
 | `shiro-cli` | CLI entry point (16 commands), published to crates.io |

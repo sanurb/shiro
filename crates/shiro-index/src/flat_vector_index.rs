@@ -147,6 +147,75 @@ impl FlatIndex {
         })
     }
 
+    /// Open a flat index and enforce ADR-012 fingerprint compatibility.
+    ///
+    /// Fresh empty indices are initialized with `active_fingerprint`. Existing
+    /// indices must already carry the same fingerprint; a non-empty index
+    /// without a fingerprint is legacy data and is rejected until rebuilt.
+    pub fn open_compatible(
+        dims: usize,
+        data_path: Utf8PathBuf,
+        active_fingerprint: &EmbeddingFingerprint,
+    ) -> Result<Self, ShiroError> {
+        let sidecar_path = fingerprint_path(&data_path);
+        match std::fs::read_to_string(sidecar_path.as_std_path()) {
+            Ok(json) => {
+                serde_json::from_str::<EmbeddingFingerprint>(&json).map_err(|error| {
+                    ShiroError::FingerprintMismatch {
+                        message: format!(
+                            "Embedding fingerprint sidecar is malformed at {sidecar_path}: {error}. Rebuild the vector index."
+                        ),
+                    }
+                })?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ShiroError::FingerprintMismatch {
+                    message: format!(
+                        "Embedding fingerprint sidecar is unreadable at {sidecar_path}: {error}. Rebuild the vector index."
+                    ),
+                });
+            }
+        }
+
+        if let Some(parent) = data_path.parent() {
+            std::fs::create_dir_all(parent.as_std_path()).map_err(|error| {
+                ShiroError::IndexBuildVec {
+                    message: format!("failed to create vector index dir {parent}: {error}"),
+                }
+            })?;
+        }
+
+        let index = Self::open(dims, data_path)?;
+        match index.stored_fingerprint() {
+            Some(stored) if stored.fingerprint_hash == active_fingerprint.fingerprint_hash => {
+                Ok(index)
+            }
+            Some(stored) => Err(ShiroError::FingerprintMismatch {
+                message: format!(
+                    "embedding fingerprint mismatch: stored={}/{}({}d, {}), active={}/{}({}d, {}). Rebuild the vector index.",
+                    stored.provider,
+                    stored.model,
+                    stored.dimensions,
+                    stored.fingerprint_hash,
+                    active_fingerprint.provider,
+                    active_fingerprint.model,
+                    active_fingerprint.dimensions,
+                    active_fingerprint.fingerprint_hash,
+                ),
+            }),
+            None if index.count()? == 0 => {
+                index.set_fingerprint(active_fingerprint)?;
+                Ok(index)
+            }
+            None => Err(ShiroError::FingerprintMismatch {
+                message:
+                    "vector index has entries but no embedding fingerprint; rebuild the vector index"
+                        .to_string(),
+            }),
+        }
+    }
+
     /// Return a clone of the stored fingerprint, if any.
     pub fn stored_fingerprint(&self) -> Option<EmbeddingFingerprint> {
         self.stored_fingerprint.read().ok().and_then(|g| g.clone())
@@ -286,6 +355,19 @@ impl FlatIndex {
         Ok(index)
     }
 
+    /// Build a new index and persist its ADR-012 fingerprint sidecar.
+    pub fn build_at_with_fingerprint(
+        dims: usize,
+        data_path: Utf8PathBuf,
+        entries: &[(String, String, Vec<f32>)],
+        gen_id: u64,
+        fingerprint: &EmbeddingFingerprint,
+    ) -> Result<Self, ShiroError> {
+        let index = Self::build_at(dims, data_path, entries, gen_id)?;
+        index.set_fingerprint(fingerprint)?;
+        Ok(index)
+    }
+
     /// Atomic rename from staging file to live file.
     ///
     /// If the live path already exists, it is removed first.
@@ -344,6 +426,15 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 }
 
 impl VectorIndex for FlatIndex {
+    fn embedding_fingerprint(&self) -> Result<Option<EmbeddingFingerprint>, ShiroError> {
+        self.stored_fingerprint
+            .read()
+            .map(|fingerprint| fingerprint.clone())
+            .map_err(|error| ShiroError::IndexBuildVec {
+                message: format!("vector fingerprint lock poisoned: {error}"),
+            })
+    }
+
     /// Insert or replace an embedding.
     ///
     /// Because the trait signature lacks a `doc_id` parameter, entries inserted
@@ -523,6 +614,17 @@ mod tests {
         DocId::from_stored(format!("doc_{name}")).unwrap()
     }
 
+    fn fp(model: &str) -> EmbeddingFingerprint {
+        EmbeddingFingerprint::new(
+            "test".to_string(),
+            model.to_string(),
+            2,
+            "l2".to_string(),
+            "model_default".to_string(),
+            "full_segment".to_string(),
+        )
+    }
+
     #[test]
     fn test_upsert_and_search() {
         let dir = TempDir::new().unwrap();
@@ -690,6 +792,67 @@ mod tests {
         assert_eq!(idx2.count().unwrap(), 2);
         let results = idx2.search(&[1.0, 0.0], 1).unwrap();
         assert_eq!(results[0].segment_id.as_str(), "seg_a");
+    }
+
+    #[test]
+    fn open_compatible_initializes_empty_index() {
+        let dir = TempDir::new().unwrap();
+        let path = test_path(&dir);
+        let fingerprint = fp("a");
+
+        let idx = FlatIndex::open_compatible(2, path, &fingerprint).unwrap();
+
+        assert_eq!(idx.stored_fingerprint(), Some(fingerprint));
+    }
+
+    #[test]
+    fn open_compatible_rejects_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let path = test_path(&dir);
+        let original = fp("a");
+        let changed = fp("b");
+
+        let idx = FlatIndex::open_compatible(2, path.clone(), &original).unwrap();
+        idx.upsert_with_doc(&seg("a"), &doc("d"), &[1.0, 0.0])
+            .unwrap();
+        idx.flush().unwrap();
+
+        let err = match FlatIndex::open_compatible(2, path, &changed) {
+            Ok(_) => panic!("expected fingerprint mismatch"),
+            Err(error) => error,
+        };
+        assert!(matches!(err, ShiroError::FingerprintMismatch { .. }));
+    }
+
+    #[test]
+    fn open_compatible_rejects_malformed_fingerprint() {
+        let dir = TempDir::new().unwrap();
+        let path = test_path(&dir);
+        let sidecar = fingerprint_path(&path);
+        std::fs::write(sidecar.as_std_path(), b"not-json").unwrap();
+
+        let error = match FlatIndex::open_compatible(2, path, &fp("a")) {
+            Ok(_) => panic!("expected malformed fingerprint error"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, ShiroError::FingerprintMismatch { .. }));
+    }
+
+    #[test]
+    fn open_compatible_rejects_non_empty_legacy_index() {
+        let dir = TempDir::new().unwrap();
+        let path = test_path(&dir);
+        let idx = FlatIndex::open(2, path.clone()).unwrap();
+        idx.upsert_with_doc(&seg("a"), &doc("d"), &[1.0, 0.0])
+            .unwrap();
+        idx.flush().unwrap();
+
+        let err = match FlatIndex::open_compatible(2, path, &fp("a")) {
+            Ok(_) => panic!("expected legacy fingerprint mismatch"),
+            Err(error) => error,
+        };
+        assert!(matches!(err, ShiroError::FingerprintMismatch { .. }));
     }
 
     #[test]

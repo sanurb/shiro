@@ -1,4 +1,8 @@
-//! Full-text search index backed by Tantivy (BM25 ranking).
+//! Derived search indices: Tantivy BM25 and flat vector similarity.
+
+mod flat_vector_index;
+
+pub use flat_vector_index::FlatIndex;
 
 use shiro_core::error::ShiroError;
 use shiro_core::id::DocId;
@@ -169,9 +173,34 @@ impl FtsIndex {
 
     /// Delete all segments for a given doc_id.
     pub fn delete_doc(&self, doc_id: &DocId) -> Result<(), ShiroError> {
+        self.replace_document_segments(std::slice::from_ref(doc_id), &[])
+    }
+
+    /// Replace several documents' segments in one Tantivy commit.
+    ///
+    /// Batch ingestion uses this to preserve per-document lifecycle semantics
+    /// without paying for one index writer and commit per source document.
+    pub fn replace_document_segments(
+        &self,
+        doc_ids: &[DocId],
+        segments: &[Segment],
+    ) -> Result<(), ShiroError> {
         let mut writer: IndexWriter = self.index.writer(50_000_000).map_err(map_tantivy)?;
-        let term = Term::from_field_text(self.f_doc_id, doc_id.as_str());
-        writer.delete_term(term);
+        for doc_id in doc_ids {
+            let term = Term::from_field_text(self.f_doc_id, doc_id.as_str());
+            writer.delete_term(term);
+        }
+        for segment in segments {
+            let tantivy_doc = doc!(
+                self.f_doc_id => segment.doc_id.as_str(),
+                self.f_segment_id => segment.id.as_str(),
+                self.f_seg_index => segment.index as u64,
+                self.f_body => segment.body.as_str(),
+                self.f_span_start => segment.span.start() as u64,
+                self.f_span_end => segment.span.end() as u64,
+            );
+            writer.add_document(tantivy_doc).map_err(map_tantivy)?;
+        }
         writer.commit().map_err(map_tantivy)?;
         self.reader.reload().map_err(map_tantivy)?;
         Ok(())

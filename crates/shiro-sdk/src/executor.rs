@@ -4,12 +4,23 @@
 //! A "program" is `{ "op": "<name>", "params": { ... } }`.
 
 use serde_json::Value;
-use shiro_core::ports::Parser;
+use shiro_core::ports::{Embedder, Parser, Reranker, VectorIndex};
 use shiro_core::{ShiroError, ShiroHome};
 use shiro_index::FtsIndex;
 use shiro_store::Store;
 
 use crate::ops;
+
+/// Optional provider-agnostic adapters available to SDK program execution.
+#[derive(Clone, Copy, Default)]
+pub struct ExecutorPorts<'a> {
+    /// Embedder paired with `vector_index` for vector-capable search.
+    pub embedder: Option<&'a dyn Embedder>,
+    /// Vector index paired with `embedder` and checked by fingerprint.
+    pub vector_index: Option<&'a dyn VectorIndex>,
+    /// Optional post-fusion reranker.
+    pub reranker: Option<&'a dyn Reranker>,
+}
 
 /// Execute a JSON program against the given home/store/index/parser.
 ///
@@ -20,6 +31,18 @@ pub fn execute(
     store: &Store,
     fts: &FtsIndex,
     parser: &dyn Parser,
+    program: &Value,
+) -> Result<Value, ShiroError> {
+    execute_with_ports(home, store, fts, parser, ExecutorPorts::default(), program)
+}
+
+/// Execute a JSON program with optional retrieval adapters at the SDK seam.
+pub fn execute_with_ports(
+    home: &ShiroHome,
+    store: &Store,
+    fts: &FtsIndex,
+    parser: &dyn Parser,
+    ports: ExecutorPorts<'_>,
     program: &Value,
 ) -> Result<Value, ShiroError> {
     let op =
@@ -38,7 +61,7 @@ pub fn execute(
     match op {
         "add" => exec_add(store, fts, parser, &params),
         "ingest" => exec_ingest(store, fts, parser, &params),
-        "search" => exec_search(store, fts, &params),
+        "search" => exec_search(store, fts, ports, &params),
         "read" => exec_read(store, &params),
         "list" => exec_list(store, &params),
         "remove" => exec_remove(store, fts, &params),
@@ -71,6 +94,10 @@ fn u64_param(params: &Value, key: &str, default: u64) -> u64 {
 
 fn bool_param(params: &Value, key: &str, default: bool) -> bool {
     params.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
+}
+
+fn str_param_default<'a>(params: &'a Value, key: &str, default: &'a str) -> &'a str {
+    params.get(key).and_then(|v| v.as_str()).unwrap_or(default)
 }
 
 fn to_json<T: serde::Serialize>(val: T) -> Result<Value, ShiroError> {
@@ -121,20 +148,43 @@ fn exec_ingest(
     to_json(ops::ingest::execute(store, fts, parser, &input, None)?)
 }
 
-fn exec_search(store: &Store, fts: &FtsIndex, params: &Value) -> Result<Value, ShiroError> {
+fn exec_search(
+    store: &Store,
+    fts: &FtsIndex,
+    ports: ExecutorPorts<'_>,
+    params: &Value,
+) -> Result<Value, ShiroError> {
     let query = str_param(params, "query")?;
     let limit = u64_param(params, "limit", 10) as usize;
     let expand = bool_param(params, "expand", false);
+    let rerank = bool_param(params, "rerank", false);
+    let mode = match str_param_default(params, "mode", "hybrid") {
+        "hybrid" => ops::search::SearchMode::Hybrid,
+        "bm25" => ops::search::SearchMode::Bm25,
+        "vector" => ops::search::SearchMode::Vector,
+        other => {
+            return Err(ShiroError::InvalidInput {
+                message: format!("invalid search mode '{other}'"),
+            });
+        }
+    };
     let input = ops::search::SearchInput {
         query: query.to_string(),
-        mode: ops::search::SearchMode::Bm25,
+        mode,
         limit,
         expand,
         max_blocks: 12,
         max_chars: 8000,
-        rerank: false,
+        rerank,
     };
-    to_json(ops::search::execute(store, fts, None, None, None, &input)?)
+    to_json(ops::search::execute(
+        store,
+        fts,
+        ports.embedder,
+        ports.vector_index,
+        ports.reranker,
+        &input,
+    )?)
 }
 fn exec_read(store: &Store, params: &Value) -> Result<Value, ShiroError> {
     let id = str_param(params, "id")?;

@@ -9,9 +9,8 @@
 
 use crate::envelope::CmdOutput;
 use shiro_core::{ErrorCode, ShiroError};
-use shiro_index::FtsIndex;
 use shiro_parse::MarkdownParser;
-use shiro_store::Store;
+use shiro_sdk::executor::ExecutorPorts;
 use std::io::{self, BufRead, Write};
 
 /// Entry point for `shiro mcp`.
@@ -222,17 +221,37 @@ fn handle_execute(
         }
     }
 
-    // Ensure server context is initialized
-    let c = match ensure_ctx(ctx, home) {
-        Ok(c) => c,
+    let server_ctx = match ensure_ctx(ctx, home) {
+        Ok(server_ctx) => server_ctx,
         Err(e) => {
             let code = ErrorCode::from_error(&e);
             return tool_error(id, code.as_str(), &format!("init failed: {e}"));
         }
     };
 
+    // Select adapters after DSL control flow and variable substitution resolve
+    // each call. An unexecuted vector branch or resolved BM25 mode therefore
+    // cannot inherit failures from an unused embedding provider.
     let parser = MarkdownParser;
-    match shiro_sdk::dsl::execute_program(&c.home, &c.store, &c.fts, &parser, program, limits) {
+    let mut call_handler = |op: &str, params: &serde_json::Value| {
+        let profile = runtime_profile_for_call(op, params);
+        let engine = server_ctx.engine(profile)?;
+        let ports = ExecutorPorts {
+            embedder: engine.embedder(),
+            vector_index: engine.vector_index(),
+            reranker: engine.reranker(),
+        };
+        let call = serde_json::json!({ "op": op, "params": params });
+        shiro_sdk::executor::execute_with_ports(
+            &engine.home,
+            &engine.store,
+            &engine.fts,
+            &parser,
+            ports,
+            &call,
+        )
+    };
+    match shiro_sdk::dsl::execute_program_with_call_handler(program, limits, &mut call_handler) {
         Ok(result) => {
             let serialized = serde_json::to_value(&result).unwrap_or_default();
             tool_ok(id, &serialized.to_string())
@@ -304,35 +323,112 @@ fn tools_list() -> serde_json::Value {
 }
 
 // ---------------------------------------------------------------------------
-// Lazy server context (home/store/fts)
+// Lazy server context
 // ---------------------------------------------------------------------------
 
 struct ServerCtx {
     home: shiro_core::ShiroHome,
-    store: Store,
-    fts: FtsIndex,
+    base_engine: shiro_sdk::Engine,
+    rerank_engine: Option<shiro_sdk::Engine>,
+    vector_engine: Option<shiro_sdk::Engine>,
+    full_engine: Option<shiro_sdk::Engine>,
 }
 
 impl ServerCtx {
     fn init(home: &shiro_core::ShiroHome) -> Result<Self, ShiroError> {
-        let store = Store::open(&home.db_path())?;
-        let fts = FtsIndex::open(&home.tantivy_dir())?;
+        let base_engine = crate::runtime::open_engine(home, crate::runtime::RuntimeProfile::Base)?;
         Ok(Self {
             home: home.clone(),
-            store,
-            fts,
+            base_engine,
+            rerank_engine: None,
+            vector_engine: None,
+            full_engine: None,
         })
+    }
+
+    fn engine(
+        &mut self,
+        profile: crate::runtime::RuntimeProfile,
+    ) -> Result<&shiro_sdk::Engine, ShiroError> {
+        match profile {
+            crate::runtime::RuntimeProfile::Base => Ok(&self.base_engine),
+            crate::runtime::RuntimeProfile::RerankOnly => {
+                if self.rerank_engine.is_none() {
+                    self.rerank_engine = Some(crate::runtime::open_engine(
+                        &self.home,
+                        crate::runtime::RuntimeProfile::RerankOnly,
+                    )?);
+                }
+                self.rerank_engine
+                    .as_ref()
+                    .ok_or_else(|| ShiroError::McpError {
+                        message: "rerank runtime initialization did not produce an Engine"
+                            .to_string(),
+                    })
+            }
+            crate::runtime::RuntimeProfile::Vector => {
+                if self.vector_engine.is_none() {
+                    self.vector_engine = Some(crate::runtime::open_engine(
+                        &self.home,
+                        crate::runtime::RuntimeProfile::Vector,
+                    )?);
+                }
+                self.vector_engine
+                    .as_ref()
+                    .ok_or_else(|| ShiroError::McpError {
+                        message: "vector runtime initialization did not produce an Engine"
+                            .to_string(),
+                    })
+            }
+            crate::runtime::RuntimeProfile::Full => {
+                if self.full_engine.is_none() {
+                    self.full_engine = Some(crate::runtime::open_engine(
+                        &self.home,
+                        crate::runtime::RuntimeProfile::Full,
+                    )?);
+                }
+                self.full_engine
+                    .as_ref()
+                    .ok_or_else(|| ShiroError::McpError {
+                        message: "full runtime initialization did not produce an Engine"
+                            .to_string(),
+                    })
+            }
+        }
     }
 }
 
 fn ensure_ctx<'a>(
     ctx: &'a mut Option<ServerCtx>,
     home: &shiro_core::ShiroHome,
-) -> Result<&'a ServerCtx, ShiroError> {
+) -> Result<&'a mut ServerCtx, ShiroError> {
     if ctx.is_none() {
         *ctx = Some(ServerCtx::init(home)?);
     }
-    Ok(ctx.as_ref().expect("ctx must be Some after init"))
+    ctx.as_mut().ok_or_else(|| ShiroError::McpError {
+        message: "MCP runtime context initialization failed".to_string(),
+    })
+}
+
+/// Select adapters from one operation after DSL parameters are resolved.
+fn runtime_profile_for_call(
+    op: &str,
+    params: &serde_json::Value,
+) -> crate::runtime::RuntimeProfile {
+    if op != "search" {
+        return crate::runtime::RuntimeProfile::Base;
+    }
+    let vector = params.get("mode").and_then(|mode| mode.as_str()) != Some("bm25");
+    let reranker = params
+        .get("rerank")
+        .and_then(|rerank| rerank.as_bool())
+        .unwrap_or(false);
+    match (vector, reranker) {
+        (false, false) => crate::runtime::RuntimeProfile::Base,
+        (false, true) => crate::runtime::RuntimeProfile::RerankOnly,
+        (true, false) => crate::runtime::RuntimeProfile::Vector,
+        (true, true) => crate::runtime::RuntimeProfile::Full,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -375,4 +471,36 @@ fn tool_error(id: serde_json::Value, code: &str, message: &str) -> serde_json::V
             "isError": true,
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_profile_uses_resolved_search_parameters() {
+        assert_eq!(
+            runtime_profile_for_call("list", &serde_json::json!({})),
+            crate::runtime::RuntimeProfile::Base
+        );
+        assert_eq!(
+            runtime_profile_for_call("search", &serde_json::json!({ "mode": "bm25" })),
+            crate::runtime::RuntimeProfile::Base
+        );
+        assert_eq!(
+            runtime_profile_for_call(
+                "search",
+                &serde_json::json!({ "mode": "bm25", "rerank": true })
+            ),
+            crate::runtime::RuntimeProfile::RerankOnly
+        );
+        assert_eq!(
+            runtime_profile_for_call("search", &serde_json::json!({})),
+            crate::runtime::RuntimeProfile::Vector
+        );
+        assert_eq!(
+            runtime_profile_for_call("search", &serde_json::json!({ "rerank": true })),
+            crate::runtime::RuntimeProfile::Full
+        );
+    }
 }

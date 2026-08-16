@@ -85,6 +85,14 @@ pub struct EmbeddingMeta {
 /// - Idempotent: upsert with same ID replaces previous embedding
 /// - Thread-safe: `&self` methods must be safe to call concurrently
 pub trait VectorIndex: Send + Sync {
+    /// Return the embedding fingerprint that defines this index's vector space.
+    ///
+    /// Vector-capable reads and writes must reject missing or incompatible
+    /// fingerprints before using the index (ADR-012).
+    fn embedding_fingerprint(&self) -> Result<Option<EmbeddingFingerprint>, ShiroError> {
+        Ok(None)
+    }
+
     /// Insert or replace an embedding for a segment.
     fn upsert(&self, id: &crate::id::SegmentId, embedding: &[f32]) -> Result<(), ShiroError>;
 
