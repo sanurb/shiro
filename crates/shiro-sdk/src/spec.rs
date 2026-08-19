@@ -177,7 +177,7 @@ pub static OPS: &[OpSpec] = &[
         name: "ingest",
         description: "Batch-scan directories and add all supported documents",
         params: INGEST_PARAMS,
-        returns: "IngestOutput { added, ready, failed, failures[] }",
+        returns: "IngestOutput { added, ready, failed, failures[], concept_proposals[] }",
         input_schema_ref: "IngestInput",
         output_schema_ref: "IngestOutput",
         example: r#"{"type":"let","name":"batch","call":{"op":"ingest","params":{"dirs":["/docs"]}}}"#,

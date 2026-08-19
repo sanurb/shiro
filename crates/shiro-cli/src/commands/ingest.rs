@@ -26,13 +26,14 @@ pub fn run(
     let cb: &dyn Fn(&IngestEvent) = &emit_event;
     let on_event: Option<&dyn Fn(&IngestEvent)> = if follow { Some(cb) } else { None };
 
-    let output = engine.ingest(parser.as_ref(), &input, on_event)?;
+    let output = engine.ingest_incremental(parser.as_ref(), &input, on_event, 32)?;
 
     let result = serde_json::json!({
         "added": output.added,
         "ready": output.ready,
         "failed": output.failed,
         "failures": output.failures,
+        "concept_proposals": output.concept_proposals,
     });
 
     Ok(CmdOutput {

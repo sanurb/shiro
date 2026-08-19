@@ -304,11 +304,13 @@ shiro ingest <dir...> \
 * Files processed in deterministic sorted order.
 * 3-phase pipeline: (1) parse all + store in one SQLite transaction, (2) bulk FTS index in one Tantivy commit, (3) bulk state update.
 * `--max-files` selects the first N files in that deterministic order.
+* After a new document reaches `READY`, the AutoTagger compares heuristic title/tag evidence and, when configured, embedding similarity against existing concepts. Matches are persisted only as fully attributed `PROPOSED` model-enrichment records. They do not affect concept-filtered retrieval until explicitly promoted with `shiro enrich-model resolve`.
+* Automatic proposals are enabled by default. Disable them with `shiro config set ingest.auto_concept_proposals false`. No setting auto-accepts proposals.
 
 **Result**
 
 ```json
-{ "added": 5, "ready": 5, "failed": 0, "failures": [] }
+{ "added": 5, "ready": 5, "failed": 0, "failures": [], "concept_proposals": [{ "proposal_id": "proposal_...", "status": "PROPOSED", "trust_zone": "PROPOSED" }] }
 ```
 
 ### Search
@@ -437,7 +439,7 @@ shiro config get <key>
 shiro config set <key> <value>
 ```
 
-Reads and writes individual keys from `config.toml` using dotted-key notation (e.g., `search.limit`).
+Reads and writes individual keys from `config.toml` using dotted-key notation (e.g., `search.limit`). `ingest.auto_concept_proposals` is a boolean and defaults to `true`; setting it to `false` opts out of automatic PROPOSED concept assignments.
 
 Type inference on `set`: values are parsed as `i64`, then `f64`, then `bool` (`true`/`false`), falling back to `String`.
 

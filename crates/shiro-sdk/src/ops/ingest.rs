@@ -34,6 +34,12 @@ pub struct IngestOutput {
     pub ready: usize,
     pub failed: usize,
     pub failures: Vec<IngestFailure>,
+    /// Automatic concept proposals created for newly ingested documents.
+    pub concept_proposals: Vec<super::model_enrichment::ModelEnrichmentProposalOutput>,
+    /// Internal identities used by the Engine to run post-publication proposal policy.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) ingested_document_ids: Vec<shiro_core::DocId>,
 }
 
 // ── Progress events ─────────────────────────────────────────────────────────
@@ -148,11 +154,18 @@ pub fn execute(
         failed,
     });
 
+    let ingested_document_ids = staged
+        .iter()
+        .take(added)
+        .map(|(_, document)| document.doc_id.clone())
+        .collect();
     Ok(IngestOutput {
         added,
         ready,
         failed,
         failures,
+        concept_proposals: Vec::new(),
+        ingested_document_ids,
     })
 }
 

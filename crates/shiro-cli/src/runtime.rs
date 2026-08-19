@@ -29,7 +29,13 @@ pub(crate) enum RuntimeProfile {
 /// Open the CLI Engine with only the adapters required by `profile`.
 pub(crate) fn open_engine(home: &ShiroHome, profile: RuntimeProfile) -> Result<Engine, ShiroError> {
     let config = load_config(home)?;
-    let mut engine = Engine::open(home.clone())?;
+    let mut engine = Engine::open(home.clone())?.with_automatic_concept_proposals(
+        config
+            .ingest
+            .as_ref()
+            .map(|ingest| ingest.auto_concept_proposals)
+            .unwrap_or(true),
+    );
     match profile {
         RuntimeProfile::Base => Ok(engine),
         RuntimeProfile::RerankOnly => {
@@ -51,15 +57,14 @@ pub(crate) fn open_engine(home: &ShiroHome, profile: RuntimeProfile) -> Result<E
 /// Open the CLI Engine for rebuilding vector artifacts without reading live vectors.
 pub(crate) fn open_engine_for_reindex(home: &ShiroHome) -> Result<Engine, ShiroError> {
     let config = load_config(home)?;
-    let engine = Engine::open(home.clone())?;
+    let engine = Engine::open(home.clone())?.with_automatic_concept_proposals(
+        config
+            .ingest
+            .as_ref()
+            .map(|ingest| ingest.auto_concept_proposals)
+            .unwrap_or(true),
+    );
     configure_engine(engine, &config, VectorIndexMode::Skip)
-}
-
-/// Rebuild and fingerprint the vector index with the configured embedder.
-pub(crate) fn reindex_vector(
-    engine: &Engine,
-) -> Result<shiro_sdk::ops::reindex::ReindexOutput, ShiroError> {
-    engine.reindex_vector()
 }
 
 #[derive(Clone, Copy)]

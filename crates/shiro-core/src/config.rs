@@ -131,6 +131,10 @@ pub struct ShiroConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search: Option<SearchConfig>,
 
+    /// Ingestion enrichment settings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingest: Option<IngestConfig>,
+
     /// Embedding service settings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embed: Option<EmbedConfig>,
@@ -149,6 +153,7 @@ impl Default for ShiroConfig {
         Self {
             version: CURRENT_CONFIG_VERSION,
             search: None,
+            ingest: None,
             embed: None,
             rerank: None,
         }
@@ -162,6 +167,22 @@ pub struct SearchConfig {
     /// Maximum number of results returned by search.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+}
+
+/// Ingestion enrichment configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct IngestConfig {
+    /// Propose assignments to existing taxonomy concepts after ingest.
+    pub auto_concept_proposals: bool,
+}
+
+impl Default for IngestConfig {
+    fn default() -> Self {
+        Self {
+            auto_concept_proposals: true,
+        }
+    }
 }
 
 /// Embedding service configuration.
@@ -245,6 +266,12 @@ pub const CONFIG_KEYS: &[ConfigKeyMeta] = &[
         description: "Maximum search results",
     },
     ConfigKeyMeta {
+        key: "ingest.auto_concept_proposals",
+        kind: ConfigFieldKind::Bool,
+        sensitive: false,
+        description: "Propose existing taxonomy concepts during ingest (default true)",
+    },
+    ConfigKeyMeta {
         key: "embed.base_url",
         kind: ConfigFieldKind::Str,
         sensitive: false,
@@ -318,6 +345,13 @@ pub fn get_config_value(config: &ShiroConfig, key: &str) -> Option<toml::Value> 
             .as_ref()
             .and_then(|search| search.limit)
             .map(|value| toml::Value::Integer(i64::from(value))),
+        "ingest.auto_concept_proposals" => Some(toml::Value::Boolean(
+            config
+                .ingest
+                .as_ref()
+                .map(|ingest| ingest.auto_concept_proposals)
+                .unwrap_or(true),
+        )),
         "embed.base_url" => config
             .embed
             .as_ref()
@@ -380,6 +414,16 @@ pub fn set_config_value(config: &mut ShiroConfig, key: &str, raw: &str) -> Resul
                 .search
                 .get_or_insert_with(SearchConfig::default)
                 .limit = Some(parse_config_number(raw, meta.kind)?);
+        }
+        "ingest.auto_concept_proposals" => {
+            config
+                .ingest
+                .get_or_insert_with(IngestConfig::default)
+                .auto_concept_proposals =
+                raw.parse::<bool>()
+                    .map_err(|error| ShiroError::InvalidInput {
+                        message: format!("invalid value '{raw}' for bool field: {error}"),
+                    })?;
         }
         "embed.base_url" => {
             config
@@ -613,6 +657,9 @@ mod tests {
         let cfg = ShiroConfig {
             version: CURRENT_CONFIG_VERSION,
             search: Some(SearchConfig { limit: Some(25) }),
+            ingest: Some(IngestConfig {
+                auto_concept_proposals: false,
+            }),
             embed: Some(EmbedConfig {
                 provider: Some("http".into()),
                 base_url: Some("http://localhost:11434/v1".into()),
@@ -661,6 +708,42 @@ mod tests {
         let path = Utf8Path::new("/tmp/config.toml");
         let err = parse_config(path, "version = 999\n").unwrap_err();
         assert!(err.to_string().contains("supports up to"));
+    }
+
+    #[test]
+    fn rerank_candidate_limit_is_validated_when_parsing_config() {
+        let path = Utf8Path::new("/tmp/config.toml");
+        let zero = parse_config(path, "version = 1\n[rerank]\ntop_k = 0\n");
+        let above_bound = parse_config(path, "version = 1\n[rerank]\ntop_k = 201\n");
+
+        assert!(matches!(zero, Err(ShiroError::Config { .. })));
+        assert!(matches!(above_bound, Err(ShiroError::Config { .. })));
+    }
+
+    #[test]
+    fn rerank_candidate_limit_is_validated_when_setting_config() {
+        let mut config = ShiroConfig::default();
+
+        assert!(matches!(
+            set_config_value(&mut config, "rerank.top_k", "0"),
+            Err(ShiroError::InvalidInput { .. })
+        ));
+        assert_eq!(config.rerank, None);
+    }
+
+    #[test]
+    fn automatic_concept_proposals_default_on_and_can_be_disabled() {
+        let mut config = ShiroConfig::default();
+        assert_eq!(
+            get_config_value(&config, "ingest.auto_concept_proposals"),
+            Some(toml::Value::Boolean(true))
+        );
+
+        set_config_value(&mut config, "ingest.auto_concept_proposals", "false").unwrap();
+        assert_eq!(
+            get_config_value(&config, "ingest.auto_concept_proposals"),
+            Some(toml::Value::Boolean(false))
+        );
     }
 
     #[test]

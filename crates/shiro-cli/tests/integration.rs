@@ -401,6 +401,15 @@ fn capabilities_schema_stable() {
                 "enrichment",
                 "mcp_server",
                 "completions",
+                "judged_benchmark",
+                "stable_evidence_handles",
+                "multi_query_search_pack",
+                "bounded_reprocessing_planner",
+                "mcp_current_protocol_and_authority",
+                "bounded_url_acquisition",
+                "taxonomy_browse_search",
+                "reversible_model_enrichment_proposals",
+                "automatic_concept_proposals",
             ];
             s.sort();
             s
@@ -1357,6 +1366,119 @@ fn taxonomy_relate_rejects_broader_cycles_without_changing_closure() {
     );
     assert!(store
         .get_concept_relations(&ancestor_id)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn ingest_concept_proposals_stay_untrusted_until_promotion_and_support_opt_out() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path().join("shiro-auto-concepts");
+    let (stdout, code) = shiro(&home, &["init"]);
+    assert_eq!(code, 0, "init failed: {stdout}");
+
+    let (stdout, code) = shiro(
+        &home,
+        &[
+            "taxonomy",
+            "add",
+            "--scheme",
+            "urn:test:auto-concepts",
+            "--label",
+            "Rust",
+            "--definition",
+            "A systems programming language",
+        ],
+    );
+    assert_eq!(code, 0, "taxonomy add failed: {stdout}");
+    let concept_id = parse_json(&stdout)["result"]["concept_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let corpus = tmp.path().join("corpus");
+    std::fs::create_dir(&corpus).unwrap();
+    std::fs::write(
+        corpus.join("rust.md"),
+        "# Rust Ownership\n\nOwnership provides memory safety evidence.",
+    )
+    .unwrap();
+    let (stdout, code) = shiro(&home, &["ingest", corpus.to_str().unwrap()]);
+    assert_eq!(code, 0, "ingest failed: {stdout}");
+    let ingested = parse_json(&stdout);
+    let proposals = ingested["result"]["concept_proposals"].as_array().unwrap();
+    assert_eq!(proposals.len(), 1);
+    assert_eq!(proposals[0]["status"], "PROPOSED");
+    assert_eq!(proposals[0]["trust_zone"], "PROPOSED");
+    let proposal_id = proposals[0]["proposal_id"].as_str().unwrap();
+
+    let (stdout, code) = shiro(
+        &home,
+        &[
+            "search",
+            "ownership",
+            "--mode",
+            "bm25",
+            "--concept",
+            &concept_id,
+        ],
+    );
+    assert_eq!(code, 0, "pre-promotion search failed: {stdout}");
+    assert!(parse_json(&stdout)["result"]["results"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    let (stdout, code) = shiro(
+        &home,
+        &[
+            "enrich-model",
+            "resolve",
+            proposal_id,
+            "--action",
+            "promote",
+            "--actor",
+            "local_user",
+            "--approval",
+            "approval:auto-concept-test",
+        ],
+    );
+    assert_eq!(code, 0, "promotion failed: {stdout}");
+    assert_eq!(parse_json(&stdout)["result"]["status"], "PROMOTED");
+
+    let (stdout, code) = shiro(
+        &home,
+        &[
+            "search",
+            "ownership",
+            "--mode",
+            "bm25",
+            "--concept",
+            &concept_id,
+        ],
+    );
+    assert_eq!(code, 0, "post-promotion search failed: {stdout}");
+    assert!(!parse_json(&stdout)["result"]["results"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    let (stdout, code) = shiro(
+        &home,
+        &["config", "set", "ingest.auto_concept_proposals", "false"],
+    );
+    assert_eq!(code, 0, "config opt-out failed: {stdout}");
+    let opted_out_corpus = tmp.path().join("opted-out-corpus");
+    std::fs::create_dir(&opted_out_corpus).unwrap();
+    std::fs::write(
+        opted_out_corpus.join("second.md"),
+        "# Rust Lifetimes\n\nA second unique document.",
+    )
+    .unwrap();
+    let (stdout, code) = shiro(&home, &["ingest", opted_out_corpus.to_str().unwrap()]);
+    assert_eq!(code, 0, "opted-out ingest failed: {stdout}");
+    assert!(parse_json(&stdout)["result"]["concept_proposals"]
+        .as_array()
         .unwrap()
         .is_empty());
 }

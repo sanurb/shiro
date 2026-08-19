@@ -107,7 +107,7 @@ pub(crate) fn extract_tags(text: &str) -> Vec<String> {
 }
 
 /// Build a summary by taking the first ~500 characters of text.
-fn build_summary(text: &str) -> Option<String> {
+pub(crate) fn build_summary(text: &str) -> Option<String> {
     if text.is_empty() {
         return None;
     }

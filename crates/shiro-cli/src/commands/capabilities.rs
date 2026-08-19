@@ -77,6 +77,7 @@ pub fn run(home: &ShiroHome) -> Result<CmdOutput, ShiroError> {
             "bounded_url_acquisition": "implemented",
             "taxonomy_browse_search": "implemented",
             "reversible_model_enrichment_proposals": "implemented",
+            "automatic_concept_proposals": "proposed_only",
         },
         "taxonomy": {
             "subcommands": crate::commands::TAXONOMY_SUBCOMMANDS,
