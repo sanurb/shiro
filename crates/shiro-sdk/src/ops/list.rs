@@ -23,11 +23,17 @@ pub struct ListOutput {
 }
 
 pub fn execute(store: &Store, input: &ListInput) -> Result<ListOutput, ShiroError> {
-    // Fetch limit+1 to detect truncation.
-    let docs = store.list_documents(input.limit + 1)?;
-    let truncated = docs.len() > input.limit;
+    let filters = ResolvedSearchFilters::resolve(store, &input.filters)?;
+    let docs = store.list_all_documents()?;
+    let mut filtered = Vec::new();
+    for document in docs {
+        if filters.matches_document(store, &document.0)? {
+            filtered.push(document);
+        }
+    }
+    let truncated = filtered.len() > input.limit;
 
-    let documents: Vec<ListEntry> = docs
+    let documents: Vec<ListEntry> = filtered
         .iter()
         .take(input.limit)
         .map(|(doc_id, state, title)| ListEntry {

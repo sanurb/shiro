@@ -1207,3 +1207,81 @@ fn taxonomy_import_rebuilds_hierarchical_closure_once() {
         vec![rust]
     );
 }
+
+#[test]
+fn ancestor_concept_filter_matches_descendant_assignment() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path().join("shiro-hierarchical-filter");
+    let (stdout, code) = shiro(&home, &["init"]);
+    assert_eq!(code, 0, "init failed: {stdout}");
+
+    let source = tmp.path().join("rust.txt");
+    std::fs::write(&source, "hierarchical retrieval evidence").unwrap();
+    let (stdout, code) = shiro(&home, &["add", source.to_str().unwrap()]);
+    assert_eq!(code, 0, "add failed: {stdout}");
+    let doc_id = parse_json(&stdout)["result"]["doc_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let taxonomy_file = tmp.path().join("hierarchy.json");
+    std::fs::write(
+        &taxonomy_file,
+        serde_json::to_vec(&serde_json::json!([
+            {
+                "scheme_uri": "urn:test:retrieval",
+                "pref_label": "Programming Languages"
+            },
+            {
+                "scheme_uri": "urn:test:retrieval",
+                "pref_label": "Rust",
+                "broader": ["Programming Languages"]
+            }
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let (stdout, code) = shiro(
+        &home,
+        &["taxonomy", "import", taxonomy_file.to_str().unwrap()],
+    );
+    assert_eq!(code, 0, "taxonomy import failed: {stdout}");
+
+    let ancestor_id = shiro_core::ConceptId::new("urn:test:retrieval", "Programming Languages");
+    let descendant_id = shiro_core::ConceptId::new("urn:test:retrieval", "Rust");
+    let (stdout, code) = shiro(
+        &home,
+        &[
+            "taxonomy",
+            "assign",
+            &doc_id,
+            descendant_id.as_str(),
+            "--source",
+            "test",
+        ],
+    );
+    assert_eq!(code, 0, "taxonomy assignment failed: {stdout}");
+
+    let (stdout, code) = shiro(
+        &home,
+        &[
+            "search",
+            "hierarchical",
+            "--mode",
+            "bm25",
+            "--expand",
+            "--concept",
+            ancestor_id.as_str(),
+        ],
+    );
+    assert_eq!(code, 0, "hierarchical search failed: {stdout}");
+    let searched = parse_json(&stdout);
+    let hits = searched["result"]["results"].as_array().unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["doc_id"], doc_id);
+
+    let result_id = hits[0]["result_id"].as_str().unwrap();
+    let (stdout, code) = shiro(&home, &["explain", result_id]);
+    assert_eq!(code, 0, "explain failed: {stdout}");
+    assert_eq!(parse_json(&stdout)["result"]["doc_id"], doc_id);
+}

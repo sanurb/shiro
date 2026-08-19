@@ -325,20 +325,21 @@ shiro search <query> \
   [--tag <tag>] \
   [--concept <concept_id>] \
   [--doc <doc_id>]
+```
 
 **Defaults**
 
-* `--mode`: `bm25` (BM25 full-text search; hybrid falls back to BM25-only since vector search is not exposed)
+* `--mode`: `hybrid` (gracefully falls back to BM25 when vector retrieval is unavailable)
 * `--limit`: 10
 * `--expand`: off (when enabled, expands context via `expand_context()` using structure-aware alternating before/after from hit segment)
 * `--max-blocks`: 12 (context expansion budget)
 * `--max-chars`: 8000 (context expansion budget)
-* `--tag`, `--concept`, `--doc`: filter facets
+* `--tag`, `--concept`, `--doc`: filter facets. A concept filter matches assignments to that concept or any transitive descendant recorded in `concept_closure`; filtering by a narrower concept does not match assignments to its broader ancestors.
 
 **Notes**
 
-* `--mode bm25` is the only functional search mode.
-* Search results are persisted to the `search_results` table (with `fts_gen`, `vec_gen`, `query_digest`) for later `explain`.
+* `hybrid`, `bm25`, and `vector` modes are supported when their configured runtime providers are available.
+* Search results are immutable snapshots persisted for later `explain`.
 
 **Result**
 
