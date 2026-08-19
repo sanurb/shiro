@@ -229,6 +229,13 @@ enum ReadView {
     Blocks,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum TaxonomyRelationKindArg {
+    Broader,
+    Narrower,
+    Related,
+}
+
 #[derive(Subcommand)]
 enum ConfigAction {
     /// Show all configuration.
@@ -275,10 +282,43 @@ enum TaxonomyAction {
         limit: usize,
     },
 
+    /// Search concept labels, synonyms, definitions, and schemes.
+    Search {
+        query: String,
+
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+
+    /// Browse a bounded concept graph or list all concept roots.
+    Browse {
+        #[arg(long)]
+        root: Option<String>,
+
+        #[arg(long, default_value_t = 2)]
+        max_depth: usize,
+
+        #[arg(long, default_value_t = 100)]
+        max_nodes: usize,
+    },
+
     /// Show relations for a concept.
     Relations {
         /// Concept ID.
         concept_id: String,
+    },
+
+    /// Author a SKOS relation and rebuild hierarchical closure.
+    Relate {
+        /// Source concept ID.
+        from_concept_id: String,
+
+        /// Target concept ID.
+        to_concept_id: String,
+
+        /// Directed SKOS relation kind.
+        #[arg(long, value_enum)]
+        kind: TaxonomyRelationKindArg,
     },
 
     /// Assign a concept to a document.
@@ -477,9 +517,31 @@ fn dispatch(cli: &Cli) -> Result<CmdOutput, ShiroError> {
                     definition.as_deref(),
                 ),
                 TaxonomyAction::List { limit } => commands::taxonomy::run_list(&home, *limit),
+                TaxonomyAction::Search { query, limit } => {
+                    commands::taxonomy::run_search(&home, query, *limit)
+                }
+                TaxonomyAction::Browse {
+                    root,
+                    max_depth,
+                    max_nodes,
+                } => commands::taxonomy::run_browse(&home, root.as_deref(), *max_depth, *max_nodes),
                 TaxonomyAction::Relations { concept_id } => {
                     commands::taxonomy::run_relations(&home, concept_id)
                 }
+                TaxonomyAction::Relate {
+                    from_concept_id,
+                    to_concept_id,
+                    kind,
+                } => commands::taxonomy::run_relate(
+                    &home,
+                    from_concept_id,
+                    to_concept_id,
+                    match kind {
+                        TaxonomyRelationKindArg::Broader => shiro_core::SkosRelation::Broader,
+                        TaxonomyRelationKindArg::Narrower => shiro_core::SkosRelation::Narrower,
+                        TaxonomyRelationKindArg::Related => shiro_core::SkosRelation::Related,
+                    },
+                ),
                 TaxonomyAction::Assign {
                     doc_id,
                     concept_id,

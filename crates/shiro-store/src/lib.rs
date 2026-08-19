@@ -1469,6 +1469,50 @@ impl Store {
         Ok(())
     }
 
+    /// Insert one authored relation and atomically rebuild hierarchical closure.
+    ///
+    /// A hierarchy cycle rolls back both the relation and closure rebuild, leaving
+    /// the previously trusted taxonomy unchanged.
+    pub fn relate_concepts(&self, relation: &ConceptRelation) -> Result<bool, ShiroError> {
+        self.with_savepoint("relate_concepts", || {
+            let inserted = self
+                .conn
+                .execute(
+                    "INSERT OR IGNORE INTO concept_relations (from_id, to_id, relation)
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![
+                        relation.from.as_str(),
+                        relation.to.as_str(),
+                        relation_to_sql(&relation.relation),
+                    ],
+                )
+                .map_err(map_db)?;
+            self.rebuild_closure()?;
+            let hierarchy_has_cycle = self
+                .conn
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM concept_closure
+                         WHERE ancestor_id = descendant_id
+                     )",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(map_db)?;
+            if hierarchy_has_cycle {
+                return Err(ShiroError::TaxonomyCycle {
+                    message: format!(
+                        "taxonomy hierarchy cycle rejected: {} {} {}",
+                        relation.from,
+                        relation_to_sql(&relation.relation),
+                        relation.to
+                    ),
+                });
+            }
+            Ok(inserted == 1)
+        })
+    }
+
     /// Get all relations for a concept (as source).
     pub fn get_concept_relations(
         &self,
@@ -1602,27 +1646,38 @@ impl Store {
                 .execute("DELETE FROM concept_closure", [])
                 .map_err(map_db)?;
 
-            // Seed: depth-1 edges from BROADER relations (from is descendant, to is ancestor)
+            // Normalize BROADER and its NARROWER inverse into ancestor→descendant rows.
             self.conn
                 .execute(
                     "INSERT OR IGNORE INTO concept_closure (ancestor_id, descendant_id, depth)
-                     SELECT to_id, from_id, 1 FROM concept_relations WHERE relation = 'BROADER'",
+                     SELECT to_id, from_id, 1
+                     FROM concept_relations WHERE relation = 'BROADER'
+                     UNION
+                     SELECT from_id, to_id, 1
+                     FROM concept_relations WHERE relation = 'NARROWER'",
                     [],
                 )
                 .map_err(map_db)?;
 
-            // Iterative expansion: join closure with BROADER edges
+            // Iteratively extend every normalized ancestor→descendant path.
             loop {
                 let inserted = self
                     .conn
                     .execute(
                         "INSERT OR IGNORE INTO concept_closure (ancestor_id, descendant_id, depth)
-                         SELECT c.ancestor_id, r.from_id, c.depth + 1
+                         SELECT c.ancestor_id, edge.descendant_id, c.depth + 1
                          FROM concept_closure c
-                         JOIN concept_relations r ON r.to_id = c.descendant_id AND r.relation = 'BROADER'
+                         JOIN (
+                             SELECT to_id AS ancestor_id, from_id AS descendant_id
+                             FROM concept_relations WHERE relation = 'BROADER'
+                             UNION
+                             SELECT from_id AS ancestor_id, to_id AS descendant_id
+                             FROM concept_relations WHERE relation = 'NARROWER'
+                         ) edge ON edge.ancestor_id = c.descendant_id
                          WHERE NOT EXISTS (
                              SELECT 1 FROM concept_closure x
-                             WHERE x.ancestor_id = c.ancestor_id AND x.descendant_id = r.from_id
+                             WHERE x.ancestor_id = c.ancestor_id
+                               AND x.descendant_id = edge.descendant_id
                          )",
                         [],
                     )
@@ -3079,6 +3134,19 @@ mod tests {
             .unwrap();
         assert_eq!(count2, 3);
 
+        let closure_before_cycle = store.get_concept_descendant_ids(&animal.id).unwrap();
+        let cycle = store.relate_concepts(&ConceptRelation {
+            from: animal.id.clone(),
+            to: dog.id.clone(),
+            relation: SkosRelation::Broader,
+        });
+        assert!(matches!(cycle, Err(ShiroError::TaxonomyCycle { .. })));
+        assert_eq!(
+            store.get_concept_descendant_ids(&animal.id).unwrap(),
+            closure_before_cycle
+        );
+        assert!(store.get_concept_relations(&animal.id).unwrap().is_empty());
+
         // Empty relations → empty closure
         store
             .conn
@@ -3090,6 +3158,28 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM concept_closure", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count3, 0);
+    }
+
+    #[test]
+    fn narrower_relation_populates_the_same_hierarchical_closure() {
+        let (store, _fixture) = tmp_store();
+        let broader = test_concept("Broader");
+        let narrower = test_concept("Narrower");
+        store.put_concept(&broader).unwrap();
+        store.put_concept(&narrower).unwrap();
+
+        store
+            .relate_concepts(&ConceptRelation {
+                from: broader.id.clone(),
+                to: narrower.id.clone(),
+                relation: SkosRelation::Narrower,
+            })
+            .unwrap();
+
+        assert_eq!(
+            store.get_concept_descendant_ids(&broader.id).unwrap(),
+            vec![narrower.id]
+        );
     }
 
     // ── BlockGraph persistence tests (ADR-006) ───────────────────────

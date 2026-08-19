@@ -105,6 +105,43 @@ pub fn run_relations(home: &ShiroHome, concept_id: &str) -> Result<CmdOutput, Sh
     })
 }
 
+pub fn run_relate(
+    home: &ShiroHome,
+    from_concept_id: &str,
+    to_concept_id: &str,
+    relation: SkosRelation,
+) -> Result<CmdOutput, ShiroError> {
+    let store = Store::open(&home.db_path())?;
+    let from =
+        ConceptId::from_stored(from_concept_id).map_err(|error| ShiroError::InvalidInput {
+            message: format!("invalid source concept ID '{from_concept_id}': {error}"),
+        })?;
+    let to = ConceptId::from_stored(to_concept_id).map_err(|error| ShiroError::InvalidInput {
+        message: format!("invalid target concept ID '{to_concept_id}': {error}"),
+    })?;
+    let _ = store.get_concept(&from)?;
+    let _ = store.get_concept(&to)?;
+    let created = store.relate_concepts(&ConceptRelation {
+        from: from.clone(),
+        to: to.clone(),
+        relation: relation.clone(),
+    })?;
+
+    Ok(CmdOutput {
+        result: serde_json::json!({
+            "from_concept_id": from.as_str(),
+            "to_concept_id": to.as_str(),
+            "kind": relation,
+            "created": created,
+            "closure_rebuilt": true,
+        }),
+        next_actions: vec![NextAction::simple(
+            format!("shiro taxonomy relations {from}"),
+            "View source concept relations",
+        )],
+    })
+}
+
 pub fn run_assign(
     home: &ShiroHome,
     doc_id_str: &str,

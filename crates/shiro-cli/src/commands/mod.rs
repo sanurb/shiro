@@ -13,12 +13,27 @@ pub mod ingest;
 pub mod init;
 pub mod list;
 pub mod mcp;
+pub mod model_enrichment;
 pub mod read;
 pub mod reindex;
 pub mod remove;
+pub mod reprocess;
 pub mod root;
 pub mod search;
+pub mod search_pack;
 pub mod taxonomy;
+
+/// Taxonomy authoring and inspection subcommands exposed by the CLI.
+pub(crate) const TAXONOMY_SUBCOMMANDS: &[&str] = &[
+    "add",
+    "list",
+    "search",
+    "browse",
+    "relations",
+    "relate",
+    "assign",
+    "import",
+];
 
 /// Resolve a doc ID from either a raw `doc_*` string or a title search.
 pub(crate) fn resolve_doc_id(store: &Store, id_or_title: &str) -> Result<DocId, ShiroError> {

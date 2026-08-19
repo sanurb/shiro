@@ -1285,3 +1285,78 @@ fn ancestor_concept_filter_matches_descendant_assignment() {
     assert_eq!(code, 0, "explain failed: {stdout}");
     assert_eq!(parse_json(&stdout)["result"]["doc_id"], doc_id);
 }
+
+#[test]
+fn taxonomy_relate_rejects_broader_cycles_without_changing_closure() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path().join("shiro-taxonomy-relate");
+    let (stdout, code) = shiro(&home, &["init"]);
+    assert_eq!(code, 0, "init failed: {stdout}");
+
+    let mut concept_ids = Vec::new();
+    for label in ["Ancestor", "Child", "Grandchild"] {
+        let (stdout, code) = shiro(
+            &home,
+            &[
+                "taxonomy",
+                "add",
+                "--scheme",
+                "urn:test:relate",
+                "--label",
+                label,
+            ],
+        );
+        assert_eq!(code, 0, "taxonomy add failed: {stdout}");
+        concept_ids.push(
+            parse_json(&stdout)["result"]["concept_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+
+    for (from, to) in [
+        (&concept_ids[1], &concept_ids[0]),
+        (&concept_ids[2], &concept_ids[1]),
+    ] {
+        let (stdout, code) = shiro(
+            &home,
+            &["taxonomy", "relate", from, to, "--kind", "broader"],
+        );
+        assert_eq!(code, 0, "taxonomy relate failed: {stdout}");
+        assert!(parse_json(&stdout)["result"]["closure_rebuilt"]
+            .as_bool()
+            .unwrap());
+    }
+
+    let home_path = camino::Utf8Path::from_path(&home).unwrap();
+    let store = shiro_store::Store::open(&home_path.join("shiro.db")).unwrap();
+    let ancestor_id = shiro_core::ConceptId::from_stored(concept_ids[0].clone()).unwrap();
+    let closure_before = store.get_concept_descendant_ids(&ancestor_id).unwrap();
+    drop(store);
+
+    let (stdout, code) = shiro(
+        &home,
+        &[
+            "taxonomy",
+            "relate",
+            &concept_ids[0],
+            &concept_ids[2],
+            "--kind",
+            "broader",
+        ],
+    );
+    assert_ne!(code, 0, "cycle unexpectedly accepted: {stdout}");
+    let rejected = parse_json(&stdout);
+    assert_eq!(rejected["error"]["code"], "E_TAXONOMY_CYCLE");
+
+    let store = shiro_store::Store::open(&home_path.join("shiro.db")).unwrap();
+    assert_eq!(
+        store.get_concept_descendant_ids(&ancestor_id).unwrap(),
+        closure_before
+    );
+    assert!(store
+        .get_concept_relations(&ancestor_id)
+        .unwrap()
+        .is_empty());
+}

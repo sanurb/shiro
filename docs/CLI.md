@@ -492,13 +492,24 @@ shiro taxonomy list [--scheme <uri>]
 
 Lists all concepts, optionally filtered by scheme URI.
 
-#### `shiro taxonomy relations`
+#### `shiro taxonomy search` / `browse`
 
 ```bash
-shiro taxonomy relations <concept_id> [--add <relation> <target_id>]
+shiro taxonomy search <query> [--limit <n>]
+shiro taxonomy browse [--root <concept_id>] [--max-depth <n>] [--max-nodes <n>]
 ```
 
-Shows or modifies relations for a concept. Relations: `broader`, `narrower`, `related`. Transitive closure maintained in `concept_closure` table. Cycle detection returns `E_TAXONOMY_CYCLE`.
+Search covers preferred labels, alternate labels, definitions, and scheme URIs. Browse returns a bounded relation graph; every concept includes a non-empty `text_fallback`.
+
+#### `shiro taxonomy relations` / `relate`
+
+```bash
+shiro taxonomy relations <concept_id>
+shiro taxonomy relate <from_concept_id> <to_concept_id> \
+  --kind <broader|narrower|related>
+```
+
+`relations` inspects outgoing relations. `relate` authors a directed SKOS relation and rebuilds `concept_closure` atomically. `BROADER` means the target is the source's ancestor; `NARROWER` expresses the inverse direction and contributes identically to closure. Hierarchy cycles are rejected with `E_TAXONOMY_CYCLE`, and neither the relation nor closure changes on rejection. `RELATED` is associative and does not affect hierarchical closure.
 
 #### `shiro taxonomy assign`
 
