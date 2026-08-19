@@ -1,447 +1,289 @@
 <h1 align="center">shiro</h1>
 
 <p align="center">
-  <strong>Local-first knowledge engine for structured document retrieval.</strong>
+  <strong>A local-first knowledge engine that turns PDFs and Markdown into structured, explainable search.</strong>
 </p>
 
 <p align="center">
   <a href="https://github.com/sanurb/shiro/actions"><img src="https://img.shields.io/github/actions/workflow/status/sanurb/shiro/ci.yml?branch=master&style=flat-square&logo=github&color=181717" alt="CI Status"></a>
   <a href="https://github.com/sanurb/shiro/releases"><img src="https://img.shields.io/github/v/release/sanurb/shiro?style=flat-square&logo=rust&color=e44d26" alt="Latest Release"></a>
+  <img src="https://img.shields.io/badge/rust-1.75%2B-b7410e?style=flat-square&logo=rust" alt="Rust 1.75+">
   <img src="https://img.shields.io/badge/License-MIT-4caf50?style=flat-square" alt="License">
 </p>
 
 ---
 
-> [!TIP]
-> **shiro** (Japanese for *castle*) is a high-performance, local-first knowledge engine designed to transform fragmented PDFs and Markdown files into a unified, structure-aware searchable base. 
+**shiro** (Japanese for *castle*) indexes your documents into a searchable base that runs entirely on your machine. It parses PDFs and Markdown into a block-level intermediate representation that preserves reading order and heading hierarchy, then retrieves against it with BM25, local vector embeddings, and optional cross-encoder reranking.
 
-Shiro transforms PDFs and Markdown files into a unified, structure-aware searchable base on your local machine. Documents are parsed into a BlockGraph intermediate representation that preserves reading order, heading hierarchy, and block relationships. Retrieval combines BM25 full-text search (Tantivy) with local vector embeddings (FastEmbed/ONNX) and optional cross-encoder reranking, fused via Reciprocal Rank Fusion. Embeddings and reranking run entirely on-device — no data leaves your machine. Every command emits deterministic JSON to stdout wrapped in a HATEOAS envelope, making shiro a first-class building block for AI agents, shell pipelines, and automation toolchains.
+Every command prints a single JSON object to stdout. There is no human-readable mode, no colors, and no interactive prompts — which makes shiro a component you can pipe into `jq`, drop into a shell script, or hand to an AI agent over MCP.
 
-## Key Differentiators
+```bash
+shiro ingest ~/Documents/papers
+shiro search "distributed consensus" --rerank | jq '.result.hits[0]'
+```
 
-- **Structure-Aware IR** -- Documents are modeled as hierarchical blocks (headings, paragraphs, code, tables) with byte-level spans, enabling precise context windowing for LLM applications.
-- **Deterministic JSON CLI** -- Every command outputs a structured JSON envelope to stdout. No human-readable mode. Built for `jq`, scripts, and agent consumption.
-- **HATEOAS Navigation** -- Every response includes `next_actions` with typed parameter templates, enabling AI agents to discover and chain commands dynamically.
-- **Local Semantic Retrieval** -- Provider-agnostic embedding and reranking boundary with FastEmbed (ONNX Runtime) as the first local implementation. Hybrid search fuses BM25 + vector rankings; reranking refines top-k quality with cross-encoder models. No external service required.
-- **Zero-API Dependency** -- Parsing, indexing, embedding, reranking, and search all run locally. No data leaves your machine.
-- **Pluggable Parsers** -- Built-in support for Markdown (pulldown-cmark), PDF (pdf-extract), and plain text, plus a Docling adapter for structured PDF extraction via external Python subprocess.
+## Why shiro
 
-## Installation
+- **Nothing leaves your machine.** Parsing, indexing, embedding, reranking, and search all run locally. The default embedding provider is FastEmbed (ONNX), so semantic search needs no API key and no network.
+- **Results point at blocks, not files.** A hit identifies the exact block within a document — its kind, byte span, and a content-derived `blk_` evidence handle that survives re-parsing — so you can build a precise context window instead of stuffing a whole PDF into a prompt.
+- **Every ranking is auditable.** `shiro explain` returns the pipeline, the ordered stages, the fusion parameters, and each source's individual contribution to a result's position.
+- **Built for programs, not people.** Deterministic JSON, stable `E_*` error codes, meaningful exit codes, and a `next_actions` field on every response that tells a caller what it can legally do next.
+- **Providers are swappable.** Embedding and reranking sit behind traits. FastEmbed is the local default; the HTTP adapter speaks to Ollama, llama.cpp, vLLM, or any OpenAI-compatible endpoint.
+- **One binary.** No daemon, no server, no container. SQLite holds the state.
 
-### Option A: Shell script (prebuilt binaries)
+## Install
+
+### Shell script (prebuilt binaries)
 
 ```bash
 curl -sSfL https://raw.githubusercontent.com/sanurb/shiro/master/install.sh | sh
 ```
 
-Detects your OS and architecture, downloads the latest release from GitHub, and installs the `shiro` binary into `~/.local/bin`. Override with `SHIRO_INSTALL_DIR`:
+Detects your OS and architecture, downloads the latest release, and installs `shiro` into `~/.local/bin`. Override the destination with `SHIRO_INSTALL_DIR`.
 
-```bash
-SHIRO_INSTALL_DIR=/usr/local/bin \
-  curl -sSfL https://raw.githubusercontent.com/sanurb/shiro/master/install.sh | sh
-```
-
-### Option B: npm
+### npm
 
 ```bash
 npm install -g @sanurb/shiro-cli
 ```
 
-The npm package does not bundle the binary. A `postinstall` script automatically downloads the correct platform binary from GitHub Releases.
+The package ships no binary; a `postinstall` script fetches the right one from GitHub Releases. Linux and macOS only.
 
-### Option C: Cargo (build from source)
+### Cargo
 
 ```bash
 cargo install shiro-cli
 ```
 
-The crate name is `shiro-cli`, the npm package is `@sanurb/shiro-cli`, but the executable you run is `shiro`.
+Requires Rust 1.75 or newer. The crate is `shiro-cli`, the npm package is `@sanurb/shiro-cli`, and the executable is `shiro`.
 
-## Quick Start
-
-Initialize a knowledge base and ingest documents:
+## Quick start
 
 ```bash
-shiro init
-shiro ingest ~/Documents/KnowledgeBase
+shiro init                              # create ~/.shiro (override with --home)
+shiro ingest ~/Documents/papers         # parse, index, and activate a directory
+shiro search "distributed consensus"    # hybrid search by default
 ```
 
-Search for a concept (defaults to hybrid mode when embeddings are configured):
-
-```bash
-shiro search "distributed consensus"
-```
+A search response:
 
 ```json
 {
   "ok": true,
+  "command": "search",
   "result": {
     "query": "distributed consensus",
     "mode": "hybrid",
-    "retrieval_info": {
-      "bm25_active": true,
-      "vector_active": true,
-      "reranker_active": false,
-      "reranker_model": null
-    },
-    "results": [
+    "retrieval_info": { "bm25_active": true, "vector_active": true, "reranker_active": false },
+    "hits": [
       {
         "result_id": "res_a1b2c3d4e5f67890",
-        "doc_id": "d:9f8e7d",
+        "evidence_handle": "blk_a1b2c3...",
+        "doc_id": "doc_9f8e7d...",
         "block_idx": 4,
         "block_kind": "PARAGRAPH",
-        "span": {"start": 1024, "end": 1280},
+        "span_start": 1024,
+        "span_end": 1280,
         "snippet": "Raft achieves consensus by electing a leader...",
         "scores": {
-          "bm25": {"score": 12.34, "rank": 1},
-          "vector": {"score": 0.87, "rank": 3},
-          "fused": {"score": 0.0318, "rank": 1}
-        },
-        "context_window": []
+          "bm25": { "score": 12.34, "rank": 1 },
+          "vector": { "score": 0.87, "rank": 3 },
+          "fused": { "score": 0.0318, "rank": 1 }
+        }
       }
     ]
   },
   "next_actions": [
-    {"action": "shiro explain <result_id>", "description": "Explain why this result matched"},
-    {"action": "shiro list", "description": "List all documents"}
+    { "command": "shiro explain <result_id>", "description": "Explain why this result matched" }
   ]
 }
 ```
 
-Read the full document:
+Follow a hit to its source, or ask why it ranked where it did:
 
 ```bash
-shiro read d:9f8e7d
+shiro read blk_a1b2c3...          # read the exact block
+shiro read doc_9f8e7d --view outline
+shiro explain res_a1b2c3d4e5f67890
 ```
 
-Explain how a result was scored:
+Every response ends in `next_actions`, so an agent can walk the tool without reading this file.
 
-```bash
-shiro explain r:a1b2c3
-```
+## How it works
 
-```json
-{
-  "ok": true,
-  "result": {
-    "result_id": "res_a1b2c3d4e5f67890",
-    "query": "distributed consensus",
-    "query_digest": "blake3:3a7f...",
-    "fts_generation": 7,
-    "doc_id": "d:9f8e7d",
-    "block_idx": 4,
-    "block_kind": "PARAGRAPH",
-    "scores": {
-      "bm25": {"score": 12.34, "rank": 1},
-      "vector": {"score": 0.87, "rank": 3},
-      "fused": {"score": 0.0318, "rank": 1}
-    },
-    "retrieval_trace": {
-      "pipeline": "hybrid",
-      "stages": ["tokenize", "bm25_rank", "embed_query", "vector_rank", "rrf_fusion"],
-      "fusion": {"method": "rrf", "k": 60}
-    }
-  },
-  "next_actions": [...]
-}
-```
+<p align="center">
+  <img src="docs/diagrams/architecture.png" width="900"
+       alt="The JSON CLI and MCP server both call shiro-sdk, which writes canonical records to SQLite in shiro-store and queries the derived Tantivy and vector indices in shiro-index; those indices are rebuilt from canonical state, and parser and embedding providers sit outside a port boundary defined by shiro-core.">
+</p>
 
-## Search and Retrieval
+Three claims the diagram makes:
 
-Shiro search returns block-level results. Each hit identifies the exact block within a document (`block_idx`, `block_kind`) and byte span, along with per-source scores and a fused ranking. Markdown and PDF content remains the source material; SQLite is the authoritative store; search indices and vector embeddings are derived artifacts that can be rebuilt at any time.
+1. **Both interfaces are thin.** The CLI and the MCP server are adapters over one SDK surface, so they cannot drift apart in behavior.
+2. **SQLite is the only truth.** Search indices are derived artifacts. Delete them and `shiro reindex` rebuilds them from canonical state.
+3. **Providers live outside a port boundary.** Parsers, embedders, and rerankers reach the core only through traits declared in `shiro-core`.
 
-### Retrieval modes
+Documents move through `STAGED → INDEXING → READY`, and only `READY` documents are searchable. Indices are published by generation: a build lands in a staging directory and is promoted by an atomic rename, so a crashed build never leaves a half-written index in place.
 
-| Mode | Flag | Behavior |
-|------|------|----------|
-| **Hybrid** (default) | `--mode hybrid` | BM25 + vector search, merged via Reciprocal Rank Fusion (k=60). Falls back to BM25-only when no embedder is configured. |
-| **BM25** | `--mode bm25` | Keyword search only, even when embeddings are available. |
-| **Vector** | `--mode vector` | Semantic similarity only. Requires a configured embedding provider. |
+Nine crates:
 
-### Reranking
+| Crate | Role |
+|-------|------|
+| `shiro-core` | Domain types, IDs, errors, invariants, and the `Parser` / `Embedder` / `VectorIndex` / `Reranker` traits |
+| `shiro-store` | SQLite persistence, document lifecycle, provenance, proposals, BlockGraph storage |
+| `shiro-index` | Tantivy BM25 and FlatIndex vector search, generation tracking, staging and promote |
+| `shiro-parse` | Markdown, PDF, and plaintext parsers |
+| `shiro-docling` | Docling subprocess adapter for structured PDF |
+| `shiro-embed` | HTTP embedder for OpenAI-compatible endpoints, plus deterministic test doubles |
+| `shiro-fastembed` | FastEmbed adapter — local ONNX embeddings and cross-encoder reranking |
+| `shiro-sdk` | Operation registry, DSL interpreter, RRF fusion, retrieval orchestration |
+| `shiro-cli` | CLI entry point and MCP server |
 
-Add `--rerank` to apply a cross-encoder model after fusion. Reranking re-scores the top-k fused candidates and re-sorts by cross-encoder relevance, improving precision on the final result set.
+The diagram source is [`docs/diagrams/architecture.html`](docs/diagrams/architecture.html). Design rationale lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and 40 ADRs under [`docs/adr/`](docs/adr).
 
-```bash
-shiro search "error handling in async Rust" --rerank
-```
+## Commands
 
-Reranking is optional and non-fatal — if the reranker fails to initialize, search falls back to RRF order.
+Twenty-one commands. Run `shiro` with no arguments to get the same list as JSON.
 
-### Context expansion
+| Command | Purpose |
+|---------|---------|
+| `init` | Initialize a shiro data directory |
+| `add` | Add one file (parse, index, activate) |
+| `acquire-url` | Safely acquire and ingest a bounded remote source |
+| `ingest` | Batch-ingest documents from directories |
+| `search` | Search indexed documents |
+| `search-pack` | Run several queries and deduplicate evidence handles |
+| `read` | Read document content by ID, evidence handle, or title |
+| `explain` | Explain why a search result matched |
+| `list` / `remove` | List or delete documents |
+| `enrich` | Run heuristic enrichment (title, summary, tags) |
+| `enrich-model` | Manage attributed, reversible model-enrichment proposals |
+| `taxonomy` | Manage SKOS-style concepts and assignments |
+| `config` | Show, get, or set configuration |
+| `doctor` | Run diagnostic checks on the library |
+| `reindex` | Rebuild indices from stored segments |
+| `reprocess` | Plan or execute bounded scoped reprocessing |
+| `benchmark` | Run a judged retrieval benchmark and rebuild-integrity check |
+| `capabilities` | Describe shiro's capabilities as structured JSON |
+| `mcp` | Start the MCP JSON-RPC server over stdio |
+| `completions` | Generate shell completions |
 
-Use `--expand` to include surrounding blocks for richer context:
+Global options apply everywhere: `--home <path>` (defaults to `~/.shiro`) and `--log-level silent|error|warn|info|debug` (logs go to stderr, never stdout).
 
-```bash
-shiro search "error handling" --expand
-```
+Full flag reference, response shapes, exit codes, and the `E_*` error catalogue: [`docs/CLI.md`](docs/CLI.md).
 
-Context expansion defaults to `max_blocks=12` and `max_chars=8000`. When enabled, each result includes a `context_window` field with the expanded text from the document's BlockGraph reading order.
+## Retrieval
 
-### Scoring
+Three modes, selected with `--mode`:
 
-Every result carries a `scores` object with per-source contributions:
+| Mode | Behavior |
+|------|----------|
+| `hybrid` *(default)* | BM25 and vector results merged with Reciprocal Rank Fusion (k=60). Falls back to BM25 alone when no embedder is configured. |
+| `bm25` | Keyword search only, even when embeddings are available. |
+| `vector` | Semantic similarity only. Requires a configured embedding provider. |
 
-| Field | Present when | Description |
-|-------|-------------|-------------|
-| `bm25.score` / `bm25.rank` | BM25 active | Raw Tantivy BM25 relevance score and rank |
-| `vector.score` / `vector.rank` | Vector active | Cosine similarity score and rank from FlatIndex |
-| `fused.score` / `fused.rank` | Always | RRF-merged score across active sources |
-| `reranker.score` / `reranker.rank` | `--rerank` | Cross-encoder relevance score and final rank |
+Add `--rerank` to re-score the top fused candidates with a cross-encoder. Reranking is non-fatal: if the model fails to load, results fall back to RRF order.
 
-Scores are **ordinal within a single result set** — they are not calibrated probabilities and cannot be compared across queries or index generations.
+Add `--expand` to attach surrounding blocks from the document's reading order (`--max-blocks`, default 12; `--max-chars`, default 8000).
 
-### Example: hybrid search with reranking
+Every hit carries a `scores` object with `bm25`, `vector`, `fused`, and — under `--rerank` — `reranker` entries, each with a score and a rank. **Scores are ordinal within one result set.** They are not calibrated probabilities and mean nothing across queries or index generations.
 
-```bash
-shiro search "distributed consensus" --rerank | jq '.result.results[0].scores'
-```
-
-```json
-{
-  "bm25": {"score": 12.34, "rank": 1},
-  "vector": {"score": 0.87, "rank": 3},
-  "fused": {"score": 0.0318, "rank": 1},
-  "reranker": {"score": 0.95, "rank": 1}
-}
-```
-
-## Explainability
-
-Every search result can be explained:
-
-```bash
-shiro explain <result_id>
-```
-
-The response includes a `retrieval_trace` object describing the full scoring pipeline:
-
-- **pipeline** -- Which retrieval path was used (`hybrid`, `bm25`, or `vector`)
-- **stages** -- Ordered list of processing stages applied (e.g., `tokenize → bm25_rank → embed_query → vector_rank → rrf_fusion`)
-- **fusion** -- Fusion method and parameters when multiple sources contribute (`{"method": "rrf", "k": 60}`)
-
-Each source's contribution (BM25 rank, vector rank, reranker score) is recorded per result, enabling full audit of how candidates were ranked and merged.
-
-## Parsing and Adapters
-
-### Built-in parsers
-
-| Parser | Format | Technology |
-|--------|--------|------------|
-| `markdown` | `.md` files | [pulldown-cmark](https://github.com/raphlinus/pulldown-cmark) with BlockGraph IR |
-| `pdf` | `.pdf` files | [pdf-extract](https://crates.io/crates/pdf-extract) |
-| `plaintext` | `.txt` and other text | Paragraph-boundary segmentation |
-
-### Docling adapter (structured PDF)
-
-The `shiro-docling` crate provides a high-fidelity PDF parser that delegates to the [Docling](https://github.com/DS4SD/docling) Python library via subprocess. It extracts tables, figures, and reading order that basic PDF extraction misses.
-
-**Setup:**
-
-```bash
-pip install docling
-```
-
-**Usage:**
-
-```bash
-shiro add document.pdf --parser premium
-shiro ingest ./papers --parser premium
-```
-
-Docling requires the external `docling` Python binary to be available on `PATH`. The adapter communicates via subprocess, not network calls.
-
-## SKOS Taxonomy
-
-Shiro supports SKOS-style taxonomies for organizing documents by concept:
-
-```bash
-# Add a concept
-shiro taxonomy add "Machine Learning"
-
-# List all concepts
-shiro taxonomy list
-
-# Define relationships between concepts
-shiro taxonomy relations "Machine Learning" --broader "Computer Science"
-
-# Assign a concept to a document
-shiro taxonomy assign d:9f8e7d "Machine Learning"
-
-# Import a SKOS taxonomy file
-shiro taxonomy import taxonomy.ttl
-```
-
-## Enrichment
-
-Heuristic enrichment extracts metadata from document content:
-
-```bash
-shiro enrich d:9f8e7d
-```
-
-The heuristic provider analyzes content to extract:
-
-- **title** -- Derived from headings or first significant text
-- **summary** -- Condensed description of the document
-- **tags** -- Keywords extracted from content analysis
-
-Enrichment is heuristic-only; no external AI services are called.
-
-## Configuration
-
-Manage configuration with `shiro config`:
-
-```bash
-shiro config get search.limit
-shiro config set search.limit 20
-```
-
-Configuration is stored as TOML at `<shiro-home>/config.toml`.
-
-### Enabling local embeddings (FastEmbed)
-
-Set the embedding provider to `fastembed` to enable fully local vector search with no external service:
+### Enabling local embeddings
 
 ```bash
 shiro config set embed.provider fastembed
 shiro config set embed.model AllMiniLML6V2    # 384-dim, fast default
+shiro reindex                                 # build the vector index
 ```
 
-After configuring the embedder, build the vector index from existing documents:
+Changing `embed.model` invalidates every stored vector — different models produce incompatible vector spaces. Always run `shiro reindex` after changing it.
+
+Configuration is TOML at `<shiro-home>/config.toml`. Keys cover `search.*`, `embed.*`, and `rerank.*`; see [`docs/CLI.md`](docs/CLI.md) for the full table.
+
+## Parsers
+
+| Parser | Format | Backend |
+|--------|--------|---------|
+| `markdown` | `.md` | [pulldown-cmark](https://github.com/raphlinus/pulldown-cmark) |
+| `pdf` | `.pdf` | [pdf-extract](https://crates.io/crates/pdf-extract) |
+| `plaintext` | `.txt` and other text | Paragraph-boundary segmentation |
+| `docling` | `.pdf` | [Docling](https://github.com/DS4SD/docling) via Python subprocess |
+
+`--parser auto` (the default) picks by extension. Docling recovers tables, figures, and reading order that basic extraction loses; it needs `pip install docling` and the `docling` binary on `PATH`, and it talks over a subprocess rather than the network.
 
 ```bash
-shiro reindex    # rebuilds FTS index (always safe to run)
+shiro add paper.pdf --parser docling
+shiro ingest ./papers --parser docling
 ```
-
-**When you change the embedding model**, you must rebuild the vector index — vectors from different models live in incompatible spaces. Use `shiro reindex` after changing `embed.model`.
-
-### Configuration keys
-
-| Key | Type | Description |
-|-----|------|-------------|
-| `search.limit` | u32 | Maximum search results |
-| `embed.provider` | string | Embedding provider: `"fastembed"` (local ONNX) or `"http"` (OpenAI-compatible endpoint) |
-| `embed.model` | string | Embedding model name (e.g., `AllMiniLML6V2`, `BGEBaseENV15`, `NomicEmbedTextV15`) |
-| `embed.base_url` | string | Base URL for HTTP provider (e.g., `http://localhost:11434/v1`) |
-| `embed.dimensions` | usize | Expected embedding dimensions (auto-detected for FastEmbed) |
-| `embed.api_key` | string | API key for HTTP provider |
-| `embed.cache_dir` | string | Directory for cached ONNX models (FastEmbed) |
-| `rerank.provider` | string | Reranker provider: `"fastembed"` |
-| `rerank.model` | string | Reranker model name (default: `BGERerankerBase`) |
-| `rerank.top_k` | usize | Number of candidates to rerank |
-
-The embedding and reranking boundaries are **provider-agnostic**: any implementation of the `Embedder` / `Reranker` traits works. FastEmbed is the first practical local implementation; the HTTP adapter supports Ollama, llama.cpp, vLLM, or any OpenAI-compatible embedding endpoint.
 
 ## Code Mode (MCP)
 
-Shiro exposes a [Model Context Protocol](https://modelcontextprotocol.io) server over stdio with exactly two tools:
+`shiro mcp` starts a [Model Context Protocol](https://modelcontextprotocol.io) server over stdio that exposes exactly two tools:
 
-| Tool | Purpose |
-|------|---------|
-| `shiro.search` | Discover SDK operations, schemas, and examples |
-| `shiro.execute` | Run a DSL program against the knowledge base |
+- **`shiro.search`** — discover SDK operations, their schemas, and examples.
+- **`shiro.execute`** — run a program in a small deterministic DSL (`let`, `call`, `if`, `for_each`, `return`).
 
-Start the MCP server:
-
-```bash
-shiro mcp
-```
-
-### DSL
-
-The `shiro.execute` tool accepts a program written in a small deterministic DSL with these statements:
-
-| Statement | Description |
-|-----------|-------------|
-| `let` | Bind a variable to a call result |
-| `call` | Invoke an SDK operation |
-| `if` | Conditional branching |
-| `for_each` | Iterate over a collection |
-| `return` | Produce the program output |
-
-### Limits
-
-| Limit | Value |
-|-------|-------|
-| Max steps | 200 |
-| Max iterations | 100 |
-| Max output bytes | 1 MiB |
-| Timeout | 30s |
-
-### Example program
-
-Search, read the top hit, and return a summary:
+Two tools instead of twenty keeps the agent's tool list small; the DSL lets it compose several operations into one round trip.
 
 ```json
 {
   "program": [
     {"type": "let", "name": "results", "call": {"op": "search", "params": {"query": "error handling", "limit": 3}}},
-    {"type": "let", "name": "top_hit", "call": {"op": "read", "params": {"id": "$results.hits.0.doc_id"}}},
-    {"type": "return", "value": {"query": "$results.query", "title": "$top_hit.title", "content": "$top_hit.content"}}
+    {"type": "let", "name": "top", "call": {"op": "read", "params": {"id": "$results.hits.0.doc_id"}}},
+    {"type": "return", "value": {"title": "$top.title", "content": "$top.content"}}
   ]
 }
 ```
 
-### Guarantees
+Programs run under hard limits — 200 steps, 100 iterations, 1 MiB of output, 30 seconds — and cannot execute arbitrary code. Details in [`docs/MCP.md`](docs/MCP.md).
 
-- **Two tools only** -- `shiro.search` and `shiro.execute`
-- **Typed SDK** -- All operations backed by schemars-derived JSON Schemas
-- **Deterministic outputs** -- Search results are scored and name-sorted
-- **Strict validation** -- Unknown fields rejected, all inputs schema-checked
-- **Stable error codes** -- Every error maps to an `E_*` code
-- **Safe execution** -- No arbitrary code; hard limits on steps, iterations, bytes, and time
+## Benchmarks
 
-## Project Status
+```bash
+shiro benchmark benchmarks/my-corpus.json
+```
 
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Markdown parsing | Stable | pulldown-cmark with BlockGraph IR |
-| PDF parsing | Stable | pdf-extract with loss detection |
-| Docling adapter | Stable | Structured PDF via Python subprocess (`pip install docling`) |
-| Plain text indexing | Stable | Paragraph-boundary segmentation |
-| BM25 full-text search | Stable | Tantivy engine, block-level results |
-| Hybrid search | Stable | RRF fusion (k=60) merging BM25 + vector; graceful fallback to BM25-only |
-| Vector embedding | Stable | FlatIndex (cosine, JSONL-persisted) with FastEmbed (local ONNX) and HTTP adapters |
-| Reranking | Stable | Post-fusion cross-encoder reranking via FastEmbed (`--rerank`) |
-| JSON / HATEOAS layer | Stable | Structured output with `next_actions` on every response |
-| SKOS taxonomy | Implemented | Add, list, relations, assign, import |
-| Completions | Implemented | Shell completions generation |
-| Enrichment | Heuristic-only | Title, summary, tags from content analysis |
-| MCP server | Code Mode | Stdio JSON-RPC 2.0 with DSL interpreter |
-| BlockGraph persistence | Stable | First-class stored representation (store schema v6) |
-| Context expansion | Stable | `--expand` with configurable max_blocks and max_chars |
-| Processing fingerprints | Stable | BLAKE3-based dedup on every add/ingest |
+Runs a versioned, adjudicated corpus manifest through every declared retrieval control plus a mandatory rebuild-integrity check, reporting Recall@50, Precision/Recall/MRR/nDCG@10, paired bootstrap confidence intervals, p50/p95/p99 latency, RSS, explain completeness, and ranking determinism.
 
-## Architecture
+Small fixtures and mismatched hardware are reported as `insufficient_evidence` rather than passes. The manifest contract is in [`benchmarks/README.md`](benchmarks/README.md).
 
-Shiro is a Rust workspace with nine crates:
+## Documentation and help
 
-| Crate | Role |
-|-------|------|
-| `shiro-core` | Domain types, config, error handling, port traits (`Embedder`, `VectorIndex`, `Reranker`) |
-| `shiro-store` | SQLite persistence (schema v6), BlockGraph storage — the authoritative store |
-| `shiro-index` | Tantivy BM25 and FlatIndex vector search, generation tracking, staging/promote |
-| `shiro-parse` | Markdown, PDF, and plaintext parsers |
-| `shiro-docling` | Docling subprocess adapter for structured PDF |
-| `shiro-embed` | HttpEmbedder plus deterministic embedding test doubles |
-| `shiro-fastembed` | FastEmbed adapter — local ONNX embeddings and cross-encoder reranking |
-| `shiro-sdk` | Operation registry, DSL interpreter, RRF fusion, hybrid search orchestration |
-| `shiro-cli` | CLI entry point (16 commands), published to crates.io |
+| Resource | What's in it |
+|----------|--------------|
+| [`docs/CLI.md`](docs/CLI.md) | Output contract, every command and flag, exit codes, error codes |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | System shape, boundaries, invariants, cross-cutting concerns |
+| [`docs/adr/`](docs/adr) | 40 Architecture Decision Records with rationale and consequences |
+| [`docs/MCP.md`](docs/MCP.md) | Code Mode pattern, DSL grammar, execution limits |
+| [`benchmarks/README.md`](benchmarks/README.md) | Judged benchmark manifest contract |
+| [`CHANGELOG.md`](CHANGELOG.md) | Release history |
 
-Embedding providers implement the `Embedder` trait; reranking providers implement the `Reranker` trait. No provider is architecturally privileged — switching providers requires re-embedding (vector spaces are incompatible across models).
+Start with `shiro doctor` when something looks wrong — it checks library health, index generations, missing fingerprints, and (with `--verify-vector`) embedding consistency. Failures come back as a stable `E_*` code you can look up in [`docs/CLI.md`](docs/CLI.md).
 
-For design decisions and ADRs, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Questions and bug reports: [GitHub Issues](https://github.com/sanurb/shiro/issues).
 
 ## Contributing
 
-Contributions that uphold speed, privacy, and structural integrity are welcome.
+Contributions that hold the line on speed, privacy, and structural integrity are welcome.
 
-1. Review the [Architecture](docs/ARCHITECTURE.md) for design patterns and ADRs.
-2. Review the [CLI Reference](docs/CLI.md) for the output contract.
-3. Ensure all changes pass the quality gate: `cargo test && cargo clippy`.
-4. Open a Pull Request with a clear description of the impact.
+```bash
+git clone https://github.com/sanurb/shiro.git
+cd shiro
+cargo test --workspace
+```
+
+Before opening a pull request:
+
+1. Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — the invariants there are constraints, not suggestions. Behavioral changes usually need an ADR in [`docs/adr/`](docs/adr).
+2. Read [`docs/CLI.md`](docs/CLI.md) if you touch output. The JSON envelope is a contract.
+3. Pass the gate: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test --workspace`. Git hooks run these via [lefthook](https://github.com/evilmartians/lefthook); `pnpm install` sets them up.
+4. Add a changeset (`pnpm changeset`) for anything user-visible. Releases are changeset-driven and `scripts/version-sync.sh` propagates the version into `Cargo.toml`.
+
+House rules worth knowing early: no `unwrap()` or `expect()` outside tests, `camino::Utf8PathBuf` instead of `std::path::PathBuf`, and nothing written to stdout except through the JSON envelope.
+
+## Maintainer
+
+Built and maintained by [David Urbano](https://github.com/sanurb).
 
 ## License
 
-Licensed under the MIT License. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
