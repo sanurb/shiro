@@ -1162,3 +1162,48 @@ fn contract_doctor_json() {
         }
     }
 }
+
+#[test]
+fn taxonomy_import_rebuilds_hierarchical_closure_once() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path().join("shiro-taxonomy-import");
+    let (stdout, code) = shiro(&home, &["init"]);
+    assert_eq!(code, 0, "init failed: {stdout}");
+
+    let taxonomy_file = tmp.path().join("taxonomy.json");
+    std::fs::write(
+        &taxonomy_file,
+        serde_json::to_vec(&serde_json::json!([
+            {
+                "scheme_uri": "urn:test:hierarchy",
+                "pref_label": "Systems",
+                "broader": [],
+                "narrower": [],
+                "related": []
+            },
+            {
+                "scheme_uri": "urn:test:hierarchy",
+                "pref_label": "Rust",
+                "broader": ["Systems"],
+                "narrower": [],
+                "related": []
+            }
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let (stdout, code) = shiro(
+        &home,
+        &["taxonomy", "import", taxonomy_file.to_str().unwrap()],
+    );
+    assert_eq!(code, 0, "taxonomy import failed: {stdout}");
+
+    let home = camino::Utf8Path::from_path(&home).unwrap();
+    let store = shiro_store::Store::open(&home.join("shiro.db")).unwrap();
+    let systems = shiro_core::ConceptId::new("urn:test:hierarchy", "Systems");
+    let rust = shiro_core::ConceptId::new("urn:test:hierarchy", "Rust");
+    assert_eq!(
+        store.get_concept_descendant_ids(&systems).unwrap(),
+        vec![rust]
+    );
+}

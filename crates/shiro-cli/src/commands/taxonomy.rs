@@ -204,6 +204,9 @@ pub fn run_import(home: &ShiroHome, file: &std::path::Path) -> Result<CmdOutput,
             relations_added += 1;
         }
     }
+    // Rebuild once after all relation writes. Rebuilding per edge would turn a
+    // bulk import into repeated full-graph scans as the taxonomy grows.
+    store.rebuild_closure()?;
     Ok(CmdOutput {
         result: serde_json::json!({
             "imported": created,

@@ -513,7 +513,7 @@ Assigns a concept to a document with optional confidence score.
 shiro taxonomy import <path>
 ```
 
-Imports concepts and relations from a SKOS JSON file. Expected format includes `broader`, `narrower`, and `related` relation arrays.
+Imports concepts and relations from a SKOS JSON file. Expected format includes `broader`, `narrower`, and `related` relation arrays. The transitive `concept_closure` table is rebuilt once after all relation writes. A closure rebuild scans the full hierarchy, so rebuilding once keeps bulk-import cost to one graph expansion instead of repeating it for every imported edge.
 
 ### Enrich
 

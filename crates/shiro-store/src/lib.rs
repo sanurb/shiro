@@ -1559,6 +1559,39 @@ impl Store {
         Ok(out)
     }
 
+    /// Return transitive descendants recorded for one broader concept.
+    ///
+    /// The concept itself is not included; callers that implement ancestor-or-self
+    /// matching must add the requested concept ID to their candidate set.
+    pub fn get_concept_descendant_ids(
+        &self,
+        ancestor_id: &ConceptId,
+    ) -> Result<Vec<ConceptId>, ShiroError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT descendant_id FROM concept_closure
+                 WHERE ancestor_id = ?1
+                 ORDER BY depth, descendant_id",
+            )
+            .map_err(map_db)?;
+        let rows = statement
+            .query_map(rusqlite::params![ancestor_id.as_str()], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(map_db)?;
+        let mut descendant_ids = Vec::new();
+        for row in rows {
+            let descendant_id = row.map_err(map_db)?;
+            descendant_ids.push(ConceptId::from_stored(descendant_id).map_err(|error| {
+                ShiroError::StoreCorrupt {
+                    message: format!("invalid descendant concept ID in closure: {error}"),
+                }
+            })?);
+        }
+        Ok(descendant_ids)
+    }
+
     /// Rebuild the transitive closure table from BROADER edges.
     ///
     /// Uses iterative BFS: repeatedly join concept_relations (BROADER)
@@ -3022,6 +3055,10 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM concept_closure", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 3); // Animal>Mammal, Mammal>Dog, Animal>Dog
+        assert_eq!(
+            store.get_concept_descendant_ids(&animal.id).unwrap(),
+            vec![mammal.id.clone(), dog.id.clone()]
+        );
 
         // Animal is ancestor of Dog at depth 2
         let depth: i64 = store
