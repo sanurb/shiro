@@ -39,11 +39,42 @@ pub struct FlatIndex {
 }
 
 impl FlatIndex {
+    /// Snapshot entries for immutable-generation reuse during incremental publication.
+    ///
+    /// This deliberately exposes owned vectors only at the publication boundary;
+    /// search paths continue to borrow the in-memory index without cloning.
+    pub fn snapshot_entries(&self) -> Result<Vec<(String, String, Vec<f32>)>, ShiroError> {
+        let entries = self.entries.read().map_err(|_| ShiroError::IndexBuildVec {
+            message: "vector index read lock poisoned".to_string(),
+        })?;
+        let mut snapshot = entries
+            .values()
+            .map(|entry| {
+                (
+                    entry.segment_id.as_str().to_string(),
+                    entry.doc_id.as_str().to_string(),
+                    entry.embedding.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        snapshot.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(snapshot)
+    }
+
     /// Open (or create) a flat index backed by the given JSONL file.
     ///
     /// If the file exists, entries are loaded. Malformed lines are logged and
     /// skipped — the index starts with whatever could be parsed.
     pub fn open(dims: usize, data_path: Utf8PathBuf) -> Result<Self, ShiroError> {
+        Self::open_generation(dims, data_path, 0)
+    }
+
+    /// Open one immutable generation of the flat index.
+    pub fn open_generation(
+        dims: usize,
+        data_path: Utf8PathBuf,
+        generation: u64,
+    ) -> Result<Self, ShiroError> {
         let mut entries = HashMap::new();
 
         if data_path.as_std_path().is_file() {
@@ -141,7 +172,7 @@ impl FlatIndex {
             dims,
             data_path,
             entries: RwLock::new(entries),
-            gen_id: 0,
+            gen_id: generation,
             checksum: RwLock::new(None),
             stored_fingerprint: RwLock::new(stored_fingerprint),
         })
@@ -155,6 +186,16 @@ impl FlatIndex {
     pub fn open_compatible(
         dims: usize,
         data_path: Utf8PathBuf,
+        active_fingerprint: &EmbeddingFingerprint,
+    ) -> Result<Self, ShiroError> {
+        Self::open_generation_compatible(dims, data_path, 0, active_fingerprint)
+    }
+
+    /// Open one vector generation and enforce fingerprint compatibility.
+    pub fn open_generation_compatible(
+        dims: usize,
+        data_path: Utf8PathBuf,
+        generation: u64,
         active_fingerprint: &EmbeddingFingerprint,
     ) -> Result<Self, ShiroError> {
         let sidecar_path = fingerprint_path(&data_path);
@@ -186,7 +227,7 @@ impl FlatIndex {
             })?;
         }
 
-        let index = Self::open(dims, data_path)?;
+        let index = Self::open_generation(dims, data_path, generation)?;
         match index.stored_fingerprint() {
             Some(stored) if stored.fingerprint_hash == active_fingerprint.fingerprint_hash => {
                 Ok(index)
@@ -367,40 +408,6 @@ impl FlatIndex {
         index.set_fingerprint(fingerprint)?;
         Ok(index)
     }
-
-    /// Atomic rename from staging file to live file.
-    ///
-    /// If the live path already exists, it is removed first.
-    pub fn promote_staging(staging: &Utf8Path, live: &Utf8Path) -> Result<(), ShiroError> {
-        if live.as_std_path().exists() {
-            std::fs::remove_file(live.as_std_path()).map_err(|e| ShiroError::IndexBuildVec {
-                message: format!("failed to remove live file {live}: {e}"),
-            })?;
-        }
-        std::fs::rename(staging.as_std_path(), live.as_std_path()).map_err(|e| {
-            ShiroError::IndexBuildVec {
-                message: format!("failed to rename {staging} -> {live}: {e}"),
-            }
-        })?;
-        // Promote fingerprint sidecar if present.
-        let staging_fp = fingerprint_path(staging);
-        let live_fp = fingerprint_path(live);
-        if staging_fp.as_std_path().is_file() {
-            if live_fp.as_std_path().exists() {
-                std::fs::remove_file(live_fp.as_std_path()).map_err(|e| {
-                    ShiroError::IndexBuildVec {
-                        message: format!("failed to remove live fingerprint {live_fp}: {e}"),
-                    }
-                })?;
-            }
-            std::fs::rename(staging_fp.as_std_path(), live_fp.as_std_path()).map_err(|e| {
-                ShiroError::IndexBuildVec {
-                    message: format!("failed to rename fingerprint {staging_fp} -> {live_fp}: {e}"),
-                }
-            })?;
-        }
-        Ok(())
-    }
 }
 
 fn fingerprint_path(data_path: &Utf8Path) -> Utf8PathBuf {
@@ -426,6 +433,10 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 }
 
 impl VectorIndex for FlatIndex {
+    fn generation_id(&self) -> u64 {
+        self.gen_id
+    }
+
     fn embedding_fingerprint(&self) -> Result<Option<EmbeddingFingerprint>, ShiroError> {
         self.stored_fingerprint
             .read()
@@ -866,50 +877,6 @@ mod tests {
     }
 
     #[test]
-    fn test_promote_staging() {
-        let dir = TempDir::new().unwrap();
-        let staging = test_path_named(&dir, "staging.jsonl");
-        let live = test_path_named(&dir, "live.jsonl");
-
-        // Build at staging path
-        let entries = vec![(
-            "seg_x".to_string(),
-            "doc_d".to_string(),
-            vec![1.0, 0.0, 0.0],
-        )];
-        FlatIndex::build_at(3, staging.clone(), &entries, 5).unwrap();
-        assert!(staging.as_std_path().exists());
-
-        FlatIndex::promote_staging(&staging, &live).unwrap();
-        assert!(!staging.as_std_path().exists());
-        assert!(live.as_std_path().exists());
-
-        let idx = FlatIndex::open(3, live).unwrap();
-        assert_eq!(idx.count().unwrap(), 1);
-    }
-
-    #[test]
-    fn test_promote_staging_overwrites_live() {
-        let dir = TempDir::new().unwrap();
-        let staging = test_path_named(&dir, "staging.jsonl");
-        let live = test_path_named(&dir, "live.jsonl");
-
-        // Create live with old data
-        let old = vec![("seg_old".to_string(), "doc_o".to_string(), vec![0.0, 1.0])];
-        FlatIndex::build_at(2, live.clone(), &old, 1).unwrap();
-
-        // Create staging with new data
-        let new_entries = vec![("seg_new".to_string(), "doc_n".to_string(), vec![1.0, 0.0])];
-        FlatIndex::build_at(2, staging.clone(), &new_entries, 2).unwrap();
-
-        FlatIndex::promote_staging(&staging, &live).unwrap();
-        let idx = FlatIndex::open(2, live).unwrap();
-        assert_eq!(idx.count().unwrap(), 1);
-        let r = idx.search(&[1.0, 0.0], 1).unwrap();
-        assert_eq!(r[0].segment_id.as_str(), "seg_new");
-    }
-
-    #[test]
     fn test_checksum_after_flush() {
         let dir = TempDir::new().unwrap();
         let idx = FlatIndex::open(2, test_path(&dir)).unwrap();
@@ -948,11 +915,6 @@ mod tests {
         // Tamper with the file
         std::fs::write(path.as_std_path(), b"tampered").unwrap();
         assert!(!idx.verify_checksum().unwrap());
-    }
-
-    fn test_path_named(dir: &TempDir, name: &str) -> Utf8PathBuf {
-        let p = dir.path().join(name);
-        Utf8PathBuf::try_from(p.to_path_buf()).expect("tempdir path should be valid UTF-8")
     }
 
     #[test]

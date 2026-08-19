@@ -4,9 +4,14 @@ use serde::{Deserialize, Serialize};
 use shiro_core::ShiroError;
 use shiro_store::Store;
 
+use super::search::SearchFilters;
+use crate::retrieval_policy::ResolvedSearchFilters;
+
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ListInput {
     pub limit: usize,
+    #[serde(default)]
+    pub filters: SearchFilters,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]

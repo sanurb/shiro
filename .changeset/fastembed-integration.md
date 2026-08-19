@@ -9,6 +9,7 @@ feat: production-ready FastEmbed integration with ADR-012 fingerprint enforcemen
 - Internalize fastembed model enums behind string-based config (ADR-011)
 - Schema v6: reranker_score/rank columns in search_results
 - Reranker stage in explain trace (ADR-014)
+- Bounded post-fusion candidate pool lets reranking promote results beyond the output limit
 - Fingerprint enforcement on vector index open in CLI
 - Hard errors on unknown model names (no silent fallbacks)
 - 11 new tests across 4 crates

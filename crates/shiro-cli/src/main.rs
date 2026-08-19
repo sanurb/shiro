@@ -73,6 +73,28 @@ enum Commands {
         parser: String,
     },
 
+    /// Safely acquire and ingest a bounded remote source.
+    AcquireUrl {
+        /// HTTPS URL for a PDF, Markdown, or UTF-8 text source.
+        url: String,
+
+        #[arg(long, value_enum, default_value = "auto")]
+        parser: AcquisitionParserArg,
+
+        #[arg(long, default_value_t = 52_428_800)]
+        max_bytes: usize,
+
+        #[arg(long, default_value_t = 30_000)]
+        timeout_ms: u64,
+
+        #[arg(long, default_value_t = 5)]
+        max_redirects: usize,
+
+        /// Permit unencrypted HTTP; HTTPS is required by default.
+        #[arg(long)]
+        allow_http: bool,
+    },
+
     /// Batch-ingest documents from directories.
     Ingest {
         /// Directories to scan.
@@ -133,14 +155,57 @@ enum Commands {
         doc: Option<String>,
     },
 
+    /// Run multiple queries and deduplicate stable evidence handles.
+    SearchPack {
+        /// Query strings to execute as one pack.
+        #[arg(required = true, num_args = 1..)]
+        queries: Vec<String>,
+
+        /// Search mode: hybrid, bm25, or vector.
+        #[arg(long, value_enum, default_value = "hybrid")]
+        mode: SearchModeArg,
+
+        /// Maximum candidates retained from each query.
+        #[arg(long, default_value_t = 10)]
+        per_query_limit: usize,
+
+        /// Maximum deduplicated evidence handles.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+
+        /// Include snippets and context blocks.
+        #[arg(long)]
+        include_content: bool,
+
+        /// Apply the configured reranker to each query.
+        #[arg(long)]
+        rerank: bool,
+
+        /// Restrict to documents with any matching tag.
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+
+        /// Restrict to documents assigned to any matching concept ID.
+        #[arg(long = "concept")]
+        concept_ids: Vec<String>,
+
+        /// Restrict to any matching document ID.
+        #[arg(long = "doc")]
+        document_ids: Vec<String>,
+    },
+
     /// Read document content.
     Read {
-        /// Document ID or title.
+        /// Document ID, evidence handle, or title.
         id: String,
 
         /// View mode: outline, text, or blocks.
         #[arg(long, value_enum, default_value = "text")]
         view: ReadView,
+
+        /// Read all blocks attributed to this one-based source page.
+        #[arg(long)]
+        page: Option<u32>,
     },
 
     /// Explain why a search result matched.
@@ -191,7 +256,11 @@ enum Commands {
     Capabilities,
 
     /// Start the MCP JSON-RPC server (reads from stdin, writes to stdout).
-    Mcp,
+    Mcp {
+        /// Permit write operations carrying explicit actor and approval IDs.
+        #[arg(long)]
+        allow_writes: bool,
+    },
 
     /// Manage SKOS-style taxonomy concepts.
     Taxonomy {
@@ -202,17 +271,84 @@ enum Commands {
     /// Rebuild FTS index from stored segments.
     Reindex,
 
+    /// Plan or execute bounded scoped reprocessing.
+    Reprocess {
+        /// Optional document IDs; empty selects every READY document.
+        #[arg(long = "doc")]
+        document_ids: Vec<String>,
+
+        /// Parser to apply to all selected source artifacts.
+        #[arg(long)]
+        parser: String,
+
+        /// Reprocessing target.
+        #[arg(long, value_enum, default_value = "all")]
+        target: ReprocessTargetArg,
+
+        /// Execute instead of returning a dry-run plan.
+        #[arg(long)]
+        execute: bool,
+
+        /// Publish vectors with the configured embedder.
+        #[arg(long)]
+        include_vector: bool,
+
+        /// Require this active verified manifest as the rollback point.
+        #[arg(long)]
+        resume_manifest_id: Option<String>,
+
+        #[arg(long, default_value_t = 100)]
+        max_documents: usize,
+
+        #[arg(long, default_value_t = 536_870_912)]
+        max_source_bytes: usize,
+
+        #[arg(long, default_value_t = 100_000)]
+        max_model_calls: usize,
+
+        #[arg(long, default_value_t = 32)]
+        embedding_batch_size: usize,
+    },
+
+    /// Run a versioned judged retrieval benchmark and rebuild-integrity check.
+    Benchmark {
+        /// Path to the benchmark manifest JSON.
+        manifest: camino::Utf8PathBuf,
+
+        /// Warmup executions per query and pipeline.
+        #[arg(long, default_value = "1")]
+        warmup_runs: usize,
+
+        /// Measured executions per query and pipeline.
+        #[arg(long, default_value = "3")]
+        measured_runs: usize,
+    },
+
     /// Generate shell completions.
     Completions {
         /// Target shell.
         shell: CompletionShell,
     },
 
-    /// Run enrichment on a document.
+    /// Run heuristic enrichment on a document.
     Enrich {
         /// Document ID or title.
         id: String,
     },
+
+    /// Manage attributed, reversible model-enrichment proposals.
+    EnrichModel {
+        #[command(subcommand)]
+        action: ModelEnrichmentAction,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum AcquisitionParserArg {
+    Auto,
+    Plaintext,
+    Markdown,
+    Pdf,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -220,6 +356,13 @@ enum SearchModeArg {
     Hybrid,
     Bm25,
     Vector,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ReprocessTargetArg {
+    Parse,
+    Derived,
+    All,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -252,6 +395,32 @@ enum ConfigAction {
         /// New value.
         value: String,
     },
+}
+
+#[derive(Subcommand)]
+enum ModelEnrichmentAction {
+    /// Store model output as an isolated PROPOSED record.
+    Propose {
+        /// JSON file matching ModelEnrichmentProposalInput.
+        #[arg(long)]
+        file: camino::Utf8PathBuf,
+    },
+    /// Explicitly promote or reject a proposal.
+    Resolve {
+        proposal_id: String,
+        #[arg(long, value_enum)]
+        action: ModelEnrichmentResolutionArg,
+        #[arg(long)]
+        actor: String,
+        #[arg(long)]
+        approval: String,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ModelEnrichmentResolutionArg {
+    Promote,
+    Reject,
 }
 
 #[derive(Subcommand)]
@@ -414,6 +583,31 @@ fn dispatch(cli: &Cli) -> Result<CmdOutput, ShiroError> {
             commands::add::run(&home, path, parser)
         }
 
+        Some(Commands::AcquireUrl {
+            url,
+            parser,
+            max_bytes,
+            timeout_ms,
+            max_redirects,
+            allow_http,
+        }) => {
+            let home = resolve_home(cli)?;
+            commands::acquire::run(
+                &home,
+                url,
+                match parser {
+                    AcquisitionParserArg::Auto => shiro_sdk::AcquisitionParser::Auto,
+                    AcquisitionParserArg::Plaintext => shiro_sdk::AcquisitionParser::Plaintext,
+                    AcquisitionParserArg::Markdown => shiro_sdk::AcquisitionParser::Markdown,
+                    AcquisitionParserArg::Pdf => shiro_sdk::AcquisitionParser::Pdf,
+                },
+                *max_bytes,
+                *timeout_ms,
+                *max_redirects,
+                *allow_http,
+            )
+        }
+
         Some(Commands::Ingest {
             dirs,
             max_files,
@@ -432,13 +626,20 @@ fn dispatch(cli: &Cli) -> Result<CmdOutput, ShiroError> {
             max_blocks,
             max_chars,
             rerank,
-            ..
+            tag,
+            concept,
+            doc,
         }) => {
             let home = resolve_home(cli)?;
             let m = match mode {
                 SearchModeArg::Hybrid => commands::search::SearchMode::Hybrid,
                 SearchModeArg::Bm25 => commands::search::SearchMode::Bm25,
                 SearchModeArg::Vector => commands::search::SearchMode::Vector,
+            };
+            let filters = shiro_sdk::SearchFilters {
+                tags: tag.iter().cloned().collect(),
+                concept_ids: concept.iter().cloned().collect(),
+                document_ids: doc.iter().cloned().collect(),
             };
             commands::search::run(
                 &home,
@@ -449,17 +650,53 @@ fn dispatch(cli: &Cli) -> Result<CmdOutput, ShiroError> {
                 *max_blocks,
                 *max_chars,
                 *rerank,
+                filters,
             )
         }
 
-        Some(Commands::Read { id, view }) => {
+        Some(Commands::SearchPack {
+            queries,
+            mode,
+            per_query_limit,
+            limit,
+            include_content,
+            rerank,
+            tags,
+            concept_ids,
+            document_ids,
+        }) => {
             let home = resolve_home(cli)?;
-            let m = match view {
-                ReadView::Text => commands::read::ReadMode::Text,
-                ReadView::Blocks => commands::read::ReadMode::Blocks,
-                ReadView::Outline => commands::read::ReadMode::Outline,
+            commands::search_pack::run(
+                &home,
+                commands::search_pack::SearchPackOptions {
+                    queries,
+                    mode: match mode {
+                        SearchModeArg::Hybrid => commands::search::SearchMode::Hybrid,
+                        SearchModeArg::Bm25 => commands::search::SearchMode::Bm25,
+                        SearchModeArg::Vector => commands::search::SearchMode::Vector,
+                    },
+                    per_query_limit: *per_query_limit,
+                    global_limit: *limit,
+                    include_content: *include_content,
+                    rerank: *rerank,
+                    tags,
+                    concept_ids,
+                    document_ids,
+                },
+            )
+        }
+        Some(Commands::Read { id, view, page }) => {
+            let home = resolve_home(cli)?;
+            let m = if page.is_some() {
+                commands::read::ReadMode::Page
+            } else {
+                match view {
+                    ReadView::Text => commands::read::ReadMode::Text,
+                    ReadView::Blocks => commands::read::ReadMode::Blocks,
+                    ReadView::Outline => commands::read::ReadMode::Outline,
+                }
             };
-            commands::read::run(&home, id, m)
+            commands::read::run(&home, id, m, *page)
         }
 
         Some(Commands::Explain { result_id }) => {
@@ -467,9 +704,21 @@ fn dispatch(cli: &Cli) -> Result<CmdOutput, ShiroError> {
             commands::explain::run(&home, result_id)
         }
 
-        Some(Commands::List { limit, .. }) => {
+        Some(Commands::List {
+            limit,
+            tag,
+            concept,
+        }) => {
             let home = resolve_home(cli)?;
-            commands::list::run(&home, *limit)
+            commands::list::run(
+                &home,
+                *limit,
+                shiro_sdk::SearchFilters {
+                    tags: tag.iter().cloned().collect(),
+                    concept_ids: concept.iter().cloned().collect(),
+                    document_ids: Vec::new(),
+                },
+            )
         }
 
         Some(Commands::Remove { id, purge }) => {
@@ -496,9 +745,9 @@ fn dispatch(cli: &Cli) -> Result<CmdOutput, ShiroError> {
             commands::capabilities::run(&home)
         }
 
-        Some(Commands::Mcp) => {
+        Some(Commands::Mcp { allow_writes }) => {
             let home = resolve_home(cli)?;
-            commands::mcp::run(home)
+            commands::mcp::run(home, *allow_writes)
         }
 
         Some(Commands::Taxonomy { action }) => {
@@ -557,6 +806,49 @@ fn dispatch(cli: &Cli) -> Result<CmdOutput, ShiroError> {
             commands::reindex::run(&home)
         }
 
+        Some(Commands::Reprocess {
+            document_ids,
+            parser,
+            target,
+            execute,
+            include_vector,
+            resume_manifest_id,
+            max_documents,
+            max_source_bytes,
+            max_model_calls,
+            embedding_batch_size,
+        }) => {
+            let home = resolve_home(cli)?;
+            commands::reprocess::run(
+                &home,
+                commands::reprocess::ReprocessOptions {
+                    document_ids,
+                    parser_name: parser,
+                    target: match target {
+                        ReprocessTargetArg::Parse => shiro_sdk::ReprocessTarget::Parse,
+                        ReprocessTargetArg::Derived => shiro_sdk::ReprocessTarget::Derived,
+                        ReprocessTargetArg::All => shiro_sdk::ReprocessTarget::All,
+                    },
+                    execute: *execute,
+                    include_vector: *include_vector,
+                    resume_manifest_id: resume_manifest_id.as_deref(),
+                    max_documents: *max_documents,
+                    max_source_bytes: *max_source_bytes,
+                    max_model_calls: *max_model_calls,
+                    embedding_batch_size: *embedding_batch_size,
+                },
+            )
+        }
+
+        Some(Commands::Benchmark {
+            manifest,
+            warmup_runs,
+            measured_runs,
+        }) => {
+            let home = resolve_home(cli)?;
+            commands::benchmark::run(&home, manifest, *warmup_runs, *measured_runs)
+        }
+
         Some(Commands::Completions { .. }) => {
             // Handled in main() before dispatch — should never reach here.
             unreachable!("completions handled before dispatch")
@@ -565,6 +857,34 @@ fn dispatch(cli: &Cli) -> Result<CmdOutput, ShiroError> {
         Some(Commands::Enrich { id }) => {
             let home = resolve_home(cli)?;
             commands::enrich::run(&home, id)
+        }
+
+        Some(Commands::EnrichModel { action }) => {
+            let home = resolve_home(cli)?;
+            match action {
+                ModelEnrichmentAction::Propose { file } => {
+                    commands::model_enrichment::run_propose(&home, file)
+                }
+                ModelEnrichmentAction::Resolve {
+                    proposal_id,
+                    action,
+                    actor,
+                    approval,
+                } => commands::model_enrichment::run_resolve(
+                    &home,
+                    proposal_id,
+                    match action {
+                        ModelEnrichmentResolutionArg::Promote => {
+                            shiro_sdk::ModelEnrichmentResolutionAction::Promote
+                        }
+                        ModelEnrichmentResolutionArg::Reject => {
+                            shiro_sdk::ModelEnrichmentResolutionAction::Reject
+                        }
+                    },
+                    actor,
+                    approval,
+                ),
+            }
         }
     }
 }
@@ -578,8 +898,10 @@ fn command_name(cli: &Cli) -> &'static str {
         None => "shiro",
         Some(Commands::Init) => "shiro init",
         Some(Commands::Add { .. }) => "shiro add",
+        Some(Commands::AcquireUrl { .. }) => "shiro acquire-url",
         Some(Commands::Ingest { .. }) => "shiro ingest",
         Some(Commands::Search { .. }) => "shiro search",
+        Some(Commands::SearchPack { .. }) => "shiro search-pack",
         Some(Commands::Read { .. }) => "shiro read",
         Some(Commands::Explain { .. }) => "shiro explain",
         Some(Commands::List { .. }) => "shiro list",
@@ -587,11 +909,14 @@ fn command_name(cli: &Cli) -> &'static str {
         Some(Commands::Doctor { .. }) => "shiro doctor",
         Some(Commands::Config { .. }) => "shiro config",
         Some(Commands::Capabilities) => "shiro capabilities",
-        Some(Commands::Mcp) => "shiro mcp",
+        Some(Commands::Mcp { .. }) => "shiro mcp",
         Some(Commands::Taxonomy { .. }) => "shiro taxonomy",
         Some(Commands::Reindex) => "shiro reindex",
+        Some(Commands::Reprocess { .. }) => "shiro reprocess",
+        Some(Commands::Benchmark { .. }) => "shiro benchmark",
         Some(Commands::Completions { .. }) => "shiro completions",
         Some(Commands::Enrich { .. }) => "shiro enrich",
+        Some(Commands::EnrichModel { .. }) => "shiro enrich-model",
     }
 }
 

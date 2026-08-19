@@ -5,7 +5,7 @@
 //! - `shiro.execute` — run a DSL program (JSON AST) against the SDK.
 //!
 //! Transport: newline-delimited JSON over stdio.
-//! Protocol version: 2024-11-05.
+//! Protocol versions: 2026-07-28 (modern) plus legacy handshake compatibility.
 
 use crate::envelope::CmdOutput;
 use shiro_core::{ErrorCode, ShiroError};
@@ -14,8 +14,8 @@ use shiro_sdk::executor::ExecutorPorts;
 use std::io::{self, BufRead, Write};
 
 /// Entry point for `shiro mcp`.
-pub fn run(home: shiro_core::ShiroHome) -> Result<CmdOutput, ShiroError> {
-    run_server(home)?;
+pub fn run(home: shiro_core::ShiroHome, allow_writes: bool) -> Result<CmdOutput, ShiroError> {
+    run_server(home, allow_writes)?;
     Ok(CmdOutput {
         result: serde_json::json!({"status": "stopped"}),
         next_actions: vec![],
@@ -26,7 +26,7 @@ pub fn run(home: shiro_core::ShiroHome) -> Result<CmdOutput, ShiroError> {
 // Server loop
 // ---------------------------------------------------------------------------
 
-fn run_server(home: shiro_core::ShiroHome) -> Result<(), ShiroError> {
+fn run_server(home: shiro_core::ShiroHome, allow_writes: bool) -> Result<(), ShiroError> {
     let stdin = io::stdin();
     let stdout = io::stdout();
 
@@ -53,15 +53,20 @@ fn run_server(home: shiro_core::ShiroHome) -> Result<(), ShiroError> {
             .unwrap_or(serde_json::Value::Null);
         let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
-        let response = match method {
-            "initialize" => handle_initialize(id),
-            "notifications/initialized" => continue, // notification — no response
-            "tools/list" => handle_tools_list(id),
-            "tools/call" => {
-                let params = request.get("params");
-                handle_tools_call(id, params, &mut ctx, &home)
+        let response = if let Some(error) = validate_modern_request(&request, &id) {
+            error
+        } else {
+            match method {
+                "server/discover" => handle_discover(id),
+                "initialize" => handle_initialize(id, request.get("params")),
+                "notifications/initialized" => continue, // notification — no response
+                "tools/list" => handle_tools_list(id),
+                "tools/call" => {
+                    let params = request.get("params");
+                    handle_tools_call(id, params, &mut ctx, &home, allow_writes)
+                }
+                _ => jsonrpc_error(id, -32601, &format!("method not found: {method}")),
             }
-            _ => jsonrpc_error(id, -32601, &format!("method not found: {method}")),
         };
 
         let mut out = stdout.lock();
@@ -83,11 +88,74 @@ fn run_server(home: shiro_core::ShiroHome) -> Result<(), ShiroError> {
 // Method handlers
 // ---------------------------------------------------------------------------
 
-fn handle_initialize(id: serde_json::Value) -> serde_json::Value {
+fn validate_modern_request(
+    request: &serde_json::Value,
+    id: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let metadata = request.get("params").and_then(|params| params.get("_meta"));
+    let metadata = metadata?;
+    let requested = metadata
+        .get("io.modelcontextprotocol/protocolVersion")
+        .and_then(serde_json::Value::as_str);
+    let requested = requested?;
+    if requested != "2026-07-28" {
+        return Some(jsonrpc_error_data(
+            id.clone(),
+            -32022,
+            "Unsupported protocol version",
+            serde_json::json!({
+                "supported": ["2026-07-28", "2025-11-25", "2025-06-18", "2024-11-05"],
+                "requested": requested,
+            }),
+        ));
+    }
+    if metadata
+        .get("io.modelcontextprotocol/clientCapabilities")
+        .is_none()
+    {
+        return Some(jsonrpc_error(
+            id.clone(),
+            -32602,
+            "modern MCP requests require clientCapabilities in _meta",
+        ));
+    }
+    None
+}
+
+fn handle_discover(id: serde_json::Value) -> serde_json::Value {
     jsonrpc_ok(
         id,
         serde_json::json!({
-            "protocolVersion": "2024-11-05",
+            "supportedVersions": ["2026-07-28", "2025-11-25", "2025-06-18", "2024-11-05"],
+            "capabilities": { "tools": {} },
+            "instructions": "Use shiro.search for operation discovery, then shiro.execute. Writes require explicit host, actor, and approval authority.",
+            "cacheScope": "public",
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": {
+                    "name": "shiro",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }
+        }),
+    )
+}
+
+fn handle_initialize(
+    id: serde_json::Value,
+    params: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let requested = params
+        .and_then(|params| params.get("protocolVersion"))
+        .and_then(serde_json::Value::as_str);
+    let protocol_version = match requested {
+        Some("2024-11-05") => "2024-11-05",
+        Some("2025-06-18") => "2025-06-18",
+        _ => "2025-11-25",
+    };
+    jsonrpc_ok(
+        id,
+        serde_json::json!({
+            "protocolVersion": protocol_version,
             "capabilities": {
                 "tools": {}
             },
@@ -108,6 +176,7 @@ fn handle_tools_call(
     params: Option<&serde_json::Value>,
     ctx: &mut Option<ServerCtx>,
     home: &shiro_core::ShiroHome,
+    allow_writes: bool,
 ) -> serde_json::Value {
     let tool_name = params
         .and_then(|p| p.get("name"))
@@ -121,7 +190,7 @@ fn handle_tools_call(
 
     match tool_name {
         "shiro.search" => handle_search(id, &arguments),
-        "shiro.execute" => handle_execute(id, &arguments, ctx, home),
+        "shiro.execute" => handle_execute(id, &arguments, ctx, home, allow_writes),
         _ => jsonrpc_error(id, -32602, &format!("unknown tool: {tool_name}")),
     }
 }
@@ -164,7 +233,11 @@ fn handle_search(id: serde_json::Value, arguments: &serde_json::Value) -> serde_
     let results = shiro_sdk::spec::search_specs(query, limit);
     let serialized = serde_json::to_value(&results).unwrap_or_default();
 
-    tool_ok(id, &serialized.to_string())
+    tool_ok(
+        id,
+        &serialized.to_string(),
+        serde_json::json!({"results": serialized}),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +249,7 @@ fn handle_execute(
     arguments: &serde_json::Value,
     ctx: &mut Option<ServerCtx>,
     home: &shiro_core::ShiroHome,
+    allow_writes: bool,
 ) -> serde_json::Value {
     // Validate: program is required
     let program = match arguments.get("program") {
@@ -208,10 +282,16 @@ fn handle_execute(
         None => shiro_sdk::dsl::Limits::default(),
     };
 
+    let actor_id = arguments.get("actor_id").and_then(|value| value.as_str());
+    let approval_id = arguments
+        .get("approval_id")
+        .and_then(|value| value.as_str());
+    let run_id = shiro_core::RunId::generate();
+
     // Reject unknown fields
     if let Some(obj) = arguments.as_object() {
         for key in obj.keys() {
-            if key != "program" && key != "limits" {
+            if key != "program" && key != "limits" && key != "actor_id" && key != "approval_id" {
                 return tool_error(
                     id,
                     "E_INVALID_INPUT",
@@ -234,6 +314,36 @@ fn handle_execute(
     // cannot inherit failures from an unused embedding provider.
     let parser = MarkdownParser;
     let mut call_handler = |op: &str, params: &serde_json::Value| {
+        let is_write = shiro_sdk::spec::operation_authority(op) == "write";
+        if is_write && !allow_writes {
+            return Err(ShiroError::McpError {
+                message: format!(
+                    "write operation '{op}' requires host startup with --allow-writes"
+                ),
+            });
+        }
+        let actor = if is_write {
+            Some(
+                actor_id
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| ShiroError::McpError {
+                        message: format!("write operation '{op}' requires actor_id"),
+                    })?,
+            )
+        } else {
+            None
+        };
+        let approval = if is_write {
+            Some(
+                approval_id
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| ShiroError::McpError {
+                        message: format!("write operation '{op}' requires approval_id"),
+                    })?,
+            )
+        } else {
+            None
+        };
         let profile = runtime_profile_for_call(op, params);
         let engine = server_ctx.engine(profile)?;
         let ports = ExecutorPorts {
@@ -242,19 +352,55 @@ fn handle_execute(
             reranker: engine.reranker(),
         };
         let call = serde_json::json!({ "op": op, "params": params });
-        shiro_sdk::executor::execute_with_ports(
+        let params_digest = blake3::hash(params.to_string().as_bytes())
+            .to_hex()
+            .to_string();
+        if let (Some(actor), Some(approval)) = (actor, approval) {
+            engine.store.record_mcp_mutation(
+                run_id.as_str(),
+                actor,
+                approval,
+                op,
+                &params_digest,
+                "AUTHORIZED",
+            )?;
+        }
+        let result = shiro_sdk::executor::execute_with_ports(
             &engine.home,
             &engine.store,
             &engine.fts,
             &parser,
             ports,
             &call,
-        )
+        );
+        if let (Some(actor), Some(approval)) = (actor, approval) {
+            let outcome = if result.is_ok() {
+                "SUCCEEDED"
+            } else {
+                "FAILED"
+            };
+            engine.store.record_mcp_mutation(
+                run_id.as_str(),
+                actor,
+                approval,
+                op,
+                &params_digest,
+                outcome,
+            )?;
+        }
+        if is_write && result.is_ok() {
+            server_ctx.refresh_after_write()?;
+        }
+        result
     };
     match shiro_sdk::dsl::execute_program_with_call_handler(program, limits, &mut call_handler) {
         Ok(result) => {
             let serialized = serde_json::to_value(&result).unwrap_or_default();
-            tool_ok(id, &serialized.to_string())
+            tool_ok(
+                id,
+                &serialized.to_string(),
+                serde_json::json!({"result": serialized, "run_id": run_id.as_str()}),
+            )
         }
         Err(e) => {
             let code = ErrorCode::from_error(&e);
@@ -271,7 +417,8 @@ fn tools_list() -> serde_json::Value {
     serde_json::json!([
         {
             "name": "shiro.search",
-            "description": "Search the SDK spec registry to discover available operations, their parameters, schemas, and examples. Use this first to understand what operations are available.",
+            "description": "Search the SDK spec registry to discover available operations, their parameters, schemas, authority, and examples. Use this first to understand what operations are available.",
+            "annotations": { "readOnlyHint": true, "idempotentHint": true },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -288,11 +435,18 @@ fn tools_list() -> serde_json::Value {
                 },
                 "required": ["query"],
                 "additionalProperties": false
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": { "results": { "type": "array" } },
+                "required": ["results"],
+                "additionalProperties": false
             }
         },
         {
             "name": "shiro.execute",
-            "description": "Execute a DSL program against the SDK. Programs are JSON arrays of typed nodes: let, call, if, for_each, return. Use 'shiro.search' first to discover available operations.",
+            "description": "Execute a DSL program against the SDK. Programs are JSON arrays of typed nodes: let, call, if, for_each, return. Write-class operations require host --allow-writes plus actor_id and approval_id.",
+            "annotations": { "readOnlyHint": false },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -302,6 +456,14 @@ fn tools_list() -> serde_json::Value {
                         "items": {
                             "type": "object"
                         }
+                    },
+                    "actor_id": {
+                        "type": "string",
+                        "description": "Required actor identity when a write-class operation executes."
+                    },
+                    "approval_id": {
+                        "type": "string",
+                        "description": "Required host/policy approval reference when a write-class operation executes."
                     },
                     "limits": {
                         "type": "object",
@@ -316,6 +478,12 @@ fn tools_list() -> serde_json::Value {
                     }
                 },
                 "required": ["program"],
+                "additionalProperties": false
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": { "result": {}, "run_id": { "type": "string" } },
+                "required": ["result", "run_id"],
                 "additionalProperties": false
             }
         }
@@ -344,6 +512,15 @@ impl ServerCtx {
             vector_engine: None,
             full_engine: None,
         })
+    }
+
+    fn refresh_after_write(&mut self) -> Result<(), ShiroError> {
+        self.base_engine =
+            crate::runtime::open_engine(&self.home, crate::runtime::RuntimeProfile::Base)?;
+        self.rerank_engine = None;
+        self.vector_engine = None;
+        self.full_engine = None;
+        Ok(())
     }
 
     fn engine(
@@ -415,7 +592,7 @@ fn runtime_profile_for_call(
     op: &str,
     params: &serde_json::Value,
 ) -> crate::runtime::RuntimeProfile {
-    if op != "search" {
+    if op != "search" && op != "search_pack" {
         return crate::runtime::RuntimeProfile::Base;
     }
     let vector = params.get("mode").and_then(|mode| mode.as_str()) != Some("bm25");
@@ -435,7 +612,20 @@ fn runtime_profile_for_call(
 // JSON-RPC 2.0 helpers
 // ---------------------------------------------------------------------------
 
-fn jsonrpc_ok(id: serde_json::Value, result: serde_json::Value) -> serde_json::Value {
+fn jsonrpc_ok(id: serde_json::Value, mut result: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = result.as_object_mut() {
+        object
+            .entry("resultType")
+            .or_insert_with(|| serde_json::Value::String("complete".to_string()));
+        object.entry("_meta").or_insert_with(|| {
+            serde_json::json!({
+                "io.modelcontextprotocol/serverInfo": {
+                    "name": "shiro",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            })
+        });
+    }
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -451,12 +641,30 @@ fn jsonrpc_error(id: serde_json::Value, code: i32, message: &str) -> serde_json:
     })
 }
 
+fn jsonrpc_error_data(
+    id: serde_json::Value,
+    code: i32,
+    message: &str,
+    data: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": message, "data": data },
+    })
+}
+
 /// MCP tool success response (content array with text).
-fn tool_ok(id: serde_json::Value, text: &str) -> serde_json::Value {
+fn tool_ok(
+    id: serde_json::Value,
+    text: &str,
+    structured_content: serde_json::Value,
+) -> serde_json::Value {
     jsonrpc_ok(
         id,
         serde_json::json!({
             "content": [{"type": "text", "text": text}],
+            "structuredContent": structured_content,
             "isError": false,
         }),
     )

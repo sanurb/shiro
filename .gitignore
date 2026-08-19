@@ -71,3 +71,5 @@ yarn-error.log*
 # npm postinstall native binary (bin/shiro wrapper is checked in)
 /bin/shiro-native
 /.install-tmp/
+# Local research notes (not part of the published repo)
+docs/research/

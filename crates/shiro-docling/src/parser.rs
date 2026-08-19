@@ -25,7 +25,7 @@ use crate::translate;
 ///
 /// Bump when any output-affecting change is made to the translation layer,
 /// subprocess invocation, or post-processing logic (ADR-004).
-const ADAPTER_VERSION: u32 = 1;
+const ADAPTER_VERSION: u32 = 3;
 
 /// Structured PDF parser backed by the Docling CLI.
 ///

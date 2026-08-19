@@ -4,9 +4,13 @@ use crate::envelope::{CmdOutput, NextAction};
 use shiro_core::{ShiroError, ShiroHome};
 use shiro_store::Store;
 
-pub fn run(home: &ShiroHome, limit: usize) -> Result<CmdOutput, ShiroError> {
+pub fn run(
+    home: &ShiroHome,
+    limit: usize,
+    filters: shiro_sdk::SearchFilters,
+) -> Result<CmdOutput, ShiroError> {
     let store = Store::open(&home.db_path())?;
-    let input = shiro_sdk::ops::list::ListInput { limit };
+    let input = shiro_sdk::ops::list::ListInput { limit, filters };
     let output = shiro_sdk::ops::list::execute(&store, &input)?;
 
     let result = serde_json::json!({

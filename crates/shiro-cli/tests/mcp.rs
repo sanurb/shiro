@@ -8,12 +8,25 @@ use std::process::{Command, Stdio};
 
 /// Send JSON-RPC requests to `shiro mcp` and collect responses.
 fn mcp_roundtrip(home: &std::path::Path, requests: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    mcp_roundtrip_with_authority(home, requests, false)
+}
+
+fn mcp_roundtrip_with_authority(
+    home: &std::path::Path,
+    requests: &[serde_json::Value],
+    allow_writes: bool,
+) -> Vec<serde_json::Value> {
     let bin = env!("CARGO_BIN_EXE_shiro");
 
-    let mut child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .args(["--home", home.to_str().unwrap()])
         .args(["--log-level", "silent"])
-        .arg("mcp")
+        .arg("mcp");
+    if allow_writes {
+        command.arg("--allow-writes");
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -82,9 +95,33 @@ fn mcp_initialize_returns_protocol_version() {
     let r = &responses[0];
     assert_eq!(r["jsonrpc"], "2.0");
     assert_eq!(r["id"], 1);
-    assert_eq!(r["result"]["protocolVersion"], "2024-11-05");
+    assert_eq!(r["result"]["protocolVersion"], "2025-11-25");
     assert!(r["result"]["capabilities"]["tools"].is_object());
     assert_eq!(r["result"]["serverInfo"]["name"], "shiro");
+}
+
+#[test]
+fn mcp_modern_discovery_and_version_rejection_follow_current_protocol() {
+    let tmp = init_home();
+    let modern_meta = serde_json::json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1"}
+    });
+    let responses = mcp_roundtrip(
+        tmp.path(),
+        &[
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta": modern_meta}}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{
+                "io.modelcontextprotocol/protocolVersion": "1900-01-01",
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }}}),
+        ],
+    );
+    assert_eq!(responses[0]["result"]["resultType"], "complete");
+    assert_eq!(responses[0]["result"]["supportedVersions"][0], "2026-07-28");
+    assert_eq!(responses[1]["error"]["code"], -32022);
+    assert_eq!(responses[1]["error"]["data"]["supported"][0], "2026-07-28");
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +157,8 @@ fn mcp_tools_list_returns_two_tools() {
         );
         assert_eq!(tool["inputSchema"]["type"], "object");
         assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        assert!(tool["outputSchema"].is_object());
+        assert!(tool["annotations"].is_object());
     }
 }
 
@@ -227,6 +266,59 @@ fn mcp_execute_list_operation() {
     assert!(result["value"]["documents"].is_array());
     assert!(result["steps_executed"].as_u64().unwrap() >= 2);
     assert!(result["trace"].is_array());
+    assert!(r["result"]["structuredContent"]["result"].is_object());
+}
+
+#[test]
+fn mcp_execute_denies_writes_without_host_authority() {
+    let tmp = init_home();
+    let responses = mcp_roundtrip(
+        tmp.path(),
+        &[
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                "name": "shiro.execute",
+                "arguments": {
+                    "actor_id": "agent:test",
+                    "approval_id": "approval:test",
+                    "program": [
+                        {"type": "call", "op": "remove", "params": {"id": "doc_missing", "purge": false}}
+                    ]
+                }
+            }}),
+        ],
+    );
+
+    let result = &responses[1]["result"];
+    assert_eq!(result["isError"], true);
+    assert!(result["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("--allow-writes"));
+}
+
+#[test]
+fn mcp_execute_authorized_write_requires_actor_and_approval() {
+    let tmp = init_home();
+    let responses = mcp_roundtrip_with_authority(
+        tmp.path(),
+        &[
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                "name": "shiro.execute",
+                "arguments": {
+                    "actor_id": "agent:test",
+                    "approval_id": "approval:test",
+                    "program": [
+                        {"type": "call", "op": "reindex", "params": {}}
+                    ]
+                }
+            }}),
+        ],
+        true,
+    );
+
+    assert_eq!(responses[1]["result"]["isError"], false, "{}", responses[1]);
 }
 
 #[test]

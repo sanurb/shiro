@@ -8,8 +8,10 @@ use shiro_store::Store;
 const COMMANDS: &[&str] = &[
     "init",
     "add",
+    "acquire-url",
     "ingest",
     "search",
+    "search-pack",
     "read",
     "explain",
     "list",
@@ -20,22 +22,48 @@ const COMMANDS: &[&str] = &[
     "mcp",
     "taxonomy",
     "reindex",
+    "reprocess",
+    "benchmark",
     "completions",
     "enrich",
+    "enrich-model",
 ];
 
 /// Known parsers and their status.
 const PARSERS: &[&str] = &["plaintext", "markdown", "pdf", "docling"];
 
 pub fn run(home: &ShiroHome) -> Result<CmdOutput, ShiroError> {
-    let schema_version = Store::open(&home.db_path())
-        .and_then(|s| s.schema_version())
+    let store = Store::open(&home.db_path()).ok();
+    let schema_version = store
+        .as_ref()
+        .and_then(|store| store.schema_version().ok())
         .unwrap_or(0);
 
-    // Check what's actually available
-    let fts_available = home.tantivy_dir().as_std_path().is_dir();
-    let vector_available = home.vector_dir().as_std_path().is_dir()
-        && home.vector_dir().join("flat.jsonl").as_std_path().is_file();
+    // Check the exact generations selected by the authoritative pointers.
+    let fts_generation = store
+        .as_ref()
+        .and_then(|store| store.active_generation("fts").ok())
+        .map(|generation| generation.as_u64())
+        .unwrap_or(0);
+    let vector_generation = store
+        .as_ref()
+        .and_then(|store| store.active_generation("vector").ok())
+        .map(|generation| generation.as_u64())
+        .unwrap_or(0);
+    let vector_published = store
+        .as_ref()
+        .and_then(|store| store.active_corpus_manifest().ok().flatten())
+        .map(|manifest| manifest.vector_generation.is_some())
+        .unwrap_or(true);
+    let fts_available = home
+        .tantivy_generation_dir(fts_generation)
+        .as_std_path()
+        .is_dir();
+    let vector_available = vector_published
+        && home
+            .vector_data_path(vector_generation)
+            .as_std_path()
+            .is_file();
 
     let result = serde_json::json!({
         "schemaVersion": 2,
@@ -57,7 +85,8 @@ pub fn run(home: &ShiroHome) -> Result<CmdOutput, ShiroError> {
             "segment_id": { "prefix": "seg_",  "algorithm": "blake3(doc_id:index)" },
             "run_id":     { "prefix": "run_",  "algorithm": "timestamp" },
             "concept_id": { "prefix": "con_",  "algorithm": "blake3(scheme_uri:pref_label)" },
-            "result_id":  { "prefix": "res_",  "algorithm": "blake3(query:segment_id)[..16]" },
+            "result_id":  { "prefix": "res_",  "algorithm": "blake3(search_snapshot:segment_id)" },
+            "evidence_handle": { "prefix": "blk_", "algorithm": "blake3(doc_id:block_text:occurrence)" },
         },
         "parsers": PARSERS,
         "features": {

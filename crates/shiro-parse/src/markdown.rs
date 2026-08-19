@@ -1,7 +1,10 @@
 //! Markdown parser backed by `pulldown-cmark`.
 
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser as MdParser, Tag, TagEnd};
-use shiro_core::ir::{Block, BlockGraph, BlockIdx, BlockKind, Document, Edge, Metadata, Relation};
+use shiro_core::ir::{
+    derive_heading_containment_edges, Block, BlockGraph, BlockIdx, BlockKind, Document,
+    DocumentHeadingLevel, Edge, Metadata, Relation,
+};
 use shiro_core::ports::Parser;
 use shiro_core::{DocId, ShiroError, Span};
 
@@ -16,7 +19,7 @@ impl Parser for MarkdownParser {
     }
 
     fn version(&self) -> u32 {
-        1
+        2
     }
 
     fn parse(&self, source_uri: &str, content: &[u8]) -> Result<Document, ShiroError> {
@@ -125,9 +128,16 @@ fn extract_md_title(text: &str) -> Option<String> {
 // Block graph construction
 // ---------------------------------------------------------------------------
 
-/// Classify a pulldown-cmark heading level into a [`BlockKind`].
-fn heading_kind(_level: HeadingLevel) -> BlockKind {
-    BlockKind::Heading
+fn markdown_heading_level(level: HeadingLevel) -> Option<DocumentHeadingLevel> {
+    let level = match level {
+        HeadingLevel::H1 => 1,
+        HeadingLevel::H2 => 2,
+        HeadingLevel::H3 => 3,
+        HeadingLevel::H4 => 4,
+        HeadingLevel::H5 => 5,
+        HeadingLevel::H6 => 6,
+    };
+    DocumentHeadingLevel::new(level).ok()
 }
 
 /// Build a [`BlockGraph`] from Markdown source text.
@@ -142,15 +152,16 @@ fn build_block_graph(text: &str) -> BlockGraph {
         let (ref ev, ref range) = events[i];
         match ev {
             Event::Start(Tag::Heading { level, .. }) => {
-                let kind = heading_kind(*level);
                 let (block_text, end_idx) = collect_inline_text(&events, i);
                 let span = make_span(range.start, events[end_idx].1.end);
                 if let Some(span) = span {
                     blocks.push(Block {
                         canonical_text: block_text,
                         rendered_text: None,
-                        kind,
+                        kind: BlockKind::Heading,
+                        heading_level: markdown_heading_level(*level),
                         span,
+                        source_locators: Vec::new(),
                     });
                 }
                 i = end_idx + 1;
@@ -163,7 +174,9 @@ fn build_block_graph(text: &str) -> BlockGraph {
                         canonical_text: block_text,
                         rendered_text: None,
                         kind: BlockKind::Paragraph,
+                        heading_level: None,
                         span,
+                        source_locators: Vec::new(),
                     });
                 }
                 i = end_idx + 1;
@@ -176,7 +189,9 @@ fn build_block_graph(text: &str) -> BlockGraph {
                         canonical_text: block_text,
                         rendered_text: None,
                         kind: BlockKind::Code,
+                        heading_level: None,
                         span,
+                        source_locators: Vec::new(),
                     });
                 }
                 i = end_idx + 1;
@@ -189,7 +204,9 @@ fn build_block_graph(text: &str) -> BlockGraph {
                         canonical_text: block_text,
                         rendered_text: None,
                         kind: BlockKind::ListItem,
+                        heading_level: None,
                         span,
+                        source_locators: Vec::new(),
                     });
                 }
                 i = end_idx + 1;
@@ -210,6 +227,7 @@ fn build_block_graph(text: &str) -> BlockGraph {
             relation: Relation::ReadsBefore,
         });
     }
+    edges.extend(derive_heading_containment_edges(&blocks, &reading_order));
 
     BlockGraph {
         blocks,
@@ -279,6 +297,12 @@ mod tests {
         let blocks = &doc.blocks;
         assert_eq!(blocks.blocks.len(), 2);
         assert_eq!(blocks.blocks[0].kind, BlockKind::Heading);
+        assert_eq!(
+            blocks.blocks[0]
+                .heading_level
+                .map(DocumentHeadingLevel::as_u32),
+            Some(1)
+        );
         assert_eq!(blocks.blocks[0].canonical_text, "Title");
         assert_eq!(blocks.blocks[1].kind, BlockKind::Paragraph);
         assert_eq!(blocks.blocks[1].canonical_text, "Body text.");
@@ -313,9 +337,10 @@ mod tests {
 
         // One heading + two paragraphs = 3 segments.
         assert_eq!(segments.len(), 3);
-        assert_eq!(segments[0].body, "Heading");
+        assert_eq!(segments[0].body, "# Heading");
         assert_eq!(segments[1].body, "Paragraph one.");
         assert_eq!(segments[2].body, "Paragraph two.");
+        assert!(segments[1].retrieval_text.contains("Section: Heading"));
     }
 
     #[test]
@@ -383,14 +408,16 @@ mod tests {
     fn test_reads_before_edges_multi_block() {
         let graph = build_block_graph("# Heading\n\nParagraph one.\n\nParagraph two.");
         assert_eq!(graph.blocks.len(), 3);
-        assert_eq!(graph.edges.len(), 2);
-        for edge in &graph.edges {
-            assert!(matches!(edge.relation, Relation::ReadsBefore));
-        }
-        assert_eq!(graph.edges[0].from.0, 0);
-        assert_eq!(graph.edges[0].to.0, 1);
-        assert_eq!(graph.edges[1].from.0, 1);
-        assert_eq!(graph.edges[1].to.0, 2);
+        let reading_edges = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.relation == Relation::ReadsBefore)
+            .collect::<Vec<_>>();
+        assert_eq!(reading_edges.len(), 2);
+        assert_eq!(reading_edges[0].from.0, 0);
+        assert_eq!(reading_edges[0].to.0, 1);
+        assert_eq!(reading_edges[1].from.0, 1);
+        assert_eq!(reading_edges[1].to.0, 2);
         assert!(graph.validate(1000).is_empty());
     }
 
@@ -399,7 +426,14 @@ mod tests {
         let graph = build_block_graph("# A\n\nB\n\nC\n\nD");
         let n = graph.blocks.len();
         assert!(n > 1);
-        assert_eq!(graph.edges.len(), n - 1);
+        assert_eq!(
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.relation == Relation::ReadsBefore)
+                .count(),
+            n - 1
+        );
         assert!(graph.validate(1000).is_empty());
     }
 
@@ -444,17 +478,39 @@ mod tests {
         assert_eq!(graph.blocks[3].kind, BlockKind::Paragraph);
         assert_eq!(graph.blocks[3].canonical_text, "Second paragraph.");
 
-        // 3 ReadsBefore edges linking sequential blocks
-        assert_eq!(graph.edges.len(), 3);
-        for edge in &graph.edges {
-            assert_eq!(edge.relation, Relation::ReadsBefore);
-        }
-        assert_eq!(graph.edges[0].from, BlockIdx(0));
-        assert_eq!(graph.edges[0].to, BlockIdx(1));
-        assert_eq!(graph.edges[1].from, BlockIdx(1));
-        assert_eq!(graph.edges[1].to, BlockIdx(2));
-        assert_eq!(graph.edges[2].from, BlockIdx(2));
-        assert_eq!(graph.edges[2].to, BlockIdx(3));
+        // 3 ReadsBefore edges link sequential blocks.
+        let reading_edges = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.relation == Relation::ReadsBefore)
+            .collect::<Vec<_>>();
+        assert_eq!(reading_edges.len(), 3);
+        assert_eq!(reading_edges[0].from, BlockIdx(0));
+        assert_eq!(reading_edges[0].to, BlockIdx(1));
+        assert_eq!(reading_edges[1].from, BlockIdx(1));
+        assert_eq!(reading_edges[1].to, BlockIdx(2));
+        assert_eq!(reading_edges[2].from, BlockIdx(2));
+        assert_eq!(reading_edges[2].to, BlockIdx(3));
+
+        // Direct section containment preserves heading hierarchy separately.
+        let section_edges = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.relation == Relation::SectionContains)
+            .collect::<Vec<_>>();
+        assert_eq!(section_edges.len(), 3);
+        assert_eq!(
+            (section_edges[0].from, section_edges[0].to),
+            (BlockIdx(0), BlockIdx(1))
+        );
+        assert_eq!(
+            (section_edges[1].from, section_edges[1].to),
+            (BlockIdx(0), BlockIdx(2))
+        );
+        assert_eq!(
+            (section_edges[2].from, section_edges[2].to),
+            (BlockIdx(2), BlockIdx(3))
+        );
 
         // Reading order is sequential
         assert_eq!(

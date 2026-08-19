@@ -4,12 +4,66 @@ mod flat_vector_index;
 
 pub use flat_vector_index::FlatIndex;
 
+/// Compute a deterministic digest for one immutable index artifact.
+///
+/// Directory entries are ordered by relative UTF-8 path. Ephemeral lock files
+/// are excluded; every durable data and sidecar file is included.
+pub fn artifact_digest(path: &camino::Utf8Path) -> Result<String, ShiroError> {
+    fn collect_files(
+        root: &camino::Utf8Path,
+        current: &camino::Utf8Path,
+        files: &mut Vec<(String, camino::Utf8PathBuf)>,
+    ) -> Result<(), ShiroError> {
+        for entry in std::fs::read_dir(current.as_std_path())? {
+            let entry = entry?;
+            let path = camino::Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
+                ShiroError::IndexBuildFts {
+                    message: format!("index artifact path is not UTF-8: {}", path.display()),
+                }
+            })?;
+            if path.is_dir() {
+                collect_files(root, &path, files)?;
+            } else if path.extension() != Some("lock") {
+                let relative =
+                    path.strip_prefix(root)
+                        .map_err(|error| ShiroError::IndexBuildFts {
+                            message: format!("failed to relativize index artifact {path}: {error}"),
+                        })?;
+                files.push((relative.as_str().to_string(), path));
+            }
+        }
+        Ok(())
+    }
+
+    if path.is_file() {
+        let bytes = std::fs::read(path.as_std_path())?;
+        return Ok(blake3::hash(&bytes).to_hex().to_string());
+    }
+    if !path.is_dir() {
+        return Err(ShiroError::IndexBuildFts {
+            message: format!("index artifact does not exist: {path}"),
+        });
+    }
+
+    let mut files = Vec::new();
+    collect_files(path, path, &mut files)?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = blake3::Hasher::new();
+    for (relative, file) in files {
+        hasher.update(relative.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(&std::fs::read(file.as_std_path())?);
+        hasher.update(b"\0");
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 use shiro_core::error::ShiroError;
 use shiro_core::id::DocId;
 use shiro_core::ir::Segment;
 
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
+use tantivy::query::{BooleanQuery, Query, QueryParser, TermSetQuery};
 use tantivy::schema::document::TantivyDocument;
 use tantivy::schema::{
     IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, STORED, STRING,
@@ -49,7 +103,8 @@ pub struct FtsHit {
     pub doc_id: String,
     pub segment_id: String,
     pub seg_index: usize,
-    pub body: String,
+    /// Versioned text that BM25 scored; canonical content must be loaded from the store.
+    pub retrieval_text: String,
     pub span_start: usize,
     pub span_end: usize,
     pub bm25_score: f32,
@@ -159,7 +214,7 @@ impl FtsIndex {
                 self.f_doc_id => seg.doc_id.as_str(),
                 self.f_segment_id => seg.id.as_str(),
                 self.f_seg_index => seg.index as u64,
-                self.f_body => seg.body.as_str(),
+                self.f_body => seg.retrieval_text.as_str(),
                 self.f_span_start => seg.span.start() as u64,
                 self.f_span_end => seg.span.end() as u64,
             );
@@ -195,7 +250,7 @@ impl FtsIndex {
                 self.f_doc_id => segment.doc_id.as_str(),
                 self.f_segment_id => segment.id.as_str(),
                 self.f_seg_index => segment.index as u64,
-                self.f_body => segment.body.as_str(),
+                self.f_body => segment.retrieval_text.as_str(),
                 self.f_span_start => segment.span.start() as u64,
                 self.f_span_end => segment.span.end() as u64,
             );
@@ -212,12 +267,36 @@ impl FtsIndex {
             return Ok(Vec::new());
         }
 
-        let searcher = self.reader.searcher();
         let query_parser = QueryParser::for_index(&self.index, vec![self.f_body]);
-
         let parsed = query_parser.parse_query(query).map_err(map_query_parse)?;
+        self.search_query(parsed.as_ref(), limit)
+    }
+
+    /// Search only documents in the authoritative retrieval scope.
+    pub fn search_in_documents(
+        &self,
+        query: &str,
+        limit: usize,
+        eligible_document_ids: &[DocId],
+    ) -> Result<Vec<FtsHit>, ShiroError> {
+        if query.is_empty() || limit == 0 || eligible_document_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let query_parser = QueryParser::for_index(&self.index, vec![self.f_body]);
+        let parsed = query_parser.parse_query(query).map_err(map_query_parse)?;
+        let document_terms = eligible_document_ids
+            .iter()
+            .map(|doc_id| Term::from_field_text(self.f_doc_id, doc_id.as_str()));
+        let scoped_query =
+            BooleanQuery::intersection(vec![parsed, Box::new(TermSetQuery::new(document_terms))]);
+        self.search_query(&scoped_query, limit)
+    }
+
+    fn search_query(&self, query: &dyn Query, limit: usize) -> Result<Vec<FtsHit>, ShiroError> {
+        let searcher = self.reader.searcher();
         let top_docs = searcher
-            .search(&parsed, &TopDocs::with_limit(limit))
+            .search(query, &TopDocs::with_limit(limit))
             .map_err(map_tantivy_search)?;
 
         let mut hits = Vec::with_capacity(top_docs.len());
@@ -261,7 +340,7 @@ impl FtsIndex {
                 doc_id: doc_id_val,
                 segment_id: segment_id_val,
                 seg_index: seg_index_val,
-                body: body_val,
+                retrieval_text: body_val,
                 span_start: span_start_val,
                 span_end: span_end_val,
                 bm25_score: score,
@@ -303,43 +382,6 @@ impl FtsIndex {
         tracing::info!(segments = segments.len(), dir = %staging_dir, "built staging index");
         Ok(())
     }
-
-    /// Promote a staging index by atomically replacing the live index.
-    ///
-    /// On Unix, this uses `rename()` which is atomic.
-    /// Returns the old index directory path (caller should clean up).
-    pub fn promote_staging(
-        staging_dir: &camino::Utf8Path,
-        live_dir: &camino::Utf8Path,
-    ) -> Result<Option<camino::Utf8PathBuf>, ShiroError> {
-        let backup = if live_dir.as_std_path().exists() {
-            let backup_dir = live_dir.with_extension("old");
-            std::fs::rename(live_dir.as_std_path(), backup_dir.as_std_path())?;
-            Some(camino::Utf8PathBuf::from(backup_dir.to_string()))
-        } else {
-            None
-        };
-
-        std::fs::rename(staging_dir.as_std_path(), live_dir.as_std_path())?;
-
-        // Clean up backup
-        if let Some(ref backup) = backup {
-            let _ = std::fs::remove_dir_all(backup.as_std_path());
-        }
-
-        tracing::info!(from = %staging_dir, to = %live_dir, "promoted staging index");
-        Ok(backup)
-    }
-
-    /// Compute the directory path for a specific FTS generation.
-    pub fn gen_dir(base: &camino::Utf8Path, gen_id: u64) -> camino::Utf8PathBuf {
-        if gen_id == 0 {
-            base.to_owned()
-        } else {
-            let dir_name = format!("tantivy_gen_{gen_id}");
-            base.parent().unwrap_or(base).join(dir_name)
-        }
-    }
 }
 
 #[cfg(test)]
@@ -355,6 +397,7 @@ mod tests {
             index,
             span: Span::new(0, body.len()).expect("test span"),
             body: body.to_string(),
+            retrieval_text: body.to_string(),
         }
     }
 
@@ -376,13 +419,29 @@ mod tests {
 
         let results = fts.search("fox", 10).unwrap();
         assert_eq!(results.len(), 1);
-        assert!(results[0].body.contains("fox"));
+        assert!(results[0].retrieval_text.contains("fox"));
         assert_eq!(results[0].bm25_rank, 1);
         assert_eq!(results[0].doc_id, doc_id.as_str());
 
         let results = fts.search("rust", 10).unwrap();
         assert_eq!(results.len(), 1);
-        assert!(results[0].body.contains("rust"));
+        assert!(results[0].retrieval_text.contains("rust"));
+    }
+
+    #[test]
+    fn fts_indexes_structural_retrieval_text() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let directory = camino::Utf8Path::from_path(temporary.path()).unwrap();
+        let fts = FtsIndex::open(directory).unwrap();
+        let doc_id = DocId::from_content(b"canonical evidence");
+        let mut segment = test_segment(&doc_id, 0, "canonical evidence");
+        segment.retrieval_text = "Document: Structural Context\n\ncanonical evidence".to_string();
+
+        fts.index_segments(&[segment]).unwrap();
+        let results = fts.search("Structural Context", 10).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].retrieval_text.contains("canonical evidence"));
     }
 
     #[test]
@@ -454,25 +513,16 @@ mod tests {
     #[test]
     fn test_build_from_segments() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let staging_path = tmp.path().join("staging");
-        let staging = camino::Utf8Path::from_path(&staging_path).unwrap();
-        let live_path = tmp.path().join("live");
-        let live = camino::Utf8Path::from_path(&live_path).unwrap();
+        let generation_path = tmp.path().join("generation");
+        let generation = camino::Utf8Path::from_path(&generation_path).unwrap();
 
         let doc_id = DocId::from_content(b"gen-test");
         let segments = vec![test_segment(&doc_id, 0, "generational index test content")];
 
-        // Build staging index
-        FtsIndex::build_from_segments(staging, &segments, 1).unwrap();
-        assert!(staging.as_std_path().exists());
+        FtsIndex::build_from_segments(generation, &segments, 1).unwrap();
+        assert!(generation.as_std_path().exists());
 
-        // Promote to live
-        FtsIndex::promote_staging(staging, live).unwrap();
-        assert!(live.as_std_path().exists());
-        assert!(!staging.as_std_path().exists());
-
-        // Verify live index works
-        let fts = FtsIndex::open(live).unwrap();
+        let fts = FtsIndex::open_generation(generation, 1).unwrap();
         let results = fts.search("generational", 10).unwrap();
         assert_eq!(results.len(), 1);
     }
@@ -489,23 +539,5 @@ mod tests {
         let dir2 = camino::Utf8Path::from_path(tmp2.path()).unwrap();
         let fts2 = FtsIndex::open_generation(dir2, 42).unwrap();
         assert_eq!(fts2.gen_id(), 42);
-    }
-
-    #[test]
-    fn test_gen_dir_naming() {
-        let base = camino::Utf8Path::new("/data/tantivy");
-
-        // gen 0 returns base unchanged
-        let dir0 = FtsIndex::gen_dir(base, 0);
-        assert_eq!(dir0, base);
-
-        // gen N returns sibling directory
-        let dir5 = FtsIndex::gen_dir(base, 5);
-        assert_eq!(dir5, camino::Utf8PathBuf::from("/data/tantivy_gen_5"));
-
-        // gen with root-level path
-        let root = camino::Utf8Path::new("tantivy");
-        let dir1 = FtsIndex::gen_dir(root, 1);
-        assert_eq!(dir1, camino::Utf8PathBuf::from("tantivy_gen_1"));
     }
 }

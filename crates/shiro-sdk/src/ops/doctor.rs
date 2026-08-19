@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use shiro_core::{ShiroError, ShiroHome};
-use shiro_index::FtsIndex;
+use shiro_index::{artifact_digest, FtsIndex};
 use shiro_store::Store;
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -83,23 +83,47 @@ pub fn execute(home: &ShiroHome, input: &DoctorInput) -> Result<DoctorOutput, Sh
     };
     checks.push(db_check);
 
-    // Check 3: Tantivy FTS index.
-    let fts_ok = match FtsIndex::open(&home.tantivy_dir()) {
+    // Check 3: active Tantivy generation and common-manifest digest.
+    let active_fts_generation = store_opt
+        .as_ref()
+        .and_then(|store| store.active_generation("fts").ok())
+        .map(|generation| generation.as_u64())
+        .unwrap_or(0);
+    let active_fts_path = home.tantivy_generation_dir(active_fts_generation);
+    let fts_ok = match FtsIndex::open_generation(&active_fts_path, active_fts_generation) {
         Ok(fts) => {
             let count = fts.num_segments().unwrap_or(0);
+            let valid = match store_opt
+                .as_ref()
+                .and_then(|store| store.active_corpus_manifest().ok().flatten())
+                .filter(|manifest| !manifest.fts_digest.is_empty())
+            {
+                Some(manifest) => artifact_digest(&active_fts_path)
+                    .map(|actual| actual == manifest.fts_digest)
+                    .unwrap_or(false),
+                None => true,
+            };
             checks.push(DoctorCheck {
                 name: "fts_index".into(),
-                status: "ok".into(),
-                message: format!("{count} segments indexed"),
+                status: if valid { "ok" } else { "fail" }.into(),
+                message: if valid {
+                    format!(
+                        "{count} segments indexed in generation {active_fts_generation}"
+                    )
+                } else {
+                    format!(
+                        "generation {active_fts_generation} does not match its corpus manifest digest"
+                    )
+                },
                 details: None,
             });
-            true
+            valid
         }
         Err(e) => {
             checks.push(DoctorCheck {
                 name: "fts_index".into(),
                 status: "fail".into(),
-                message: format!("cannot open FTS index: {e}"),
+                message: format!("cannot open FTS generation {active_fts_generation}: {e}"),
                 details: None,
             });
             false
@@ -199,7 +223,7 @@ pub fn execute(home: &ShiroHome, input: &DoctorInput) -> Result<DoctorOutput, Sh
             .filter(|(s, _)| s.as_str() == "READY")
             .map(|(_, c)| *c)
             .sum();
-        match FtsIndex::open(&home.tantivy_dir()) {
+        match FtsIndex::open_generation(&active_fts_path, active_fts_generation) {
             Ok(fts) => {
                 let fts_count = fts.num_segments().unwrap_or(0);
                 let (status, message) = if ready_count > 0 && fts_count == 0 {
@@ -233,36 +257,57 @@ pub fn execute(home: &ShiroHome, input: &DoctorInput) -> Result<DoctorOutput, Sh
         }
     }
 
-    // Check 7: vector index (optional)
+    // Check 8: active vector generation (optional).
     if input.verify_vector {
-        let vector_data_path = home.vector_dir().join("flat.jsonl");
-        let fingerprint_path = home.vector_dir().join("flat.fingerprint.json");
-        match std::fs::read_to_string(vector_data_path.as_std_path()) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                checks.push(DoctorCheck {
-                    name: "vector_index".into(),
-                    status: "warn".into(),
-                    message: "no vector index found — vector search not yet configured".into(),
-                    details: None,
-                });
-            }
-            Err(error) => {
-                checks.push(DoctorCheck {
-                    name: "vector_index".into(),
-                    status: "fail".into(),
-                    message: format!("cannot read vector index: {error}"),
-                    details: Some(serde_json::json!({
-                        "data_path": vector_data_path.as_str(),
-                    })),
-                });
-            }
-            Ok(content) => {
-                let vector_count = content
-                    .lines()
-                    .filter(|line| !line.trim().is_empty())
-                    .count();
-                let fingerprint_read = std::fs::read_to_string(fingerprint_path.as_std_path());
-                let (status, message, fingerprint_hash) = match fingerprint_read {
+        let active_vector_generation = store_opt
+            .as_ref()
+            .and_then(|store| store.active_generation("vector").ok())
+            .map(|generation| generation.as_u64())
+            .unwrap_or(0);
+        let vector_data_path = home.vector_data_path(active_vector_generation);
+        let fingerprint_path = home
+            .vector_generation_dir(active_vector_generation)
+            .join("flat.fingerprint.json");
+        let vector_published = store_opt
+            .as_ref()
+            .and_then(|store| store.active_corpus_manifest().ok().flatten())
+            .map(|manifest| manifest.vector_generation.is_some())
+            .unwrap_or(true);
+        if !vector_published {
+            checks.push(DoctorCheck {
+                name: "vector_index".into(),
+                status: "warn".into(),
+                message: "active corpus manifest has no vector generation — run `shiro reindex`"
+                    .into(),
+                details: None,
+            });
+        } else {
+            match std::fs::read_to_string(vector_data_path.as_std_path()) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    checks.push(DoctorCheck {
+                        name: "vector_index".into(),
+                        status: "warn".into(),
+                        message: "no vector index found — vector search not yet configured".into(),
+                        details: None,
+                    });
+                }
+                Err(error) => {
+                    checks.push(DoctorCheck {
+                        name: "vector_index".into(),
+                        status: "fail".into(),
+                        message: format!("cannot read vector index: {error}"),
+                        details: Some(serde_json::json!({
+                            "data_path": vector_data_path.as_str(),
+                        })),
+                    });
+                }
+                Ok(content) => {
+                    let vector_count = content
+                        .lines()
+                        .filter(|line| !line.trim().is_empty())
+                        .count();
+                    let fingerprint_read = std::fs::read_to_string(fingerprint_path.as_std_path());
+                    let (status, message, fingerprint_hash) = match fingerprint_read {
                     Ok(json) => {
                         match serde_json::from_str::<shiro_core::EmbeddingFingerprint>(&json) {
                             Ok(fingerprint) => (
@@ -294,16 +339,37 @@ pub fn execute(home: &ShiroHome, input: &DoctorInput) -> Result<DoctorOutput, Sh
                         None,
                     ),
                 };
-                checks.push(DoctorCheck {
+                    let digest_valid = store_opt
+                        .as_ref()
+                        .and_then(|store| store.active_corpus_manifest().ok().flatten())
+                        .and_then(|manifest| manifest.vector_digest)
+                        .map(|expected| {
+                            artifact_digest(&home.vector_generation_dir(active_vector_generation))
+                                .map(|actual| actual == expected)
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(true);
+                    checks.push(DoctorCheck {
                     name: "vector_index".into(),
-                    status: status.into(),
-                    message,
+                    status: if status == "ok" && !digest_valid {
+                        "fail".into()
+                    } else {
+                        status.into()
+                    },
+                    message: if digest_valid {
+                        message
+                    } else {
+                        format!(
+                            "vector generation {active_vector_generation} does not match its corpus manifest digest"
+                        )
+                    },
                     details: Some(serde_json::json!({
                         "data_path": vector_data_path.as_str(),
                         "fingerprint_path": fingerprint_path.as_str(),
                         "fingerprint_hash": fingerprint_hash,
                     })),
                 });
+                }
             }
         }
     }

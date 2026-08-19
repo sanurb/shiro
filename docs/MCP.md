@@ -9,34 +9,25 @@ The MCP server exposes shiro's document library and a safe execution environment
 - **Transport:** JSON-RPC 2.0 over stdio
 - **Input:** Newline-delimited JSON on stdin
 - **Output:** JSON + newline on stdout
-- **Protocol version:** `2024-11-05`
+- **Modern protocol:** `2026-07-28` (per-request `_meta`, `server/discover`, stateless requests)
+- **Legacy compatibility:** `2025-11-25`, `2025-06-18`, and `2024-11-05` initialization handshakes
+- **Schemas:** JSON Schema 2020-12 input/output schemas; tool results include both text and `structuredContent`
+
+The modern behavior follows the official [versioning contract](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning), including `-32022` responses with supported versions.
 
 ## Lifecycle
 
-```
-Client                              Server
-  │                                    │
-  │─── initialize ────────────────────>│
-  │<── capabilities, serverInfo ───────│
-  │                                    │
-  │─── notifications/initialized ─────>│
-  │    (no response — notification)    │
-  │                                    │
-  │─── tools/list ────────────────────>│
-  │<── shiro.search, shiro.execute ───│
-  │                                    │
-  │─── tools/call {shiro.search} ────>│
-  │<── SpecSearchResult[] ────────────│
-  │                                    │
-  │─── tools/call {shiro.execute} ───>│
-  │<── ExecutionResult ───────────────│
+Modern clients call `server/discover` (optional but recommended on stdio), then include these fields in every request's `params._meta`:
+
+```json
+{
+  "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+  "io.modelcontextprotocol/clientInfo": {"name": "host", "version": "1"},
+  "io.modelcontextprotocol/clientCapabilities": {}
+}
 ```
 
-1. Client sends `initialize` → server responds with capabilities (`tools: {}`), server info (`name: "shiro"`, `version`).
-2. Client sends `notifications/initialized` → server acknowledges (no response for notifications).
-3. Client sends `tools/list` → server returns exactly two tools: `shiro.search` and `shiro.execute`.
-4. Client sends `tools/call` → server dispatches to the requested tool with strict input validation.
-5. Unknown methods → JSON-RPC error code `-32601` ("method not found").
+The server returns `resultType: "complete"` and server identity metadata on every successful response. Unsupported modern versions return `-32022`; missing required capabilities return `-32602`. Legacy clients may still use `initialize` and `notifications/initialized` before `tools/list`/`tools/call`. Both eras expose exactly two tools.
 
 ## Tools
 
@@ -58,7 +49,7 @@ Search for available operations by keyword.
 | `query` | string | yes | — | Search terms (AND semantics) |
 | `limit` | integer | no | 10 | Max results to return |
 
-**Output:** Array of `SpecSearchResult` objects, ranked by score descending with name ascending as tie-break. Each result includes the operation spec, JSON Schema for inputs/outputs, and usage examples.
+**Output:** `structuredContent.results` contains `SpecSearchResult` objects ranked by score descending with name ascending as tie-break. Each result includes schemas, examples, and an `authority` value of `read` or `write`. The same JSON is serialized in a text content block for compatibility.
 
 ### `shiro.execute`
 
@@ -69,13 +60,13 @@ Execute a DSL program against the shiro library.
 ```json
 {
   "program": [
-    { "let": { "name": "results", "call": { "op": "search", "params": { "query": "machine learning" } } } },
-    { "return": { "value": "$results" } }
+    { "type": "let", "name": "results", "call": { "op": "search", "params": { "query": "machine learning", "mode": "bm25", "limit": 5 } } },
+    { "type": "return", "value": "$results" }
   ],
   "limits": {
     "max_steps": 100,
     "max_iterations": 50,
-    "timeout_secs": 15
+    "timeout_ms": 15000
   }
 }
 ```
@@ -84,8 +75,12 @@ Execute a DSL program against the shiro library.
 |-------|------|----------|---------|-------------|
 | `program` | Node[] | yes | — | DSL program (array of nodes) |
 | `limits` | Limits | no | defaults | Override execution limits |
+| `actor_id` | string | for writes | — | Actor identity recorded for each write-class operation |
+| `approval_id` | string | for writes | — | Host/policy approval reference recorded for each write |
 
-**Output:** `ExecutionResult` containing:
+The host must also start Shiro with `shiro mcp --allow-writes`. Without all three authority signals, write-class operations fail closed. Authorization and outcomes are append-only audited with a generated run ID. Read-only programs require none of these fields.
+
+**Output:** `structuredContent.result` contains an `ExecutionResult`; the same JSON is serialized as text for compatibility:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -103,28 +98,23 @@ The DSL is a JSON AST interpreted by a safe, sandboxed interpreter. All node typ
 #### `let` — Bind a variable to the result of a call
 
 ```json
-{ "let": { "name": "docs", "call": { "op": "list", "params": {} } } }
+{ "type": "let", "name": "docs", "call": { "op": "list", "params": {} } }
 ```
 
 #### `call` — Execute an operation (result discarded)
 
 ```json
-{ "call": { "op": "search", "params": { "query": "neural networks" } } }
+{ "type": "call", "op": "search", "params": { "query": "neural networks", "mode": "bm25", "limit": 5 } }
 ```
 
 #### `if` — Conditional execution
 
 ```json
 {
-  "if": {
-    "condition": "$results",
-    "then": [
-      { "return": { "value": "$results" } }
-    ],
-    "else": [
-      { "return": { "value": "no results" } }
-    ]
-  }
+  "type": "if",
+  "condition": "$results",
+  "then": [{ "type": "return", "value": "$results" }],
+  "else": [{ "type": "return", "value": "no results" }]
 }
 ```
 
@@ -132,20 +122,19 @@ The DSL is a JSON AST interpreted by a safe, sandboxed interpreter. All node typ
 
 ```json
 {
-  "for_each": {
-    "collection": "$docs",
-    "item": "doc",
-    "body": [
-      { "call": { "op": "read", "params": { "doc_id": "$doc.id" } } }
-    ]
-  }
+  "type": "for_each",
+  "collection": "$docs.documents",
+  "item": "doc",
+  "body": [
+    { "type": "call", "op": "read", "params": { "id": "$doc.doc_id" } }
+  ]
 }
 ```
 
 #### `return` — Return a value from the program
 
 ```json
-{ "return": { "value": "$results.0.title" } }
+{ "type": "return", "value": "$results.hits.0.title" }
 ```
 
 ### Variable Substitution
@@ -166,7 +155,7 @@ The DSL interpreter enforces hard limits to prevent abuse:
 | `max_steps` | 200 | Maximum total DSL steps (all node evaluations) |
 | `max_iterations` | 100 | Maximum iterations per `for_each` loop |
 | `max_output_bytes` | 1 MiB | Maximum size of the return value |
-| `timeout` | 30s | Wall-clock execution timeout |
+| `timeout_ms` | 30000 | Wall-clock execution timeout |
 
 **Safety guarantees:**
 
@@ -195,6 +184,7 @@ JSON-RPC error codes:
 | `-32601` | Method not found |
 | `-32602` | Invalid params (unknown fields, schema mismatch) |
 | `-32603` | Internal error |
+| `-32022` | Unsupported modern protocol version (response includes supported versions) |
 
 ## Client Configuration
 

@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use camino::Utf8PathBuf;
 use fastembed::{RerankInitOptions, RerankerModel, TextRerank};
 use shiro_core::error::ShiroError;
-use shiro_core::ports::{RerankResult, Reranker};
+use shiro_core::{RerankCandidateLimit, RerankResult, Reranker};
 
 /// Configuration for constructing a [`FastEmbedReranker`].
 #[derive(Debug, Clone)]
@@ -33,6 +33,7 @@ impl Default for FastEmbedRerankerConfig {
 pub struct FastEmbedReranker {
     inner: Mutex<TextRerank>,
     model_name: String,
+    rerank_candidate_limit: RerankCandidateLimit,
 }
 
 impl FastEmbedReranker {
@@ -54,11 +55,22 @@ impl FastEmbedReranker {
         Ok(Self {
             inner: Mutex::new(reranker),
             model_name,
+            rerank_candidate_limit: RerankCandidateLimit::default(),
         })
+    }
+
+    /// Configure the maximum fused candidate count scored per query.
+    pub fn with_rerank_candidate_limit(mut self, limit: RerankCandidateLimit) -> Self {
+        self.rerank_candidate_limit = limit;
+        self
     }
 }
 
 impl Reranker for FastEmbedReranker {
+    fn rerank_candidate_limit(&self) -> RerankCandidateLimit {
+        self.rerank_candidate_limit
+    }
+
     fn rerank(
         &self,
         query: &str,

@@ -315,6 +315,184 @@ fn new_flags_accepted() {
     assert_eq!(code, 0, "doctor with --verify-vector failed: {stdout}");
 }
 
+#[test]
+fn reprocess_dry_run_enforces_limits_and_executes_from_verified_manifest() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("shiro-home");
+    let (stdout, code) = shiro(&home, &["init"]);
+    assert_eq!(code, 0, "init failed: {stdout}");
+    let source = temp.path().join("reprocess.txt");
+    std::fs::write(&source, "scoped reprocessing evidence").unwrap();
+    let (stdout, code) = shiro(&home, &["add", source.to_str().unwrap()]);
+    assert_eq!(code, 0, "add failed: {stdout}");
+
+    let (stdout, code) = shiro(
+        &home,
+        &[
+            "reprocess",
+            "--parser",
+            "plaintext",
+            "--target",
+            "derived",
+            "--max-documents",
+            "0",
+        ],
+    );
+    assert_eq!(code, 0, "dry-run failed: {stdout}");
+    let blocked = parse_json(&stdout);
+    assert_eq!(blocked["result"]["status"], "planned");
+    assert_eq!(blocked["result"]["plan"]["execution_allowed"], false);
+
+    let (stdout, code) = shiro(
+        &home,
+        &["reprocess", "--parser", "plaintext", "--target", "derived"],
+    );
+    assert_eq!(code, 0, "plan failed: {stdout}");
+    let plan = parse_json(&stdout);
+    let rollback = plan["result"]["plan"]["rollback_manifest_id"]
+        .as_str()
+        .unwrap();
+    let (stdout, code) = shiro(
+        &home,
+        &[
+            "reprocess",
+            "--parser",
+            "plaintext",
+            "--target",
+            "derived",
+            "--execute",
+            "--resume-manifest-id",
+            rollback,
+        ],
+    );
+    assert_eq!(code, 0, "execute failed: {stdout}");
+    let executed = parse_json(&stdout);
+    assert_eq!(executed["result"]["status"], "executed");
+    assert!(executed["result"]["publication"].is_array());
+}
+
+#[test]
+fn search_pack_deduplicates_stable_evidence_handles() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("shiro-home");
+    let (stdout, code) = shiro(&home, &["init"]);
+    assert_eq!(code, 0, "init failed: {stdout}");
+    let source = temp.path().join("pack.md");
+    std::fs::write(&source, "# Evidence\n\nbatched retrieval evidence").unwrap();
+    let (stdout, code) = shiro(&home, &["add", source.to_str().unwrap()]);
+    assert_eq!(code, 0, "add failed: {stdout}");
+
+    let (stdout, code) = shiro(
+        &home,
+        &[
+            "search-pack",
+            "batched evidence",
+            "retrieval evidence",
+            "--mode",
+            "bm25",
+        ],
+    );
+    assert_eq!(code, 0, "search-pack failed: {stdout}");
+    let output = parse_json(&stdout);
+    assert!(output["ok"].as_bool().unwrap());
+    assert_eq!(output["result"]["query_count"], 2);
+    let hits = output["result"]["hits"].as_array().unwrap();
+    assert!(!hits.is_empty());
+    assert!(hits[0]["evidence_handle"]
+        .as_str()
+        .unwrap()
+        .starts_with("blk_"));
+    assert_eq!(hits[0]["matched_queries"].as_array().unwrap().len(), 2);
+    assert!(hits[0]["snippet"].is_null());
+
+    let (stdout, code) = shiro(
+        &home,
+        &["read", hits[0]["evidence_handle"].as_str().unwrap()],
+    );
+    assert_eq!(code, 0, "stable read failed: {stdout}");
+    let deferred = parse_json(&stdout);
+    assert_eq!(
+        deferred["result"]["evidence_resolution"]["status"],
+        "ACTIVE"
+    );
+}
+
+#[test]
+fn search_and_list_filters_are_enforced_end_to_end() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path().join("shiro-filter-test");
+    shiro(&home, &["init"]);
+
+    let competitor_path = tmp.path().join("competitor.md");
+    std::fs::write(
+        &competitor_path,
+        "# Competitor Heading\n\nfiltered filtered filtered competitor",
+    )
+    .unwrap();
+    let target_path = tmp.path().join("target.md");
+    std::fs::write(&target_path, "# Target Heading\n\nfiltered target evidence").unwrap();
+
+    shiro(&home, &["add", competitor_path.to_str().unwrap()]);
+    let (stdout, code) = shiro(&home, &["add", target_path.to_str().unwrap()]);
+    assert_eq!(code, 0, "target add failed: {stdout}");
+    let target_doc_id = parse_json(&stdout)["result"]["doc_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (stdout, code) = shiro(&home, &["enrich", &target_doc_id]);
+    assert_eq!(code, 0, "target enrich failed: {stdout}");
+
+    let (stdout, code) = shiro(
+        &home,
+        &[
+            "taxonomy",
+            "add",
+            "--scheme",
+            "https://example.test/filters",
+            "--label",
+            "Target Concept",
+        ],
+    );
+    assert_eq!(code, 0, "taxonomy add failed: {stdout}");
+    let concept_id = parse_json(&stdout)["result"]["concept_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (stdout, code) = shiro(&home, &["taxonomy", "assign", &target_doc_id, &concept_id]);
+    assert_eq!(code, 0, "taxonomy assign failed: {stdout}");
+
+    let (stdout, code) = shiro(
+        &home,
+        &[
+            "search",
+            "filtered",
+            "--tag",
+            "target heading",
+            "--concept",
+            &concept_id,
+            "--doc",
+            &target_doc_id,
+            "--limit",
+            "1",
+        ],
+    );
+    assert_eq!(code, 0, "filtered search failed: {stdout}");
+    let search = parse_json(&stdout);
+    let results = search["result"]["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["doc_id"].as_str().unwrap(), target_doc_id);
+
+    let (stdout, code) = shiro(
+        &home,
+        &["list", "--tag", "target heading", "--concept", &concept_id],
+    );
+    assert_eq!(code, 0, "filtered list failed: {stdout}");
+    let list = parse_json(&stdout);
+    let items = list["result"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["doc_id"].as_str().unwrap(), target_doc_id);
+}
+
 /// Golden test: capabilities command schema stability.
 #[test]
 fn capabilities_schema_stable() {
@@ -360,6 +538,7 @@ fn capabilities_schema_stable() {
                 "id_schemes",
                 "parsers",
                 "features",
+                "taxonomy",
                 "embedding",
                 "storage",
             ];
@@ -427,7 +606,14 @@ fn capabilities_schema_stable() {
             s
         },
         {
-            let mut s = vec!["doc_id", "segment_id", "run_id", "concept_id", "result_id"];
+            let mut s = vec![
+                "doc_id",
+                "segment_id",
+                "run_id",
+                "concept_id",
+                "result_id",
+                "evidence_handle",
+            ];
             s.sort();
             s
         },
@@ -773,6 +959,126 @@ fn test_taxonomy_workflow() {
     let (stdout, _) = shiro(&home, &["taxonomy", "list"]);
     let v = parse_json(&stdout);
     assert_eq!(v["result"]["count"].as_u64().unwrap(), 2);
+
+    let (stdout, code) = shiro(&home, &["taxonomy", "search", "rust"]);
+    assert_eq!(code, 0, "taxonomy search failed: {stdout}");
+    let searched = parse_json(&stdout);
+    assert_eq!(searched["result"]["concepts"][0]["pref_label"], "Rust");
+    assert_eq!(searched["result"]["concepts"][0]["text_fallback"], "Rust");
+
+    let (stdout, code) = shiro(&home, &["taxonomy", "browse", "--root", &concept_id]);
+    assert_eq!(code, 0, "taxonomy browse failed: {stdout}");
+    let browsed = parse_json(&stdout);
+    assert_eq!(browsed["result"]["root_concept_id"], concept_id);
+    assert_eq!(browsed["result"]["concepts"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn model_enrichment_stays_proposed_until_promotion_and_is_reversible() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path().join("shiro-model-enrichment");
+    let (stdout, code) = shiro(&home, &["init"]);
+    assert_eq!(code, 0, "init failed: {stdout}");
+    let source = tmp.path().join("model.txt");
+    std::fs::write(&source, "model proposal evidence").unwrap();
+    let (stdout, code) = shiro(&home, &["add", source.to_str().unwrap()]);
+    assert_eq!(code, 0, "add failed: {stdout}");
+    let added = parse_json(&stdout);
+    let doc_id = added["result"]["doc_id"].as_str().unwrap();
+
+    let proposal_file = tmp.path().join("proposal.json");
+    std::fs::write(
+        &proposal_file,
+        serde_json::to_vec(&serde_json::json!({
+            "doc_id": doc_id,
+            "provider": "test-provider",
+            "model": "test-model",
+            "actor_id": "agent:test",
+            "data_region": "local",
+            "retention_policy": "none",
+            "consent_id": "consent:test",
+            "concepts": [{
+                "scheme_uri": "urn:test:topics",
+                "pref_label": "Proposed Topic",
+                "alt_labels": [],
+                "definition": "A model-proposed topic",
+                "confidence": 0.9
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let (stdout, code) = shiro(
+        &home,
+        &[
+            "enrich-model",
+            "propose",
+            "--file",
+            proposal_file.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 0, "proposal failed: {stdout}");
+    let proposed = parse_json(&stdout);
+    assert_eq!(proposed["result"]["status"], "PROPOSED");
+    assert_eq!(proposed["result"]["trust_zone"], "PROPOSED");
+    let proposal_id = proposed["result"]["proposal_id"].as_str().unwrap();
+    let concept_id = proposed["result"]["proposed_concept_ids"][0]
+        .as_str()
+        .unwrap();
+
+    let (stdout, code) = shiro(&home, &["list", "--concept", concept_id]);
+    assert_eq!(code, 0, "pre-promotion list failed: {stdout}");
+    assert!(parse_json(&stdout)["result"]["items"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    let (stdout, code) = shiro(
+        &home,
+        &[
+            "enrich-model",
+            "resolve",
+            proposal_id,
+            "--action",
+            "promote",
+            "--actor",
+            "local_user",
+            "--approval",
+            "approval:test",
+        ],
+    );
+    assert_eq!(code, 0, "promotion failed: {stdout}");
+    assert_eq!(parse_json(&stdout)["result"]["status"], "PROMOTED");
+    let (stdout, _) = shiro(&home, &["list", "--concept", concept_id]);
+    assert_eq!(
+        parse_json(&stdout)["result"]["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let (stdout, code) = shiro(
+        &home,
+        &[
+            "enrich-model",
+            "resolve",
+            proposal_id,
+            "--action",
+            "reject",
+            "--actor",
+            "local_user",
+            "--approval",
+            "reversal:test",
+        ],
+    );
+    assert_eq!(code, 0, "reversal failed: {stdout}");
+    assert_eq!(parse_json(&stdout)["result"]["status"], "REJECTED");
+    let (stdout, _) = shiro(&home, &["list", "--concept", concept_id]);
+    assert!(parse_json(&stdout)["result"]["items"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -814,6 +1120,98 @@ fn test_reindex_command() {
     assert!(
         !results.is_empty(),
         "search should still find results after reindex"
+    );
+}
+
+#[test]
+fn benchmark_command_reports_measured_metrics_and_honest_evidence_status() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path().join("shiro-benchmark-test");
+    shiro(&home, &["init"]);
+
+    let content = "judged benchmark retrieval evidence";
+    let document_path = tmp.path().join("benchmark.txt");
+    std::fs::write(&document_path, content).unwrap();
+    let (stdout, code) = shiro(&home, &["add", document_path.to_str().unwrap()]);
+    assert_eq!(code, 0, "add failed: {stdout}");
+    let doc_id = parse_json(&stdout)["result"]["doc_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let manifest_path = tmp.path().join("benchmark-manifest.json");
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "corpus_id": "integration-fixture",
+        "corpus_version": "1",
+        "documents": [{
+            "doc_id": doc_id,
+            "source_uri": document_path.to_str().unwrap(),
+            "source_hash": blake3::hash(content.as_bytes()).to_hex().to_string(),
+            "license": "test-only"
+        }],
+        "queries": [{
+            "query_id": "q1",
+            "text": "retrieval evidence",
+            "judgments": [{
+                "doc_id": doc_id,
+                "relevance": 3,
+                "source_locator": "bytes:0-35",
+                "assessor_ids": ["integration-test"],
+                "adjudicated": true
+            }]
+        }],
+        "hardware_profile": {
+            "profile_id": "integration-host",
+            "cpu_model": "unspecified-test-cpu",
+            "logical_cores": 1,
+            "memory_bytes": 1,
+            "os": std::env::consts::OS,
+            "architecture": std::env::consts::ARCH
+        },
+        "pipelines": ["bm25"],
+        "thresholds": {
+            "min_candidate_recall_at_50": 1.0,
+            "min_ndcg_at_10": 1.0,
+            "min_mrr_at_10": 1.0,
+            "max_search_p95_ms": 10000.0,
+            "min_paired_ndcg_delta_ci95_lower": null
+        }
+    });
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let (stdout, code) = shiro(
+        &home,
+        &[
+            "benchmark",
+            manifest_path.to_str().unwrap(),
+            "--warmup-runs",
+            "0",
+            "--measured-runs",
+            "2",
+        ],
+    );
+    assert_eq!(code, 0, "benchmark failed: {stdout}");
+    let output = parse_json(&stdout);
+    assert_eq!(
+        output["result"]["evidence_status"].as_str(),
+        Some("insufficient_evidence")
+    );
+    assert_eq!(
+        output["result"]["pipelines"][0]["candidate_recall_at_50"].as_f64(),
+        Some(1.0)
+    );
+    assert_eq!(
+        output["result"]["pipelines"][0]["ndcg_at_10"].as_f64(),
+        Some(1.0)
+    );
+    assert_eq!(
+        output["result"]["rebuild_integrity"]["passed"].as_bool(),
+        Some(true)
     );
 }
 

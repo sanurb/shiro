@@ -14,26 +14,36 @@ pub fn run(home: &ShiroHome, result_id: &str) -> Result<CmdOutput, ShiroError> {
     };
     let output = engine.explain(&input)?;
 
+    let filters_applied = output
+        .retrieval_trace
+        .stages
+        .iter()
+        .find(|stage| stage["name"] == "retrieval_policy")
+        .map(|stage| stage["policy"]["filters"].clone())
+        .unwrap_or_else(|| serde_json::json!({}));
     let retrieval_trace = serde_json::json!({
         "pipeline": output.retrieval_trace.pipeline,
         "stages": output.retrieval_trace.stages,
         "fusion": output.retrieval_trace.fusion,
-        "filters_applied": [],
+        "filters_applied": filters_applied,
         "expansions_applied": [],
     });
 
     let result = serde_json::json!({
         "result_id": output.result_id,
+        "evidence_handle": output.evidence_handle,
         "query": output.query,
         "query_digest": output.query_digest,
         "generations": { "fts": output.fts_generation },
         "doc_id": output.doc_id,
         "block_idx": output.block_idx,
         "block_kind": output.block_kind,
+        "heading_level": output.heading_level,
         "span": {
             "start": output.span_start,
             "end": output.span_end,
         },
+        "source_locators": output.source_locators,
         "scores": serde_json::Value::Object({
             let mut scores = serde_json::Map::new();
             scores.insert("bm25".to_string(), serde_json::json!({

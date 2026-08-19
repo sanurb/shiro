@@ -1,0 +1,23 @@
+[package]
+name = "shiro-pdf-inspector-probe"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+publish = false
+autobins = false
+
+# Keep this evaluation tool outside Shiro's Rust 1.75 workspace. The pinned
+# pdf-inspector/lopdf graph and exact executable lockfile use a newer toolchain.
+[workspace]
+
+[dependencies]
+blake3 = "1"
+camino = "1"
+pdf-inspector = { git = "https://github.com/firecrawl/pdf-inspector", rev = "2543abe3715848589903754f30b5dca54f6b33a6" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "shiro-pdf-inspector-probe"
+path = "src/pdf_inspector_probe.rs"

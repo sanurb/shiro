@@ -27,6 +27,7 @@ Humans can use `jq`. Agents can parse deterministically.
   - [Taxonomy](#taxonomy)
   - [Enrich](#enrich)
   - [Reindex](#reindex)
+  - [Benchmark](#benchmark)
   - [MCP](#mcp)
   - [Completions](#completions)
 - [Stable error codes](#stable-error-codes)
@@ -262,20 +263,19 @@ Creates `<home>/`, `<home>/tantivy/`, `<home>/lock/`, initializes SQLite schema 
 #### `shiro add`
 
 ```bash
-shiro add <path|url> \
-  [--parser <baseline>] \
-  [--follow]
+shiro add <path> [--parser <auto|plaintext|markdown|pdf|docling>]
 ```
 
 **Arguments**
 
-* `<path|url>`: local file path
+* `<path>`: local file path. Use `acquire-url` for network sources.
 
 **Behavior**
 
 * Content-addressed deduplication: if `doc_id` already exists, returns existing doc (`changed: false`).
 * Pipeline: parse → `STAGED` → segment → FTS index → `READY`.
-* Parser selection: currently always uses baseline parser.
+* Parser selection is explicit or inferred from the local extension.
+* When an embedder is configured, changed segments are embedded in bounded batches and unchanged compatible vectors are reused before common FTS/vector activation.
 
 **Result**
 
@@ -288,6 +288,16 @@ shiro add <path|url> \
 ```bash
 shiro add ~/docs/notes.md
 ```
+
+#### `shiro acquire-url`
+
+```bash
+shiro acquire-url <https-url> \
+  [--parser <auto|plaintext|markdown|pdf>] \
+  [--max-bytes <n>] [--timeout-ms <n>] [--max-redirects <n>]
+```
+
+HTTPS is required unless `--allow-http` is explicit. Every DNS resolution and redirect is revalidated against private/local/non-routable targets. Shiro enforces total time and response-byte limits, validates PDF or UTF-8 signatures, stores content in the CAS, and atomically records requested/final URLs, redirects, MIME evidence, signature, hash, and canonical source provenance.
 
 #### `shiro ingest`
 
@@ -349,32 +359,46 @@ shiro search <query> \
 {
   "query": "...",
   "mode": "bm25",
-  "generation": { "fts_gen": 1 },
-  "results": [{
+  "fts_generation": 1,
+  "hits": [{
     "result_id": "res_...",
+    "evidence_handle": "blk_...",
     "doc_id": "doc_...",
-    "segment_id": "seg_...",
-    "block_id": 0,
-    "span": { "start": 0, "end": 100 },
-    "snippet": "...",
-    "scores": { "bm25": { "score": 0.5, "rank": 1 }, "fused": 0.016 }
+    "block_idx": 0,
+    "span_start": 0,
+    "span_end": 100,
+    "snippet": "..."
   }]
 }
 ```
+
+#### `shiro search-pack`
+
+```bash
+shiro search-pack <query>... \
+  [--mode <hybrid|bm25|vector>] \
+  [--per-query-limit <n>] [--limit <n>] \
+  [--include-content] [--rerank] \
+  [--tag <tag>] [--concept <concept_id>] [--doc <doc_id>]
+```
+
+Runs the queries in one operation, deduplicates results by `evidence_handle`, and ranks the union by reciprocal-rank contributions across queries. Each hit reports `matched_queries` and a query-ID-to-`result_id` map. Snippets and context are omitted unless `--include-content` is set.
 
 ### Read
 
 #### `shiro read`
 
 ```bash
-shiro read <doc_id|title> [--view <outline|text|blocks>]
+shiro read <doc_id|title|evidence_handle> [--view <outline|text|blocks>] [--page <n>]
 ```
 
+* `shiro read blk_...`: returns the stored canonical block and an `evidence_resolution` with `ACTIVE` or `SUPERSEDED` status and an optional `superseded_by` handle. Superseded handles are never silently redirected.
+* `--page <n>`: returns canonical blocks attributed to a one-based source page; requires parser-provided source locators.
 * `--view text` (default): `canonical_text`, truncated to 50,000 bytes. Fields: `doc_id`, `title`, `status`, `text`, `truncated`
-* `--view blocks`: segments list. Fields: `doc_id`, `title`, `status`, `blocks: [{ segment_id, index, span, body }]`, `total_blocks`
+* `--view blocks`: canonical blocks in reading order. Each block includes `index`, `kind`, optional one-based `heading_level`, byte span, source-faithful `body`, and parser-neutral `source_locators`.
 * `--view outline`: first line of each segment. Fields: `doc_id`, `title`, `status`, `outline: [{ index, preview }]`
 
-ID resolution: if the argument starts with `doc_`, treated as `DocId`; otherwise matched against titles.
+ID resolution: `blk_` values are stable evidence handles, `doc_` values are document IDs, and other values are matched against titles.
 
 ### Explain
 
@@ -548,18 +572,53 @@ Runs enrichment on a document.
 { "doc_id": "doc_...", "provider": "heuristic", "title": "...", "summary": "...", "tags": ["heading1", "heading2"] }
 ```
 
-### Reindex
+#### `shiro enrich-model`
+
+```bash
+shiro enrich-model propose --file <proposal.json>
+shiro enrich-model resolve <proposal_id> \
+  --action <promote|reject> --actor <id> --approval <id>
+```
+
+Model output requires provider/model/actor, data-region, retention-policy, consent, and labeled concept evidence. It remains `PROPOSED` and cannot affect trusted filters until explicit promotion. Rejecting a promoted proposal removes only assignments introduced by that proposal and does not overwrite manual assignments.
+
+### Reindex and reprocessing
 
 #### `shiro reindex`
 
-shiro reindex [--fts] [--follow]
+```bash
+shiro reindex
 ```
 
-Rebuilds derived indices from the SQLite source of truth.
+Rebuilds derived indices from the SQLite source of truth. FTS and any configured
+vector index are validated in generation-specific immutable locations, then
+activated through one common corpus manifest.
 
-* `--fts`: Fully implemented. Performs staging build from all segments, promotes staging to live, and updates generation tracking.
-* `--follow`: Streams NDJSON progress events to stderr.
-* If `--fts` is not specified, FTS reindex is performed by default.
+#### `shiro reprocess`
+
+```bash
+shiro reprocess --parser <name> [--doc <doc_id>]... \
+  [--target <parse|derived|all>] [--include-vector] \
+  [--resume-manifest-id <id>] [--execute] \
+  [--max-documents <n>] [--max-source-bytes <n>] \
+  [--max-model-calls <n>] [--embedding-batch-size <n>]
+```
+
+Dry-run is the default. The plan reports selected documents, stale processing identity, transitive artifacts, source/model/batch estimates, hard blockers, and exact rollback generations. Execution first verifies the rollback manifest and artifacts, then reparses persisted sources and/or publishes complete generations within the declared limits.
+
+### Benchmark
+
+#### `shiro benchmark`
+
+```bash
+shiro benchmark <manifest.json> [--warmup-runs <n>] [--measured-runs <n>]
+```
+
+Evaluates a versioned, adjudicated corpus manifest against the current engine,
+then performs a mandatory reindex and verifies ranking integrity. Results report
+quality metrics, paired confidence intervals, latency percentiles, observed RSS,
+explain completeness, determinism, and an explicit `pass`, `fail`, or
+`insufficient_evidence` status. See [`benchmarks/README.md`](../benchmarks/README.md).
 
 ### MCP
 

@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use crate::envelope::{CmdOutput, NextAction, ParamMeta};
 use shiro_core::{ShiroError, ShiroHome};
-use shiro_sdk::SearchInput;
+use shiro_sdk::{SearchFilters, SearchInput};
 
 pub use shiro_sdk::SearchMode;
 
@@ -21,6 +21,7 @@ pub fn run(
     max_blocks: usize,
     max_chars: usize,
     rerank: bool,
+    filters: SearchFilters,
 ) -> Result<CmdOutput, ShiroError> {
     let runtime_profile = match (mode, rerank) {
         (SearchMode::Bm25, false) => crate::runtime::RuntimeProfile::Base,
@@ -38,6 +39,7 @@ pub fn run(
         max_blocks,
         max_chars,
         rerank,
+        filters,
     };
     let output = engine.search(&input)?;
 
@@ -51,10 +53,13 @@ pub fn run(
                 .iter()
                 .map(|cb| {
                     serde_json::json!({
+                        "evidence_handle": cb.evidence_handle,
                         "block_idx": cb.block_idx,
                         "kind": cb.kind,
+                        "heading_level": cb.heading_level,
                         "span": { "start": cb.span_start, "end": cb.span_end },
                         "text": cb.text,
+                        "source_locators": cb.source_locators,
                     })
                 })
                 .collect();
@@ -97,10 +102,13 @@ pub fn run(
 
             serde_json::json!({
                 "result_id": h.result_id,
+                "evidence_handle": h.evidence_handle,
                 "doc_id": h.doc_id,
                 "block_idx": h.block_idx,
                 "block_kind": h.block_kind,
+                "heading_level": h.heading_level,
                 "span": { "start": h.span_start, "end": h.span_end },
+                "source_locators": h.source_locators,
                 "snippet": h.snippet,
                 "scores": scores,
                 "context_window": context_window,

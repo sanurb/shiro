@@ -11,6 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::id::{DocId, SegmentId};
+use crate::source_locator::SourceLocator;
 use crate::span::Span;
 
 // ---------------------------------------------------------------------------
@@ -60,8 +61,11 @@ pub struct Segment {
     pub index: usize,
     /// Byte span within `canonical_text`.
     pub span: Span,
-    /// The textual content of this segment.
+    /// Source-faithful canonical content covered by `span`.
     pub body: String,
+    /// Versioned, bounded text supplied to lexical/vector/rerank retrieval.
+    #[serde(default)]
+    pub retrieval_text: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -84,6 +88,48 @@ pub enum BlockKind {
     Footnote,
 }
 
+/// Validated one-based heading depth with no format-specific maximum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, schemars::JsonSchema)]
+#[serde(transparent)]
+pub struct DocumentHeadingLevel(u32);
+
+impl DocumentHeadingLevel {
+    /// Construct a positive, one-based document heading level.
+    pub fn new(level: u32) -> Result<Self, DocumentHeadingLevelError> {
+        if level == 0 {
+            return Err(DocumentHeadingLevelError);
+        }
+        Ok(Self(level))
+    }
+
+    /// Return the one-based document heading level.
+    pub fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for DocumentHeadingLevel {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let level = u32::deserialize(deserializer)?;
+        Self::new(level).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Error returned when a document heading level is zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DocumentHeadingLevelError;
+
+impl std::fmt::Display for DocumentHeadingLevelError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("document heading level must be one-based and nonzero")
+    }
+}
+
+impl std::error::Error for DocumentHeadingLevelError {}
+
 /// A structural block within a document.
 ///
 /// Provenance model per `docs/ARCHITECTURE.md`:
@@ -96,8 +142,14 @@ pub struct Block {
     /// Normalized text for display/indexing. `None` until normalization runs.
     pub rendered_text: Option<String>,
     pub kind: BlockKind,
+    /// One-based structural depth for headings; absent when the parser has no reliable level.
+    #[serde(default)]
+    pub heading_level: Option<DocumentHeadingLevel>,
     /// Byte span within the document's `canonical_text`.
     pub span: Span,
+    /// Physical source evidence positions in deterministic parser order.
+    #[serde(default)]
+    pub source_locators: Vec<SourceLocator>,
 }
 
 /// Semantic relation between two blocks.
@@ -111,6 +163,8 @@ pub enum Relation {
     FootnoteOf,
     /// Block `from` references block `to` (citation, cross-reference).
     RefersTo,
+    /// Heading block `from` directly contains block or subsection `to`.
+    SectionContains,
 }
 
 /// A directed edge between two blocks in a [`BlockGraph`].
@@ -205,6 +259,8 @@ pub enum IrViolation {
         block_ref: usize,
         blocks_len: usize,
     },
+    /// A non-heading block declares a heading level.
+    HeadingLevelOnNonHeading { block: usize },
     /// ReadsBefore edges form a cycle.
     CycleDetected { involved_blocks: Vec<usize> },
 }
@@ -240,6 +296,12 @@ impl fmt::Display for IrViolation {
                 blocks_len,
             } => {
                 write!(f, "edge {edge_idx}: block ref {block_ref} out of bounds (blocks len {blocks_len})")
+            }
+            Self::HeadingLevelOnNonHeading { block } => {
+                write!(
+                    f,
+                    "block {block}: only heading blocks may declare a heading level"
+                )
             }
             Self::CycleDetected { involved_blocks } => {
                 write!(
@@ -285,7 +347,14 @@ impl BlockGraph {
             }
         }
 
-        // 2. reading_order: valid indices
+        // 2. Heading level belongs only to heading blocks.
+        for (index, block) in self.blocks.iter().enumerate() {
+            if block.heading_level.is_some() && block.kind != BlockKind::Heading {
+                violations.push(IrViolation::HeadingLevelOnNonHeading { block: index });
+            }
+        }
+
+        // 3. reading_order: valid indices
         for idx in &self.reading_order {
             if idx.0 >= n {
                 violations.push(IrViolation::InvalidReadingOrderIndex {
@@ -295,7 +364,7 @@ impl BlockGraph {
             }
         }
 
-        // 3. reading_order: completeness
+        // 4. reading_order: completeness
         if self.reading_order.len() != n {
             violations.push(IrViolation::ReadingOrderIncomplete {
                 expected: n,
@@ -303,7 +372,7 @@ impl BlockGraph {
             });
         }
 
-        // 4. reading_order: no duplicates
+        // 5. reading_order: no duplicates
         {
             let mut seen = HashSet::with_capacity(self.reading_order.len());
             for idx in &self.reading_order {
@@ -313,7 +382,7 @@ impl BlockGraph {
             }
         }
 
-        // 5. Edge bounds
+        // 6. Edge bounds
         for (i, edge) in self.edges.iter().enumerate() {
             if edge.from.0 >= n {
                 violations.push(IrViolation::EdgeOutOfBounds {
@@ -331,7 +400,7 @@ impl BlockGraph {
             }
         }
 
-        // 6. Cycle detection on ReadsBefore edges (iterative 3-color DFS)
+        // 7. Cycle detection on ReadsBefore edges (iterative 3-color DFS)
         if n > 0 {
             // Build adjacency list for ReadsBefore edges only
             let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -394,6 +463,46 @@ impl BlockGraph {
     }
 }
 
+/// Derive direct heading-to-content containment edges from reading order and heading levels.
+pub fn derive_heading_containment_edges(blocks: &[Block], reading_order: &[BlockIdx]) -> Vec<Edge> {
+    let mut heading_stack: Vec<(DocumentHeadingLevel, BlockIdx)> = Vec::new();
+    let mut edges = Vec::new();
+
+    for block_index in reading_order {
+        let Some(block) = blocks.get(block_index.0) else {
+            continue;
+        };
+        if block.kind == BlockKind::Heading {
+            let Some(level) = block.heading_level else {
+                heading_stack.clear();
+                continue;
+            };
+            while heading_stack
+                .last()
+                .is_some_and(|(ancestor_level, _)| *ancestor_level >= level)
+            {
+                heading_stack.pop();
+            }
+            if let Some((_, parent)) = heading_stack.last() {
+                edges.push(Edge {
+                    from: *parent,
+                    to: *block_index,
+                    relation: Relation::SectionContains,
+                });
+            }
+            heading_stack.push((level, *block_index));
+        } else if let Some((_, parent)) = heading_stack.last() {
+            edges.push(Edge {
+                from: *parent,
+                to: *block_index,
+                relation: Relation::SectionContains,
+            });
+        }
+    }
+
+    edges
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,7 +515,9 @@ mod tests {
             canonical_text: String::new(),
             rendered_text: None,
             kind: BlockKind::Paragraph,
+            heading_level: None,
             span: Span::new(start, end).unwrap(),
+            source_locators: Vec::new(),
         }
     }
 
@@ -608,7 +719,9 @@ mod tests {
                             canonical_text: String::new(),
                             rendered_text: None,
                             kind: BlockKind::Paragraph,
+                            heading_level: None,
                             span: Span::new(s, end).unwrap(),
+                            source_locators: Vec::new(),
                         }
                     })
                     .collect();
@@ -643,7 +756,9 @@ mod tests {
                     canonical_text: String::new(),
                     rendered_text: None,
                     kind: BlockKind::Paragraph,
+                    heading_level: None,
                     span,
+                    source_locators: Vec::new(),
                 };
                 let graph = BlockGraph {
                     blocks: vec![block],
@@ -663,7 +778,9 @@ mod tests {
                 canonical_text: String::new(),
                 rendered_text: None,
                 kind: BlockKind::Paragraph,
+                heading_level: None,
                 span: Span::new(i, i + 1).unwrap(),
+                source_locators: Vec::new(),
             }).collect();
             // Identity permutation
             let reading_order: Vec<BlockIdx> = (0..n).map(BlockIdx).collect();
@@ -674,6 +791,67 @@ mod tests {
             }).collect();
             prop_assert!(ro_issues.is_empty(), "identity permutation should be valid");
         }
+    }
+
+    #[test]
+    fn document_heading_level_rejects_zero_during_construction_and_deserialization() {
+        assert!(DocumentHeadingLevel::new(0).is_err());
+        assert_eq!(DocumentHeadingLevel::new(3).unwrap().as_u32(), 3);
+        assert!(serde_json::from_str::<DocumentHeadingLevel>("0").is_err());
+    }
+
+    #[test]
+    fn heading_containment_edges_preserve_direct_section_hierarchy() {
+        let mut blocks = vec![
+            make_block(0, 1),
+            make_block(1, 2),
+            make_block(2, 3),
+            make_block(3, 4),
+        ];
+        blocks[0].kind = BlockKind::Heading;
+        blocks[0].heading_level = Some(DocumentHeadingLevel::new(1).unwrap());
+        blocks[2].kind = BlockKind::Heading;
+        blocks[2].heading_level = Some(DocumentHeadingLevel::new(2).unwrap());
+        let reading_order = vec![BlockIdx(0), BlockIdx(1), BlockIdx(2), BlockIdx(3)];
+
+        let edges = derive_heading_containment_edges(&blocks, &reading_order);
+
+        assert_eq!(
+            edges,
+            vec![
+                Edge {
+                    from: BlockIdx(0),
+                    to: BlockIdx(1),
+                    relation: Relation::SectionContains,
+                },
+                Edge {
+                    from: BlockIdx(0),
+                    to: BlockIdx(2),
+                    relation: Relation::SectionContains,
+                },
+                Edge {
+                    from: BlockIdx(2),
+                    to: BlockIdx(3),
+                    relation: Relation::SectionContains,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn heading_level_on_non_heading_is_invalid_ir() {
+        let mut block = make_block(0, 1);
+        block.heading_level = Some(DocumentHeadingLevel::new(1).unwrap());
+        let graph = BlockGraph {
+            blocks: vec![block],
+            edges: Vec::new(),
+            reading_order: vec![BlockIdx(0)],
+        };
+
+        assert_eq!(
+            graph.validate(1),
+            vec![IrViolation::HeadingLevelOnNonHeading { block: 0 }]
+        );
     }
 
     #[test]
@@ -696,7 +874,9 @@ mod tests {
                 canonical_text: String::new(),
                 rendered_text: None,
                 kind: BlockKind::Paragraph,
+                heading_level: None,
                 span: Span::new(i, i + 1).unwrap(),
+                source_locators: Vec::new(),
             }).collect();
             let reading_order: Vec<BlockIdx> = (0..n).map(BlockIdx).collect();
             // Generate edges with non-ReadsBefore relations only
@@ -721,7 +901,9 @@ mod tests {
                 canonical_text: String::new(),
                 rendered_text: None,
                 kind: BlockKind::Paragraph,
+                heading_level: None,
                 span: Span::new(i, i + 1).unwrap(),
+                source_locators: Vec::new(),
             }).collect();
             let mut reading_order: Vec<BlockIdx> = (0..n).map(BlockIdx).collect();
             reading_order.remove(remove_idx);

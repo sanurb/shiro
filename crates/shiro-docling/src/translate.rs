@@ -12,11 +12,12 @@
 //! - Docling types never leak past this module boundary
 
 use shiro_core::ir::{
-    Block, BlockGraph, BlockIdx, BlockKind, Document, Edge, LossKind, Metadata, ParseLoss, Relation,
+    derive_heading_containment_edges, Block, BlockGraph, BlockIdx, BlockKind, Document,
+    DocumentHeadingLevel, Edge, LossKind, Metadata, ParseLoss, Relation,
 };
-use shiro_core::{DocId, Span};
+use shiro_core::{DocId, PageDimensions, SourceLocator, SourceRegion, Span};
 
-use crate::schema::{ChildRef, DoclingDocument, TableData, TableItem, TextItem};
+use crate::schema::{ChildRef, DoclingDocument, ProvenanceItem, TableData, TableItem, TextItem};
 
 /// Translate a Docling document into shiro's canonical IR.
 ///
@@ -31,11 +32,12 @@ pub fn translate(docling: &DoclingDocument, source_uri: &str, raw_content: &[u8]
     // Walk the body tree depth-first — this follows Docling's reading order.
     walk_children(&docling.body.children, docling, &mut builder);
 
-    let (canonical_text, blocks, edges, losses) = builder.finish();
+    let (canonical_text, blocks, mut edges, losses) = builder.finish();
 
     let title = extract_title(docling, &blocks);
 
     let reading_order: Vec<BlockIdx> = (0..blocks.len()).map(BlockIdx).collect();
+    edges.extend(derive_heading_containment_edges(&blocks, &reading_order));
 
     Document {
         id,
@@ -74,7 +76,13 @@ impl IrBuilder {
     }
 
     /// Append a block. Handles separator insertion and span tracking.
-    fn push_block(&mut self, text: &str, kind: BlockKind) {
+    fn push_block(
+        &mut self,
+        text: &str,
+        kind: BlockKind,
+        heading_level: Option<DocumentHeadingLevel>,
+        source_locators: Vec<SourceLocator>,
+    ) {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return;
@@ -110,7 +118,9 @@ impl IrBuilder {
             canonical_text: trimmed.to_string(),
             rendered_text: None,
             kind,
+            heading_level,
             span,
+            source_locators,
         });
     }
 
@@ -150,7 +160,7 @@ fn resolve_ref(reference: &str, doc: &DoclingDocument, builder: &mut IrBuilder) 
     if let Some(idx_str) = stripped.strip_prefix("/texts/") {
         if let Ok(idx) = idx_str.parse::<usize>() {
             if let Some(text_item) = doc.texts.get(idx) {
-                emit_text_block(text_item, builder);
+                emit_text_block(text_item, doc, builder);
                 return;
             }
         }
@@ -158,7 +168,7 @@ fn resolve_ref(reference: &str, doc: &DoclingDocument, builder: &mut IrBuilder) 
     } else if let Some(idx_str) = stripped.strip_prefix("/tables/") {
         if let Ok(idx) = idx_str.parse::<usize>() {
             if let Some(table_item) = doc.tables.get(idx) {
-                emit_table_block(table_item, builder);
+                emit_table_block(table_item, doc, builder);
                 return;
             }
         }
@@ -180,9 +190,86 @@ fn resolve_ref(reference: &str, doc: &DoclingDocument, builder: &mut IrBuilder) 
 }
 
 /// Convert a Docling text item into a shiro block.
-fn emit_text_block(item: &TextItem, builder: &mut IrBuilder) {
+fn emit_text_block(item: &TextItem, doc: &DoclingDocument, builder: &mut IrBuilder) {
     let kind = label_to_block_kind(&item.label);
-    builder.push_block(&item.text, kind);
+    let locators = translate_provenance(&item.prov, doc, builder);
+    let heading_level = if kind == BlockKind::Heading {
+        item.level
+            .and_then(|level| match DocumentHeadingLevel::new(level) {
+                Ok(level) => Some(level),
+                Err(error) => {
+                    builder.push_loss(
+                        LossKind::Layout,
+                        format!("invalid Docling heading level: {error}"),
+                    );
+                    None
+                }
+            })
+    } else {
+        None
+    };
+    builder.push_block(&item.text, kind, heading_level, locators);
+}
+
+/// Translate Docling's private provenance schema into parser-neutral locators.
+fn translate_provenance(
+    provenance: &[ProvenanceItem],
+    doc: &DoclingDocument,
+    builder: &mut IrBuilder,
+) -> Vec<SourceLocator> {
+    let mut locators = Vec::new();
+    for (index, item) in provenance.iter().enumerate() {
+        let Some(page_number) = item.page_no else {
+            builder.push_loss(
+                LossKind::Layout,
+                format!("Docling provenance item {index} has no page number"),
+            );
+            continue;
+        };
+        let region = match item.bbox.as_ref() {
+            Some(bbox) => match SourceRegion::new(bbox.l, bbox.t, bbox.r, bbox.b) {
+                Ok(region) => Some(region),
+                Err(error) => {
+                    builder.push_loss(
+                        LossKind::Layout,
+                        format!("invalid Docling region on page {page_number}: {error}"),
+                    );
+                    continue;
+                }
+            },
+            None => None,
+        };
+        let page_dimensions = doc
+            .pages
+            .get(&page_number.to_string())
+            .or_else(|| {
+                doc.pages
+                    .values()
+                    .find(|page| page.page_no == Some(page_number))
+            })
+            .and_then(|page| page.size.as_ref());
+        let page_dimensions = match page_dimensions {
+            Some(size) => match PageDimensions::new(size.width, size.height) {
+                Ok(dimensions) => Some(dimensions),
+                Err(error) => {
+                    builder.push_loss(
+                        LossKind::Layout,
+                        format!("invalid Docling page dimensions for page {page_number}: {error}"),
+                    );
+                    continue;
+                }
+            },
+            None => None,
+        };
+        match SourceLocator::new(page_number, region, None, page_dimensions) {
+            Ok(locator) => locators.push(locator),
+            Err(error) => builder.push_loss(
+                LossKind::Layout,
+                format!("invalid Docling source locator {index}: {error}"),
+            ),
+        }
+    }
+    locators
 }
 
 /// Convert a Docling table item into a shiro block.
@@ -190,7 +277,8 @@ fn emit_text_block(item: &TextItem, builder: &mut IrBuilder) {
 /// Tables are serialized as pipe-delimited text. If the table has structured
 /// cell data, we produce a markdown-like table representation. Otherwise we
 /// record a ParseLoss.
-fn emit_table_block(item: &TableItem, builder: &mut IrBuilder) {
+fn emit_table_block(item: &TableItem, doc: &DoclingDocument, builder: &mut IrBuilder) {
+    let locators = translate_provenance(&item.prov, doc, builder);
     match &item.data {
         Some(data) if !data.table_cells.is_empty() => {
             let text = render_table_as_text(data);
@@ -200,7 +288,7 @@ fn emit_table_block(item: &TableItem, builder: &mut IrBuilder) {
                     "table with empty cells omitted".to_string(),
                 );
             } else {
-                builder.push_block(&text, BlockKind::TableCell);
+                builder.push_block(&text, BlockKind::TableCell, None, locators);
             }
         }
         _ => {
@@ -362,6 +450,7 @@ mod tests {
         );
         assert_eq!(result.blocks.blocks.len(), 3);
         assert_eq!(result.blocks.blocks[0].kind, BlockKind::Heading);
+        assert_eq!(result.blocks.blocks[0].heading_level, None);
         assert_eq!(result.blocks.blocks[1].kind, BlockKind::Paragraph);
         assert_eq!(result.blocks.blocks[2].kind, BlockKind::Paragraph);
 

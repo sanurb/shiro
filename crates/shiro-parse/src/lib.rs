@@ -8,12 +8,14 @@ use shiro_core::ir::{
     Block, BlockGraph, BlockIdx, BlockKind, Document, Edge, Metadata, Relation, Segment,
 };
 use shiro_core::ports::Parser;
-use shiro_core::{DocId, SegmentId, ShiroError, Span};
+use shiro_core::{DocId, ShiroError, Span};
 
 pub mod markdown;
 pub use markdown::MarkdownParser;
 pub mod pdf;
 pub use pdf::PdfParser;
+mod retrieval_text;
+pub use retrieval_text::{MAX_RETRIEVAL_TEXT_BYTES, RETRIEVAL_TEXT_VERSION};
 
 // ---------------------------------------------------------------------------
 // Parser
@@ -26,7 +28,7 @@ pub struct PlainTextParser;
 /// Segmenter version — bump when segmentation logic changes.
 ///
 /// Used in [`ProcessingFingerprint`] to detect stale segments (ADR-004).
-pub const SEGMENTER_VERSION: u32 = 1;
+pub const SEGMENTER_VERSION: u32 = 2;
 
 impl Parser for PlainTextParser {
     fn name(&self) -> &str {
@@ -78,42 +80,7 @@ fn extract_title(text: &str) -> Option<String> {
 /// Uses `reading_order` to derive segments from the block arena. Every
 /// parser now produces a `BlockGraph`, so there is no text-split fallback.
 pub fn segment_document(doc: &Document) -> Result<Vec<Segment>, ShiroError> {
-    segment_from_blocks(doc, &doc.blocks)
-}
-
-fn segment_from_blocks(
-    doc: &Document,
-    graph: &shiro_core::BlockGraph,
-) -> Result<Vec<Segment>, ShiroError> {
-    let mut segments = Vec::new();
-    let mut seg_idx = 0usize;
-
-    for block_idx in &graph.reading_order {
-        let BlockIdx(idx) = *block_idx;
-        let block = graph.blocks.get(idx).ok_or_else(|| ShiroError::InvalidIr {
-            message: format!(
-                "block index {idx} out of range (len={})",
-                graph.blocks.len()
-            ),
-        })?;
-
-        let trimmed = block.canonical_text.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        // Use the block's span directly — it already references canonical_text.
-        segments.push(Segment {
-            id: SegmentId::new(&doc.id, seg_idx),
-            doc_id: doc.id.clone(),
-            index: seg_idx,
-            span: block.span,
-            body: trimmed.to_string(),
-        });
-        seg_idx += 1;
-    }
-
-    Ok(segments)
+    retrieval_text::derive_segments(doc, &doc.blocks)
 }
 
 /// Build a [`BlockGraph`] from plain text by splitting on paragraph
@@ -139,7 +106,9 @@ pub fn build_paragraph_block_graph(text: &str) -> BlockGraph {
                 canonical_text: trimmed.to_string(),
                 rendered_text: None,
                 kind: BlockKind::Paragraph,
+                heading_level: None,
                 span,
+                source_locators: Vec::new(),
             });
         }
     }

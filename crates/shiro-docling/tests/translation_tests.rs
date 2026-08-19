@@ -82,6 +82,42 @@ mod simple_report {
     }
 
     #[test]
+    fn page_regions_and_dimensions_survive_translation() {
+        let doc = parse_fixture();
+        let first = &doc.blocks.blocks[0].source_locators;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].page_number(), 1);
+        let region = first[0].region().unwrap();
+        assert_eq!(
+            (region.x0(), region.y0(), region.x1(), region.y1()),
+            (72.0, 72.0, 300.0, 90.0)
+        );
+        assert!(first[0].coordinate_origin().is_none());
+        let dimensions = first[0].page_dimensions().unwrap();
+        assert_eq!((dimensions.width(), dimensions.height()), (612.0, 792.0));
+
+        let conclusion = &doc.blocks.blocks[8].source_locators;
+        assert_eq!(conclusion[0].page_number(), 2);
+    }
+
+    #[test]
+    fn heading_levels_survive_translation() {
+        let doc = parse_fixture();
+        let headings = doc
+            .blocks
+            .blocks
+            .iter()
+            .filter(|block| block.kind == BlockKind::Heading)
+            .map(|block| {
+                block
+                    .heading_level
+                    .map(shiro_core::DocumentHeadingLevel::as_u32)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(headings, vec![Some(1), Some(1), Some(1)]);
+    }
+
+    #[test]
     fn footnote_in_body_produces_block() {
         let doc = parse_fixture();
         let last = doc.blocks.blocks.last().expect("should have blocks");
@@ -122,19 +158,16 @@ mod simple_report {
     fn reads_before_edges_form_chain() {
         let doc = parse_fixture();
         let n = doc.blocks.blocks.len();
-        assert_eq!(
-            doc.blocks.edges.len(),
-            n - 1,
-            "should have n-1 ReadsBefore edges"
-        );
-        for (i, edge) in doc.blocks.edges.iter().enumerate() {
+        let reading_edges = doc
+            .blocks
+            .edges
+            .iter()
+            .filter(|edge| edge.relation == shiro_core::Relation::ReadsBefore)
+            .collect::<Vec<_>>();
+        assert_eq!(reading_edges.len(), n - 1);
+        for (i, edge) in reading_edges.into_iter().enumerate() {
             assert_eq!(edge.from.0, i, "edge {i} from should be {i}");
             assert_eq!(edge.to.0, i + 1, "edge {i} to should be {}", i + 1);
-            assert_eq!(
-                edge.relation,
-                shiro_core::Relation::ReadsBefore,
-                "all edges should be ReadsBefore"
-            );
         }
     }
 

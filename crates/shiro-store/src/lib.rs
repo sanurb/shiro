@@ -3,14 +3,18 @@
 use shiro_core::enrichment::EnrichmentResult;
 use shiro_core::error::ShiroError;
 use shiro_core::fingerprint::ProcessingFingerprint;
-use shiro_core::generation::{GenerationId, IndexGeneration};
+use shiro_core::generation::{CorpusManifest, GenerationId, IndexGeneration};
 use shiro_core::id::{DocId, SegmentId, VersionId};
 use shiro_core::ir::{
-    Block, BlockGraph, BlockIdx, BlockKind, Document, Edge, Metadata, Relation, Segment,
+    Block, BlockGraph, BlockIdx, BlockKind, Document, DocumentHeadingLevel, Edge, LossKind,
+    Metadata, ParseLoss, Relation, Segment,
 };
 use shiro_core::manifest::DocState;
+use shiro_core::provenance::{ProvenanceActorKind, ProvenanceRecord, TrustZone, WriteProvenance};
+use shiro_core::source_locator::{CoordinateOrigin, PageDimensions, SourceLocator, SourceRegion};
 use shiro_core::span::Span;
 use shiro_core::taxonomy::{Concept, ConceptId, ConceptRelation, SkosRelation};
+use shiro_core::{evidence_handle_for_block, EvidenceHandleId};
 
 /// Map any `rusqlite::Error` into `ShiroError::StoreCorrupt`.
 fn map_db(e: rusqlite::Error) -> ShiroError {
@@ -20,6 +24,17 @@ fn map_db(e: rusqlite::Error) -> ShiroError {
 }
 
 /// Parse a `DocState` from its SQL string representation.
+fn parse_provenance_actor_kind(s: &str) -> Result<ProvenanceActorKind, ShiroError> {
+    match s {
+        "HUMAN" => Ok(ProvenanceActorKind::Human),
+        "SYSTEM" => Ok(ProvenanceActorKind::System),
+        "AGENT" => Ok(ProvenanceActorKind::Agent),
+        other => Err(ShiroError::StoreCorrupt {
+            message: format!("unknown ProvenanceActorKind: {other}"),
+        }),
+    }
+}
+
 fn parse_state(s: &str) -> Result<DocState, ShiroError> {
     match s {
         "STAGED" => Ok(DocState::Staged),
@@ -68,6 +83,50 @@ fn block_kind_to_sql(kind: &BlockKind) -> &'static str {
 }
 
 /// Parse a `BlockKind` from its SQL string representation.
+fn loss_kind_to_sql(kind: LossKind) -> &'static str {
+    match kind {
+        LossKind::Image => "IMAGE",
+        LossKind::Table => "TABLE",
+        LossKind::Math => "MATH",
+        LossKind::Media => "MEDIA",
+        LossKind::Layout => "LAYOUT",
+        LossKind::Encoding => "ENCODING",
+        LossKind::Other => "OTHER",
+    }
+}
+
+fn parse_loss_kind(s: &str) -> Result<LossKind, ShiroError> {
+    match s {
+        "IMAGE" => Ok(LossKind::Image),
+        "TABLE" => Ok(LossKind::Table),
+        "MATH" => Ok(LossKind::Math),
+        "MEDIA" => Ok(LossKind::Media),
+        "LAYOUT" => Ok(LossKind::Layout),
+        "ENCODING" => Ok(LossKind::Encoding),
+        "OTHER" => Ok(LossKind::Other),
+        other => Err(ShiroError::StoreCorrupt {
+            message: format!("unknown LossKind: {other}"),
+        }),
+    }
+}
+
+fn coordinate_origin_to_sql(origin: CoordinateOrigin) -> &'static str {
+    match origin {
+        CoordinateOrigin::TopLeft => "TOP_LEFT",
+        CoordinateOrigin::BottomLeft => "BOTTOM_LEFT",
+    }
+}
+
+fn parse_coordinate_origin(s: &str) -> Result<CoordinateOrigin, ShiroError> {
+    match s {
+        "TOP_LEFT" => Ok(CoordinateOrigin::TopLeft),
+        "BOTTOM_LEFT" => Ok(CoordinateOrigin::BottomLeft),
+        other => Err(ShiroError::StoreCorrupt {
+            message: format!("unknown source coordinate origin: {other}"),
+        }),
+    }
+}
+
 fn parse_block_kind(s: &str) -> Result<BlockKind, ShiroError> {
     match s {
         "PARAGRAPH" => Ok(BlockKind::Paragraph),
@@ -90,6 +149,7 @@ fn relation_to_edge_sql(rel: &Relation) -> &'static str {
         Relation::CaptionOf => "CAPTION_OF",
         Relation::FootnoteOf => "FOOTNOTE_OF",
         Relation::RefersTo => "REFERS_TO",
+        Relation::SectionContains => "SECTION_CONTAINS",
     }
 }
 
@@ -100,6 +160,7 @@ fn parse_edge_relation(s: &str) -> Result<Relation, ShiroError> {
         "CAPTION_OF" => Ok(Relation::CaptionOf),
         "FOOTNOTE_OF" => Ok(Relation::FootnoteOf),
         "REFERS_TO" => Ok(Relation::RefersTo),
+        "SECTION_CONTAINS" => Ok(Relation::SectionContains),
         other => Err(ShiroError::StoreCorrupt {
             message: format!("unknown block Relation: {other}"),
         }),
@@ -107,11 +168,81 @@ fn parse_edge_relation(s: &str) -> Result<Relation, ShiroError> {
 }
 
 /// Current schema version this binary expects.
-pub const CURRENT_SCHEMA_VERSION: u32 = 7;
+pub const CURRENT_SCHEMA_VERSION: u32 = 21;
+
+/// Attributed model-enrichment proposal isolated from trusted taxonomy state.
+#[derive(Debug, Clone)]
+pub struct ModelEnrichmentProposalRecord {
+    pub proposal_id: String,
+    pub doc_id: DocId,
+    pub provider: String,
+    pub model: String,
+    pub actor_id: String,
+    pub data_region: String,
+    pub retention_policy: String,
+    pub consent_id: String,
+    pub payload_json: String,
+    pub status: String,
+    pub applied_concepts_json: String,
+}
+
+/// Generations protected from orphan cleanup because at least one corpus manifest names them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorpusManifestGenerationReferences {
+    /// FTS generations retained for active, rollback, or audit manifests.
+    pub fts_generations: Vec<GenerationId>,
+    /// Vector generations retained for active, rollback, reuse, or audit manifests.
+    pub vector_generations: Vec<GenerationId>,
+}
+
+/// One proposed concept and assignment applied during explicit promotion.
+#[derive(Debug, Clone)]
+pub struct ProposedConceptAssignment {
+    pub concept: Concept,
+    pub confidence: f32,
+}
+
+/// Network and content evidence captured by one bounded URL acquisition.
+#[derive(Debug, Clone)]
+pub struct UrlAcquisitionRecord {
+    pub requested_url: String,
+    pub final_url: String,
+    pub redirects_json: String,
+    pub content_type: Option<String>,
+    pub signature: String,
+    pub byte_count: usize,
+    pub content_hash: String,
+}
+
+/// Stored resolution of a stable canonical block handle.
+#[derive(Debug, Clone)]
+pub struct EvidenceHandleResolution {
+    pub handle_id: EvidenceHandleId,
+    pub status: String,
+    pub superseded_by: Option<EvidenceHandleId>,
+    pub doc_id: DocId,
+    pub block_idx: usize,
+    pub block_kind: BlockKind,
+    pub heading_level: Option<u32>,
+    pub span: Span,
+    pub canonical_text: String,
+    pub source_locators: Vec<SourceLocator>,
+}
+
+/// Immutable metadata shared by every result produced in one search snapshot.
+pub struct SearchSnapshotMetadata<'a> {
+    pub search_snapshot_id: &'a str,
+    pub retrieval_policy_json: &'a str,
+    pub query: &'a str,
+    pub query_digest: &'a str,
+    pub fts_generation: u64,
+    pub vector_generation: u64,
+}
 
 /// A row to be saved in the `search_results` table.
 pub struct SearchResultRow {
     pub result_id: String,
+    pub evidence_handle: EvidenceHandleId,
     pub doc_id: DocId,
     pub segment_id: SegmentId,
     pub bm25_score: Option<f32>,
@@ -124,14 +255,19 @@ pub struct SearchResultRow {
     pub reranker_rank: Option<usize>,
     pub block_idx: usize,
     pub block_kind: String,
+    pub heading_level: Option<u32>,
     pub span_start: usize,
     pub span_end: usize,
+    pub source_locators: Vec<SourceLocator>,
 }
 
 /// Detail returned from `get_search_result`.
 pub struct SearchResultDetail {
     pub query: String,
     pub query_digest: Option<String>,
+    pub search_snapshot_id: String,
+    pub retrieval_policy_json: String,
+    pub evidence_handle: Option<EvidenceHandleId>,
     pub doc_id: DocId,
     pub segment_id: SegmentId,
     pub bm25_score: Option<f32>,
@@ -146,8 +282,10 @@ pub struct SearchResultDetail {
     pub reranker_rank: Option<usize>,
     pub block_idx: usize,
     pub block_kind: String,
+    pub heading_level: Option<u32>,
     pub span_start: usize,
     pub span_end: usize,
+    pub source_locators: Vec<SourceLocator>,
 }
 
 /// V3 DDL for new tables (used in both fresh-create and migration).
@@ -209,7 +347,157 @@ CREATE TABLE IF NOT EXISTS active_generations (
 );
 ";
 
+const V21_CREATE_TABLES: &str = "
+CREATE TABLE IF NOT EXISTS model_enrichment_proposals (
+    proposal_id TEXT PRIMARY KEY,
+    doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    data_region TEXT NOT NULL,
+    retention_policy TEXT NOT NULL,
+    consent_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('PROPOSED','PROMOTED','REJECTED')),
+    applied_concepts_json TEXT NOT NULL DEFAULT '[]',
+    resolved_actor_id TEXT,
+    approval_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    resolved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_model_proposals_doc_status
+    ON model_enrichment_proposals(doc_id, status);
+";
+
+const V20_CREATE_TABLES: &str = "
+CREATE TABLE IF NOT EXISTS url_acquisitions (
+    acquisition_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+    requested_url TEXT NOT NULL,
+    final_url TEXT NOT NULL,
+    redirects_json TEXT NOT NULL,
+    content_type TEXT,
+    signature TEXT NOT NULL,
+    byte_count INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_url_acquisitions_doc
+    ON url_acquisitions(doc_id, acquisition_id);
+";
+
+const V19_CREATE_TABLES: &str = "
+CREATE TABLE IF NOT EXISTS mcp_mutation_audit (
+    audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    approval_id TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    params_digest TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_mcp_mutation_audit_run
+    ON mcp_mutation_audit(run_id, audit_id);
+";
+
+const V17_CREATE_TABLES: &str = "
+CREATE TABLE IF NOT EXISTS evidence_handles (
+    handle_id TEXT PRIMARY KEY,
+    doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+    block_idx INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('ACTIVE','SUPERSEDED')),
+    superseded_by TEXT,
+    block_kind TEXT NOT NULL,
+    heading_level INTEGER,
+    span_start INTEGER NOT NULL,
+    span_end INTEGER NOT NULL,
+    canonical_text TEXT NOT NULL,
+    source_locators_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_handles_doc_status
+    ON evidence_handles(doc_id, status);
+";
+
+const V12_CREATE_TABLES: &str = "
+CREATE TABLE IF NOT EXISTS block_source_locators (
+    doc_id TEXT NOT NULL,
+    block_idx INTEGER NOT NULL,
+    locator_idx INTEGER NOT NULL,
+    page_number INTEGER NOT NULL CHECK(page_number > 0),
+    region_x0 REAL,
+    region_y0 REAL,
+    region_x1 REAL,
+    region_y1 REAL,
+    coordinate_origin TEXT CHECK(coordinate_origin IN ('TOP_LEFT','BOTTOM_LEFT')),
+    page_width REAL,
+    page_height REAL,
+    PRIMARY KEY (doc_id, block_idx, locator_idx),
+    FOREIGN KEY (doc_id, block_idx) REFERENCES blocks(doc_id, block_idx) ON DELETE CASCADE
+);
+";
+
+const V11_CREATE_TABLES: &str = "
+CREATE TABLE IF NOT EXISTS corpus_manifests (
+    manifest_id TEXT PRIMARY KEY,
+    corpus_digest TEXT NOT NULL,
+    document_count INTEGER NOT NULL,
+    segment_count INTEGER NOT NULL,
+    fts_generation INTEGER NOT NULL,
+    fts_digest TEXT NOT NULL,
+    vector_generation INTEGER,
+    vector_digest TEXT,
+    embedding_fingerprint_hash TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS active_corpus_manifest (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    manifest_id TEXT NOT NULL REFERENCES corpus_manifests(manifest_id)
+);
+";
+
 /// V5 DDL: persist BlockGraph as first-class stored representation (ADR-006).
+const V10_CREATE_TABLES: &str = "
+CREATE TABLE IF NOT EXISTS provenance_records (
+    provenance_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    actor_kind TEXT NOT NULL CHECK(actor_kind IN ('HUMAN','SYSTEM','AGENT')),
+    actor_id TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_provenance_doc ON provenance_records(doc_id, provenance_id);
+
+CREATE TABLE IF NOT EXISTS source_artifacts (
+    source_artifact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+    content_hash TEXT NOT NULL REFERENCES blobs(content_hash),
+    source_uri TEXT NOT NULL,
+    byte_count INTEGER NOT NULL,
+    trust_zone TEXT NOT NULL CHECK(trust_zone IN ('CANONICAL','DERIVED','PROPOSED','QUARANTINED')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE(doc_id, content_hash, source_uri)
+);
+";
+
+const V9_CREATE_TABLES: &str = "
+CREATE TABLE IF NOT EXISTS document_losses (
+    doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+    loss_idx INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    span_start INTEGER,
+    span_end INTEGER,
+    message TEXT NOT NULL,
+    PRIMARY KEY (doc_id, loss_idx)
+);
+";
+
 const V5_CREATE_TABLES: &str = "
 CREATE TABLE IF NOT EXISTS blocks (
     doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
@@ -219,6 +507,7 @@ CREATE TABLE IF NOT EXISTS blocks (
     span_end INTEGER NOT NULL,
     canonical_text TEXT NOT NULL,
     rendered_text TEXT,
+    heading_level INTEGER,
     PRIMARY KEY (doc_id, block_idx)
 );
 
@@ -396,6 +685,131 @@ fn run_migrations(conn: &rusqlite::Connection, from_version: u32) -> Result<(), 
             }
         }
 
+        if version == 7 {
+            // v7 → v8: immutable retrieval snapshot identity and policy evidence.
+            let has_snapshot = conn
+                .prepare("SELECT search_snapshot_id FROM search_results LIMIT 0")
+                .is_ok();
+            if !has_snapshot {
+                conn.execute_batch(
+                    "ALTER TABLE search_results ADD COLUMN search_snapshot_id TEXT NOT NULL DEFAULT '';
+                     ALTER TABLE search_results ADD COLUMN retrieval_policy_json TEXT NOT NULL DEFAULT '{}';",
+                )
+                .map_err(map_db)?;
+            }
+        }
+
+        if version == 8 {
+            // v8 → v9: persist parser-reported losses with the canonical graph.
+            conn.execute_batch(V9_CREATE_TABLES).map_err(map_db)?;
+        }
+
+        if version == 9 {
+            // v9 → v10: provenance-bearing immutable source artifacts.
+            let has_trust_zone = conn
+                .prepare("SELECT trust_zone FROM documents LIMIT 0")
+                .is_ok();
+            if !has_trust_zone {
+                conn.execute_batch(
+                    "ALTER TABLE documents ADD COLUMN trust_zone TEXT NOT NULL DEFAULT 'CANONICAL';",
+                )
+                .map_err(map_db)?;
+            }
+            conn.execute_batch(V10_CREATE_TABLES).map_err(map_db)?;
+        }
+
+        if version == 10 {
+            // v10 → v11: one authoritative manifest couples derived indices.
+            conn.execute_batch(V11_CREATE_TABLES).map_err(map_db)?;
+        }
+
+        if version == 11 {
+            // v11 → v12: canonical parser-neutral source locators (ADR-035).
+            conn.execute_batch(V12_CREATE_TABLES).map_err(map_db)?;
+        }
+
+        if version == 12 {
+            // v12 → v13: snapshot exact entry-point locators for explain.
+            let has_source_locators = conn
+                .prepare("SELECT source_locators_json FROM search_results LIMIT 0")
+                .is_ok();
+            if !has_source_locators {
+                conn.execute_batch(
+                    "ALTER TABLE search_results ADD COLUMN source_locators_json TEXT NOT NULL DEFAULT '[]';",
+                )
+                .map_err(map_db)?;
+            }
+        }
+
+        if version == 13 {
+            // v13 → v14: preserve parser heading depth.
+            let has_heading_level = conn
+                .prepare("SELECT heading_level FROM blocks LIMIT 0")
+                .is_ok();
+            if !has_heading_level {
+                conn.execute_batch("ALTER TABLE blocks ADD COLUMN heading_level INTEGER;")
+                    .map_err(map_db)?;
+            }
+        }
+
+        if version == 14 {
+            // v14 → v15: separate source-faithful body from retrieval text.
+            let has_retrieval_text = conn
+                .prepare("SELECT retrieval_text FROM segments LIMIT 0")
+                .is_ok();
+            if !has_retrieval_text {
+                conn.execute_batch(
+                    "ALTER TABLE segments ADD COLUMN retrieval_text TEXT;
+                     UPDATE segments SET retrieval_text = body WHERE retrieval_text IS NULL;",
+                )
+                .map_err(map_db)?;
+            }
+        }
+
+        if version == 15 {
+            // v15 → v16: snapshot exact entry-point heading depth for explain.
+            let has_heading_level = conn
+                .prepare("SELECT heading_level FROM search_results LIMIT 0")
+                .is_ok();
+            if !has_heading_level {
+                conn.execute_batch("ALTER TABLE search_results ADD COLUMN heading_level INTEGER;")
+                    .map_err(map_db)?;
+            }
+        }
+
+        if version == 16 {
+            // v16 → v17: stable block handles and explicit supersession.
+            conn.execute_batch(V17_CREATE_TABLES).map_err(map_db)?;
+        }
+
+        if version == 17 {
+            // v17 → v18: snapshot stable evidence handles with search results.
+            let has_evidence_handle = conn
+                .prepare("SELECT evidence_handle FROM search_results LIMIT 0")
+                .is_ok();
+            if !has_evidence_handle {
+                conn.execute_batch(
+                    "ALTER TABLE search_results ADD COLUMN evidence_handle TEXT NOT NULL DEFAULT '';",
+                )
+                .map_err(map_db)?;
+            }
+        }
+
+        if version == 18 {
+            // v18 → v19: actor/run/approval provenance for MCP mutations.
+            conn.execute_batch(V19_CREATE_TABLES).map_err(map_db)?;
+        }
+
+        if version == 19 {
+            // v19 → v20: bounded URL acquisition evidence.
+            conn.execute_batch(V20_CREATE_TABLES).map_err(map_db)?;
+        }
+
+        if version == 20 {
+            // v20 → v21: reversible model-enrichment proposals.
+            conn.execute_batch(V21_CREATE_TABLES).map_err(map_db)?;
+        }
+
         // Update version after each successful migration.
         conn.execute(
             "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -446,6 +860,8 @@ impl Store {
                 state TEXT NOT NULL DEFAULT 'STAGED'
                     CHECK(state IN ('STAGED','INDEXING','READY','FAILED','DELETED')),
                 active_version_id TEXT,
+                trust_zone TEXT NOT NULL DEFAULT 'CANONICAL'
+                    CHECK(trust_zone IN ('CANONICAL','DERIVED','PROPOSED','QUARANTINED')),
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                 updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
             );
@@ -457,6 +873,7 @@ impl Store {
                 span_start INTEGER NOT NULL,
                 span_end INTEGER NOT NULL,
                 body TEXT NOT NULL,
+                retrieval_text TEXT,
                 version_id TEXT
             );
 
@@ -478,10 +895,15 @@ impl Store {
                 query_digest TEXT,
                 reranker_score REAL,
                 reranker_rank INTEGER,
+                search_snapshot_id TEXT NOT NULL DEFAULT '',
+                retrieval_policy_json TEXT NOT NULL DEFAULT '{}',
                 block_idx INTEGER NOT NULL DEFAULT 0,
                 block_kind TEXT NOT NULL DEFAULT 'PARAGRAPH',
+                heading_level INTEGER,
                 span_start INTEGER NOT NULL DEFAULT 0,
                 span_end INTEGER NOT NULL DEFAULT 0,
+                source_locators_json TEXT NOT NULL DEFAULT '[]',
+                evidence_handle TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
             );
 
@@ -506,8 +928,16 @@ impl Store {
         // V3 tables (idempotent via IF NOT EXISTS)
         conn.execute_batch(V3_CREATE_TABLES).map_err(map_db)?;
 
-        // V5 tables: BlockGraph persistence (ADR-006)
+        // Canonical graph, parse-loss, source-artifact, and provenance persistence.
         conn.execute_batch(V5_CREATE_TABLES).map_err(map_db)?;
+        conn.execute_batch(V9_CREATE_TABLES).map_err(map_db)?;
+        conn.execute_batch(V10_CREATE_TABLES).map_err(map_db)?;
+        conn.execute_batch(V11_CREATE_TABLES).map_err(map_db)?;
+        conn.execute_batch(V12_CREATE_TABLES).map_err(map_db)?;
+        conn.execute_batch(V17_CREATE_TABLES).map_err(map_db)?;
+        conn.execute_batch(V19_CREATE_TABLES).map_err(map_db)?;
+        conn.execute_batch(V20_CREATE_TABLES).map_err(map_db)?;
+        conn.execute_batch(V21_CREATE_TABLES).map_err(map_db)?;
         conn.execute_batch(
             "INSERT OR IGNORE INTO active_generations (kind, gen_id) VALUES ('fts', 0);
              INSERT OR IGNORE INTO active_generations (kind, gen_id) VALUES ('vector', 0);",
@@ -585,6 +1015,7 @@ impl Store {
                 .map_err(map_db)?;
 
             self.put_block_graph(&doc.id, &doc.blocks)?;
+            self.put_document_losses(&doc.id, &doc.losses)?;
 
             if !existed {
                 let version_id = VersionId::new(&doc.id, 1);
@@ -639,6 +1070,7 @@ impl Store {
         let state = parse_state(&state_str)?;
 
         let blocks = self.get_block_graph(&doc_id)?;
+        let losses = self.get_document_losses(&doc_id)?;
 
         let doc = Document {
             id: doc_id,
@@ -650,7 +1082,7 @@ impl Store {
                 source_hash,
             },
             blocks,
-            losses: Vec::new(),
+            losses,
         };
 
         Ok((doc, state))
@@ -687,6 +1119,73 @@ impl Store {
         }
 
         Ok(out)
+    }
+
+    /// List every document for callers that must filter before applying a limit.
+    pub fn list_all_documents(&self) -> Result<Vec<(DocId, DocState, Option<String>)>, ShiroError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT doc_id, state, title FROM documents ORDER BY created_at")
+            .map_err(map_db)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(map_db)?;
+
+        let mut documents = Vec::new();
+        for row in rows {
+            let (doc_id, state, title) = row.map_err(map_db)?;
+            documents.push((
+                DocId::from_stored(doc_id).map_err(|error| ShiroError::StoreCorrupt {
+                    message: error.to_string(),
+                })?,
+                parse_state(&state)?,
+                title,
+            ));
+        }
+        Ok(documents)
+    }
+
+    /// Return segment ownership for documents currently eligible for retrieval.
+    ///
+    /// The document state in SQLite is authoritative: only segments whose
+    /// owning document is READY are included.
+    pub fn ready_document_segment_ids(&self) -> Result<Vec<(DocId, SegmentId)>, ShiroError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT documents.doc_id, segments.segment_id
+                 FROM documents
+                 JOIN segments ON segments.doc_id = documents.doc_id
+                 WHERE documents.state = 'READY'
+                   AND documents.trust_zone IN ('CANONICAL', 'DERIVED')
+                 ORDER BY documents.doc_id, segments.seg_index",
+            )
+            .map_err(map_db)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(map_db)?;
+
+        let mut eligible = Vec::new();
+        for row in rows {
+            let (doc_id, segment_id) = row.map_err(map_db)?;
+            let doc_id = DocId::from_stored(doc_id).map_err(|error| ShiroError::StoreCorrupt {
+                message: error.to_string(),
+            })?;
+            let segment_id =
+                SegmentId::from_stored(segment_id).map_err(|error| ShiroError::StoreCorrupt {
+                    message: error.to_string(),
+                })?;
+            eligible.push((doc_id, segment_id));
+        }
+        Ok(eligible)
     }
 
     /// Transition a document's state with guard validation.
@@ -789,8 +1288,8 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "INSERT INTO segments (segment_id, doc_id, seg_index, span_start, span_end, body, version_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO segments (segment_id, doc_id, seg_index, span_start, span_end, body, retrieval_text, version_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )
             .map_err(map_db)?;
 
@@ -802,6 +1301,7 @@ impl Store {
                 segment.span.start() as i64,
                 segment.span.end() as i64,
                 segment.body,
+                segment.retrieval_text,
                 version_id_str,
             ])
             .map_err(map_db)?;
@@ -820,8 +1320,40 @@ impl Store {
         doc: &Document,
         fingerprint: &ProcessingFingerprint,
         segments: &[Segment],
+        source_bytes: &[u8],
+        provenance: &WriteProvenance,
+    ) -> Result<bool, ShiroError> {
+        self.stage_document_processing_with_force(
+            doc,
+            fingerprint,
+            segments,
+            source_bytes,
+            provenance,
+            false,
+        )
+    }
+
+    /// Stage processing even when the stored fingerprint is current.
+    pub fn stage_document_processing_with_force(
+        &self,
+        doc: &Document,
+        fingerprint: &ProcessingFingerprint,
+        segments: &[Segment],
+        source_bytes: &[u8],
+        provenance: &WriteProvenance,
+        force: bool,
     ) -> Result<bool, ShiroError> {
         self.with_savepoint("stage_document_processing", || {
+            let source_hash = self.put_blob(source_bytes)?;
+            if source_hash != doc.metadata.source_hash || provenance.content_hash != source_hash {
+                return Err(ShiroError::StoreCorrupt {
+                    message: format!(
+                        "source provenance hash mismatch for {}: parser={}, provenance={}, stored={source_hash}",
+                        doc.id, doc.metadata.source_hash, provenance.content_hash
+                    ),
+                });
+            }
+
             let stored_state: Option<String> = self
                 .conn
                 .query_row(
@@ -832,8 +1364,28 @@ impl Store {
                 .optional()
                 .map_err(map_db)?;
 
+            let mut reprocessing_ready_document = false;
             match stored_state.as_deref().map(parse_state).transpose()? {
-                Some(DocState::Ready) => return Ok(false),
+                Some(DocState::Ready) => {
+                    let stored_fingerprint = self.get_fingerprint(&doc.id)?;
+                    if !force
+                        && stored_fingerprint
+                            .as_ref()
+                            .map(ProcessingFingerprint::content_hash)
+                            .as_deref()
+                            == Some(fingerprint.content_hash().as_str())
+                    {
+                        self.record_source_artifact(
+                            &doc.id,
+                            &source_hash,
+                            &doc.metadata.source_uri,
+                            source_bytes.len(),
+                            provenance,
+                        )?;
+                        return Ok(false);
+                    }
+                    reprocessing_ready_document = true;
+                }
                 Some(DocState::Staged) | None => {}
                 Some(DocState::Indexing) => {
                     self.set_state(&doc.id, DocState::Failed)?;
@@ -853,13 +1405,150 @@ impl Store {
             }
 
             self.put_document(doc, DocState::Staged)?;
+            if reprocessing_ready_document {
+                let next_sequence = self.count_versions(&doc.id)?.saturating_add(1) as u64;
+                let version_id = VersionId::new(&doc.id, next_sequence);
+                let fingerprint_hash = fingerprint.content_hash();
+                self.create_version(&doc.id, &version_id, Some(&fingerprint_hash))?;
+                self.set_active_version(&doc.id, &version_id)?;
+            }
             self.set_fingerprint(&doc.id, fingerprint)?;
             self.replace_document_segments(&doc.id, segments)?;
+            self.record_source_artifact(
+                &doc.id,
+                &source_hash,
+                &doc.metadata.source_uri,
+                source_bytes.len(),
+                provenance,
+            )?;
+            let entity_id = self
+                .active_version_id(&doc.id)?
+                .map(|version_id| version_id.as_str().to_string())
+                .unwrap_or_else(|| doc.id.as_str().to_string());
+            self.append_provenance(&doc.id, "document_processing", &entity_id, provenance)?;
             Ok(true)
         })
     }
 
-    // ── BlockGraph persistence (ADR-006) ───────────────────────────────
+    /// Atomically stage canonical URL content with acquisition evidence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_url_document_processing(
+        &self,
+        doc: &Document,
+        fingerprint: &ProcessingFingerprint,
+        segments: &[Segment],
+        source_bytes: &[u8],
+        provenance: &WriteProvenance,
+        acquisition: &UrlAcquisitionRecord,
+    ) -> Result<bool, ShiroError> {
+        self.with_savepoint("stage_url_document_processing", || {
+            let changed = self.stage_document_processing_with_force(
+                doc,
+                fingerprint,
+                segments,
+                source_bytes,
+                provenance,
+                false,
+            )?;
+            self.conn
+                .execute(
+                    "INSERT INTO url_acquisitions (
+                        doc_id, requested_url, final_url, redirects_json, content_type,
+                        signature, byte_count, content_hash
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    rusqlite::params![
+                        doc.id.as_str(),
+                        acquisition.requested_url,
+                        acquisition.final_url,
+                        acquisition.redirects_json,
+                        acquisition.content_type,
+                        acquisition.signature,
+                        acquisition.byte_count as i64,
+                        acquisition.content_hash,
+                    ],
+                )
+                .map_err(map_db)?;
+            Ok(changed)
+        })
+    }
+
+    // ── Canonical graph and parse-loss persistence ─────────────────────
+
+    fn put_document_losses(&self, doc_id: &DocId, losses: &[ParseLoss]) -> Result<(), ShiroError> {
+        self.conn
+            .execute(
+                "DELETE FROM document_losses WHERE doc_id = ?1",
+                rusqlite::params![doc_id.as_str()],
+            )
+            .map_err(map_db)?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "INSERT INTO document_losses (doc_id, loss_idx, kind, span_start, span_end, message)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )
+            .map_err(map_db)?;
+        for (index, loss) in losses.iter().enumerate() {
+            stmt.execute(rusqlite::params![
+                doc_id.as_str(),
+                index as i64,
+                loss_kind_to_sql(loss.kind),
+                loss.span.map(|span| span.start() as i64),
+                loss.span.map(|span| span.end() as i64),
+                loss.message,
+            ])
+            .map_err(map_db)?;
+        }
+        Ok(())
+    }
+
+    fn get_document_losses(&self, doc_id: &DocId) -> Result<Vec<ParseLoss>, ShiroError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT kind, span_start, span_end, message
+                 FROM document_losses WHERE doc_id = ?1 ORDER BY loss_idx",
+            )
+            .map_err(map_db)?;
+        let rows = stmt
+            .query_map(rusqlite::params![doc_id.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(map_db)?;
+
+        let mut losses = Vec::new();
+        for row in rows {
+            let (kind, span_start, span_end, message) = row.map_err(map_db)?;
+            let span = match (span_start, span_end) {
+                (Some(start), Some(end)) => {
+                    Some(Span::new(start as usize, end as usize).map_err(|error| {
+                        ShiroError::StoreCorrupt {
+                            message: format!(
+                                "invalid persisted parse-loss span for {doc_id}: {error}"
+                            ),
+                        }
+                    })?)
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(ShiroError::StoreCorrupt {
+                        message: format!("incomplete persisted parse-loss span for {doc_id}"),
+                    });
+                }
+            };
+            losses.push(ParseLoss {
+                kind: parse_loss_kind(&kind)?,
+                span,
+                message,
+            });
+        }
+        Ok(losses)
+    }
 
     /// Persist a document's BlockGraph. Replaces any existing graph data.
     ///
@@ -868,6 +1557,7 @@ impl Store {
     pub fn put_block_graph(&self, doc_id: &DocId, graph: &BlockGraph) -> Result<(), ShiroError> {
         self.with_savepoint("put_block_graph", || {
             let id = doc_id.as_str();
+            self.snapshot_current_evidence_handles(doc_id)?;
 
             // Clear existing graph data for this document.
             self.conn
@@ -891,8 +1581,8 @@ impl Store {
                 let mut stmt = self
                     .conn
                     .prepare(
-                        "INSERT INTO blocks (doc_id, block_idx, kind, span_start, span_end, canonical_text, rendered_text)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        "INSERT INTO blocks (doc_id, block_idx, kind, span_start, span_end, canonical_text, rendered_text, heading_level)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     )
                     .map_err(map_db)?;
                 for (i, block) in graph.blocks.iter().enumerate() {
@@ -904,8 +1594,46 @@ impl Store {
                         block.span.end() as i64,
                         block.canonical_text,
                         block.rendered_text,
+                        block
+                            .heading_level
+                            .map(DocumentHeadingLevel::as_u32)
+                            .map(i64::from),
                     ])
                     .map_err(map_db)?;
+                }
+            }
+
+            // Insert source locators after their parent blocks.
+            {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "INSERT INTO block_source_locators (
+                            doc_id, block_idx, locator_idx, page_number,
+                            region_x0, region_y0, region_x1, region_y1,
+                            coordinate_origin, page_width, page_height
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    )
+                    .map_err(map_db)?;
+                for (block_index, block) in graph.blocks.iter().enumerate() {
+                    for (locator_index, locator) in block.source_locators.iter().enumerate() {
+                        let region = locator.region();
+                        let dimensions = locator.page_dimensions();
+                        stmt.execute(rusqlite::params![
+                            id,
+                            block_index as i64,
+                            locator_index as i64,
+                            locator.page_number() as i64,
+                            region.map(SourceRegion::x0),
+                            region.map(SourceRegion::y0),
+                            region.map(SourceRegion::x1),
+                            region.map(SourceRegion::y1),
+                            locator.coordinate_origin().map(coordinate_origin_to_sql),
+                            dimensions.map(PageDimensions::width),
+                            dimensions.map(PageDimensions::height),
+                        ])
+                        .map_err(map_db)?;
+                    }
                 }
             }
 
@@ -945,6 +1673,7 @@ impl Store {
                 }
             }
 
+            self.replace_active_evidence_handles(doc_id, graph)?;
             Ok(())
         })
     }
@@ -956,11 +1685,11 @@ impl Store {
         let id = doc_id.as_str();
 
         // Load blocks.
-        let blocks = {
+        let mut blocks = {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT block_idx, kind, span_start, span_end, canonical_text, rendered_text
+                    "SELECT block_idx, kind, span_start, span_end, canonical_text, rendered_text, heading_level
                      FROM blocks WHERE doc_id = ?1 ORDER BY block_idx",
                 )
                 .map_err(map_db)?;
@@ -971,19 +1700,21 @@ impl Store {
                     let span_end: i64 = row.get(3)?;
                     let canonical_text: String = row.get(4)?;
                     let rendered_text: Option<String> = row.get(5)?;
+                    let heading_level: Option<i64> = row.get(6)?;
                     Ok((
                         kind_str,
                         span_start,
                         span_end,
                         canonical_text,
                         rendered_text,
+                        heading_level,
                     ))
                 })
                 .map_err(map_db)?;
 
             let mut blocks = Vec::new();
             for row in rows {
-                let (kind_str, span_start, span_end, canonical_text, rendered_text) =
+                let (kind_str, span_start, span_end, canonical_text, rendered_text, heading_level) =
                     row.map_err(map_db)?;
                 let kind = parse_block_kind(&kind_str)?;
                 let span = Span::new(span_start as usize, span_end as usize).map_err(|e| {
@@ -991,15 +1722,136 @@ impl Store {
                         message: format!("invalid block span: {e}"),
                     }
                 })?;
+                let heading_level = heading_level
+                    .map(|level| {
+                        u32::try_from(level)
+                            .map_err(|_| ShiroError::StoreCorrupt {
+                                message: format!("invalid heading level for {doc_id}"),
+                            })
+                            .and_then(|level| {
+                                DocumentHeadingLevel::new(level).map_err(|error| {
+                                    ShiroError::StoreCorrupt {
+                                        message: format!(
+                                            "invalid heading level for {doc_id}: {error}"
+                                        ),
+                                    }
+                                })
+                            })
+                    })
+                    .transpose()?;
+                if heading_level.is_some() && !matches!(kind, BlockKind::Heading) {
+                    return Err(ShiroError::StoreCorrupt {
+                        message: format!("invalid heading level for {doc_id}"),
+                    });
+                }
                 blocks.push(Block {
                     canonical_text,
                     rendered_text,
                     kind,
+                    heading_level,
                     span,
+                    source_locators: Vec::new(),
                 });
             }
             blocks
         };
+
+        // Load and validate source locators. Partial persisted geometry is
+        // corruption rather than a reason to fabricate missing coordinates.
+        {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT block_idx, page_number,
+                            region_x0, region_y0, region_x1, region_y1,
+                            coordinate_origin, page_width, page_height
+                     FROM block_source_locators
+                     WHERE doc_id = ?1 ORDER BY block_idx, locator_idx",
+                )
+                .map_err(map_db)?;
+            let rows = stmt
+                .query_map(rusqlite::params![id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<f64>>(2)?,
+                        row.get::<_, Option<f64>>(3)?,
+                        row.get::<_, Option<f64>>(4)?,
+                        row.get::<_, Option<f64>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<f64>>(7)?,
+                        row.get::<_, Option<f64>>(8)?,
+                    ))
+                })
+                .map_err(map_db)?;
+            for row in rows {
+                let (block_index, page_number, x0, y0, x1, y1, origin, width, height) =
+                    row.map_err(map_db)?;
+                let block_index =
+                    usize::try_from(block_index).map_err(|_| ShiroError::StoreCorrupt {
+                        message: format!("negative source-locator block index for {doc_id}"),
+                    })?;
+                let block =
+                    blocks
+                        .get_mut(block_index)
+                        .ok_or_else(|| ShiroError::StoreCorrupt {
+                            message: format!(
+                            "source locator references missing block {block_index} for {doc_id}"
+                        ),
+                        })?;
+                let page_number =
+                    u32::try_from(page_number).map_err(|_| ShiroError::StoreCorrupt {
+                        message: format!("invalid source-locator page number for {doc_id}"),
+                    })?;
+                let region = match (x0, y0, x1, y1) {
+                    (None, None, None, None) => None,
+                    (Some(x0), Some(y0), Some(x1), Some(y1)) => Some(
+                        SourceRegion::new(x0, y0, x1, y1).map_err(|error| {
+                            ShiroError::StoreCorrupt {
+                                message: format!(
+                                    "invalid source region for {doc_id} block {block_index}: {error}"
+                                ),
+                            }
+                        })?,
+                    ),
+                    _ => {
+                        return Err(ShiroError::StoreCorrupt {
+                            message: format!(
+                                "partial source region for {doc_id} block {block_index}"
+                            ),
+                        });
+                    }
+                };
+                let dimensions = match (width, height) {
+                    (None, None) => None,
+                    (Some(width), Some(height)) => Some(
+                        PageDimensions::new(width, height).map_err(|error| {
+                            ShiroError::StoreCorrupt {
+                                message: format!(
+                                    "invalid page dimensions for {doc_id} block {block_index}: {error}"
+                                ),
+                            }
+                        })?,
+                    ),
+                    _ => {
+                        return Err(ShiroError::StoreCorrupt {
+                            message: format!(
+                                "partial page dimensions for {doc_id} block {block_index}"
+                            ),
+                        });
+                    }
+                };
+                let origin = origin.as_deref().map(parse_coordinate_origin).transpose()?;
+                let locator = SourceLocator::new(page_number, region, origin, dimensions).map_err(
+                    |error| ShiroError::StoreCorrupt {
+                        message: format!(
+                            "invalid source locator for {doc_id} block {block_index}: {error}"
+                        ),
+                    },
+                )?;
+                block.source_locators.push(locator);
+            }
+        }
 
         // Load edges.
         let edges = {
@@ -1058,6 +1910,268 @@ impl Store {
         })
     }
 
+    fn snapshot_current_evidence_handles(&self, doc_id: &DocId) -> Result<(), ShiroError> {
+        let active_count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM evidence_handles WHERE doc_id = ?1 AND status = 'ACTIVE'",
+                rusqlite::params![doc_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(map_db)?;
+        if active_count > 0 {
+            return Ok(());
+        }
+        let graph = self.get_block_graph(doc_id)?;
+        if graph.blocks.is_empty() {
+            return Ok(());
+        }
+        self.insert_active_evidence_handles(doc_id, &graph)
+    }
+
+    fn replace_active_evidence_handles(
+        &self,
+        doc_id: &DocId,
+        graph: &BlockGraph,
+    ) -> Result<(), ShiroError> {
+        let old_handles = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT handle_id, span_start, span_end
+                     FROM evidence_handles
+                     WHERE doc_id = ?1 AND status = 'ACTIVE' ORDER BY handle_id",
+                )
+                .map_err(map_db)?;
+            let rows = stmt
+                .query_map(rusqlite::params![doc_id.as_str()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(map_db)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(map_db)?
+        };
+        self.conn
+            .execute(
+                "UPDATE evidence_handles
+                 SET status = 'SUPERSEDED', superseded_by = NULL,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE doc_id = ?1 AND status = 'ACTIVE'",
+                rusqlite::params![doc_id.as_str()],
+            )
+            .map_err(map_db)?;
+        self.insert_active_evidence_handles(doc_id, graph)?;
+
+        let new_handles = graph
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, block)| {
+                evidence_handle_for_block(doc_id, graph, index)
+                    .map(|handle| (handle, block.span.start(), block.span.end()))
+            })
+            .collect::<Vec<_>>();
+        let new_ids = new_handles
+            .iter()
+            .map(|(handle, _, _)| handle.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        for (old_handle, old_start, old_end) in old_handles {
+            if new_ids.contains(old_handle.as_str()) {
+                continue;
+            }
+            let successor = new_handles
+                .iter()
+                .filter_map(|(handle, new_start, new_end)| {
+                    let overlap_start = (old_start as usize).max(*new_start);
+                    let overlap_end = (old_end as usize).min(*new_end);
+                    (overlap_start < overlap_end).then(|| (handle, overlap_end - overlap_start))
+                })
+                .max_by(
+                    |(left_handle, left_overlap), (right_handle, right_overlap)| {
+                        left_overlap
+                            .cmp(right_overlap)
+                            .then_with(|| right_handle.as_str().cmp(left_handle.as_str()))
+                    },
+                )
+                .map(|(handle, _)| handle.as_str());
+            self.conn
+                .execute(
+                    "UPDATE evidence_handles SET superseded_by = ?1
+                     WHERE handle_id = ?2 AND status = 'SUPERSEDED'",
+                    rusqlite::params![successor, old_handle],
+                )
+                .map_err(map_db)?;
+        }
+        Ok(())
+    }
+
+    fn insert_active_evidence_handles(
+        &self,
+        doc_id: &DocId,
+        graph: &BlockGraph,
+    ) -> Result<(), ShiroError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "INSERT INTO evidence_handles (
+                    handle_id, doc_id, block_idx, status, superseded_by,
+                    block_kind, heading_level, span_start, span_end,
+                    canonical_text, source_locators_json
+                 ) VALUES (?1, ?2, ?3, 'ACTIVE', NULL, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(handle_id) DO UPDATE SET
+                    block_idx = excluded.block_idx,
+                    status = 'ACTIVE',
+                    superseded_by = NULL,
+                    block_kind = excluded.block_kind,
+                    heading_level = excluded.heading_level,
+                    span_start = excluded.span_start,
+                    span_end = excluded.span_end,
+                    canonical_text = excluded.canonical_text,
+                    source_locators_json = excluded.source_locators_json,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+            )
+            .map_err(map_db)?;
+        for (block_index, block) in graph.blocks.iter().enumerate() {
+            let Some(handle) = evidence_handle_for_block(doc_id, graph, block_index) else {
+                continue;
+            };
+            let source_locators_json =
+                serde_json::to_string(&block.source_locators).map_err(|error| {
+                    ShiroError::StoreCorrupt {
+                        message: format!("failed to serialize evidence-handle locators: {error}"),
+                    }
+                })?;
+            stmt.execute(rusqlite::params![
+                handle.as_str(),
+                doc_id.as_str(),
+                block_index as i64,
+                block_kind_to_sql(&block.kind),
+                block
+                    .heading_level
+                    .map(DocumentHeadingLevel::as_u32)
+                    .map(i64::from),
+                block.span.start() as i64,
+                block.span.end() as i64,
+                block.canonical_text,
+                source_locators_json,
+            ])
+            .map_err(map_db)?;
+        }
+        Ok(())
+    }
+
+    /// Resolve an active or superseded stable block handle.
+    pub fn get_evidence_handle(
+        &self,
+        handle: &EvidenceHandleId,
+    ) -> Result<EvidenceHandleResolution, ShiroError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT doc_id, block_idx, status, superseded_by, block_kind,
+                        heading_level, span_start, span_end, canonical_text,
+                        source_locators_json
+                 FROM evidence_handles WHERE handle_id = ?1",
+                rusqlite::params![handle.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                    ))
+                },
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => ShiroError::NotFoundMsg {
+                    message: format!("evidence handle not found: {handle}"),
+                },
+                other => map_db(other),
+            })?;
+        let (
+            doc_id,
+            block_idx,
+            status,
+            superseded_by,
+            block_kind,
+            heading_level,
+            span_start,
+            span_end,
+            canonical_text,
+            source_locators_json,
+        ) = row;
+        let heading_level = heading_level
+            .map(|level| {
+                u32::try_from(level).map_err(|_| ShiroError::StoreCorrupt {
+                    message: format!("invalid evidence-handle heading level: {handle}"),
+                })
+            })
+            .transpose()?;
+        if heading_level == Some(0) {
+            return Err(ShiroError::StoreCorrupt {
+                message: format!("zero evidence-handle heading level: {handle}"),
+            });
+        }
+        Ok(EvidenceHandleResolution {
+            handle_id: handle.clone(),
+            status,
+            superseded_by: superseded_by
+                .map(EvidenceHandleId::from_stored)
+                .transpose()
+                .map_err(|message| ShiroError::StoreCorrupt {
+                    message: message.to_string(),
+                })?,
+            doc_id: DocId::from_stored(doc_id).map_err(|message| ShiroError::StoreCorrupt {
+                message: message.to_string(),
+            })?,
+            block_idx: usize::try_from(block_idx).map_err(|_| ShiroError::StoreCorrupt {
+                message: format!("negative evidence-handle block index: {handle}"),
+            })?,
+            block_kind: parse_block_kind(&block_kind)?,
+            heading_level,
+            span: Span::new(
+                usize::try_from(span_start).map_err(|_| ShiroError::StoreCorrupt {
+                    message: format!("negative evidence-handle span: {handle}"),
+                })?,
+                usize::try_from(span_end).map_err(|_| ShiroError::StoreCorrupt {
+                    message: format!("negative evidence-handle span: {handle}"),
+                })?,
+            )
+            .map_err(|error| ShiroError::StoreCorrupt {
+                message: format!("invalid evidence-handle span: {error}"),
+            })?,
+            canonical_text,
+            source_locators: serde_json::from_str(&source_locators_json).map_err(|error| {
+                ShiroError::StoreCorrupt {
+                    message: format!("invalid evidence-handle source locators: {error}"),
+                }
+            })?,
+        })
+    }
+
+    /// Tombstone a document and remove every deferred evidence handle in one transaction.
+    pub fn tombstone_document_evidence(&self, doc_id: &DocId) -> Result<(), ShiroError> {
+        self.with_savepoint("tombstone_document_evidence", || {
+            self.set_state(doc_id, DocState::Deleted)?;
+            self.conn
+                .execute(
+                    "DELETE FROM evidence_handles WHERE doc_id = ?1",
+                    rusqlite::params![doc_id.as_str()],
+                )
+                .map_err(map_db)?;
+            Ok(())
+        })
+    }
+
     /// Purge all derived data for a document.
     ///
     /// Removes segments and search_results associated with this doc_id.
@@ -1086,7 +2200,7 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT segment_id, doc_id, seg_index, span_start, span_end, body
+                "SELECT segment_id, doc_id, seg_index, span_start, span_end, body, retrieval_text
                  FROM segments WHERE doc_id = ?1 ORDER BY seg_index",
             )
             .map_err(map_db)?;
@@ -1099,6 +2213,7 @@ impl Store {
                 let span_start: i64 = row.get(3)?;
                 let span_end: i64 = row.get(4)?;
                 let body: String = row.get(5)?;
+                let retrieval_text: Option<String> = row.get(6)?;
                 Ok((
                     segment_id_str,
                     doc_id_str,
@@ -1106,13 +2221,14 @@ impl Store {
                     span_start,
                     span_end,
                     body,
+                    retrieval_text,
                 ))
             })
             .map_err(map_db)?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (segment_id_str, doc_id_str, index, span_start, span_end, body) =
+            let (segment_id_str, doc_id_str, index, span_start, span_end, body, retrieval_text) =
                 row.map_err(map_db)?;
 
             let id =
@@ -1133,6 +2249,7 @@ impl Store {
                 doc_id: did,
                 index: index as usize,
                 span,
+                retrieval_text: retrieval_text.unwrap_or_else(|| body.clone()),
                 body,
             });
         }
@@ -1161,46 +2278,55 @@ impl Store {
     /// Save search results for later explain.
     pub fn save_search_results(
         &self,
-        query: &str,
-        query_digest: &str,
-        fts_gen: u64,
-        vec_gen: u64,
+        snapshot: &SearchSnapshotMetadata<'_>,
         results: &[SearchResultRow],
     ) -> Result<(), ShiroError> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "INSERT INTO search_results (result_id, query, doc_id, segment_id, bm25_score, bm25_rank, vector_score, vector_rank, fused_score, fused_rank, fts_gen, vec_gen, query_digest, reranker_score, reranker_rank, block_idx, block_kind, span_start, span_end)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
-            )
-            .map_err(map_db)?;
+        self.with_savepoint("save_search_results", || {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "INSERT INTO search_results (result_id, query, doc_id, segment_id, bm25_score, bm25_rank, vector_score, vector_rank, fused_score, fused_rank, fts_gen, vec_gen, query_digest, reranker_score, reranker_rank, search_snapshot_id, retrieval_policy_json, block_idx, block_kind, span_start, span_end, source_locators_json, heading_level, evidence_handle)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                )
+                .map_err(map_db)?;
 
-        for r in results {
-            stmt.execute(rusqlite::params![
-                r.result_id,
-                query,
-                r.doc_id.as_str(),
-                r.segment_id.as_str(),
-                r.bm25_score.map(|s| s as f64),
-                r.bm25_rank.map(|r| r as i64),
-                r.vector_score.map(|s| s as f64),
-                r.vector_rank.map(|r| r as i64),
-                r.fused_score.map(|s| s as f64),
-                r.fused_rank.map(|r| r as i64),
-                fts_gen as i64,
-                vec_gen as i64,
-                query_digest,
-                r.reranker_score.map(|s| s as f64),
-                r.reranker_rank.map(|r| r as i64),
-                r.block_idx as i64,
-                r.block_kind,
-                r.span_start as i64,
-                r.span_end as i64,
-            ])
-            .map_err(map_db)?;
-        }
+            for r in results {
+                let source_locators_json = serde_json::to_string(&r.source_locators).map_err(
+                    |error| ShiroError::StoreCorrupt {
+                        message: format!("failed to serialize entry-point source locators: {error}"),
+                    },
+                )?;
+                stmt.execute(rusqlite::params![
+                    r.result_id,
+                    snapshot.query,
+                    r.doc_id.as_str(),
+                    r.segment_id.as_str(),
+                    r.bm25_score.map(|s| s as f64),
+                    r.bm25_rank.map(|r| r as i64),
+                    r.vector_score.map(|s| s as f64),
+                    r.vector_rank.map(|r| r as i64),
+                    r.fused_score.map(|s| s as f64),
+                    r.fused_rank.map(|r| r as i64),
+                    snapshot.fts_generation as i64,
+                    snapshot.vector_generation as i64,
+                    snapshot.query_digest,
+                    r.reranker_score.map(|s| s as f64),
+                    r.reranker_rank.map(|r| r as i64),
+                    snapshot.search_snapshot_id,
+                    snapshot.retrieval_policy_json,
+                    r.block_idx as i64,
+                    r.block_kind,
+                    r.span_start as i64,
+                    r.span_end as i64,
+                    source_locators_json,
+                    r.heading_level.map(i64::from),
+                    r.evidence_handle.as_str(),
+                ])
+                .map_err(map_db)?;
+            }
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Load a saved search result by `result_id`.
@@ -1208,7 +2334,7 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT query, doc_id, segment_id, bm25_score, bm25_rank, vector_score, vector_rank, fused_score, fused_rank, fts_gen, vec_gen, query_digest, reranker_score, reranker_rank, block_idx, block_kind, span_start, span_end
+                "SELECT query, doc_id, segment_id, bm25_score, bm25_rank, vector_score, vector_rank, fused_score, fused_rank, fts_gen, vec_gen, query_digest, reranker_score, reranker_rank, block_idx, block_kind, span_start, span_end, search_snapshot_id, retrieval_policy_json, source_locators_json, heading_level, evidence_handle
                  FROM search_results WHERE result_id = ?1",
             )
             .map_err(map_db)?;
@@ -1233,6 +2359,11 @@ impl Store {
                 let block_kind: String = row.get(15)?;
                 let span_start: i64 = row.get(16)?;
                 let span_end: i64 = row.get(17)?;
+                let search_snapshot_id: String = row.get(18)?;
+                let retrieval_policy_json: String = row.get(19)?;
+                let source_locators_json: String = row.get(20)?;
+                let heading_level: Option<i64> = row.get(21)?;
+                let evidence_handle: String = row.get(22)?;
                 Ok((
                     query,
                     doc_id_str,
@@ -1252,6 +2383,11 @@ impl Store {
                     block_kind,
                     span_start,
                     span_end,
+                    search_snapshot_id,
+                    retrieval_policy_json,
+                    source_locators_json,
+                    heading_level,
+                    evidence_handle,
                 ))
             })
             .map_err(|e| match e {
@@ -1280,6 +2416,11 @@ impl Store {
             block_kind,
             span_start,
             span_end,
+            search_snapshot_id,
+            retrieval_policy_json,
+            source_locators_json,
+            heading_level,
+            evidence_handle,
         ) = result;
 
         let doc_id = DocId::from_stored(doc_id_str).map_err(|e| ShiroError::StoreCorrupt {
@@ -1289,10 +2430,37 @@ impl Store {
             SegmentId::from_stored(segment_id_str).map_err(|e| ShiroError::StoreCorrupt {
                 message: e.to_string(),
             })?;
+        let source_locators = serde_json::from_str(&source_locators_json).map_err(|error| {
+            ShiroError::StoreCorrupt {
+                message: format!("invalid entry-point source locators: {error}"),
+            }
+        })?;
+        let heading_level = heading_level
+            .map(|level| {
+                u32::try_from(level).map_err(|_| ShiroError::StoreCorrupt {
+                    message: "invalid snapshot heading level".to_string(),
+                })
+            })
+            .transpose()?;
+        if heading_level == Some(0) || (heading_level.is_some() && block_kind != "HEADING") {
+            return Err(ShiroError::StoreCorrupt {
+                message: "invalid snapshot heading level".to_string(),
+            });
+        }
 
         Ok(SearchResultDetail {
             query,
             query_digest,
+            search_snapshot_id,
+            retrieval_policy_json,
+            evidence_handle: if evidence_handle.is_empty() {
+                None
+            } else {
+                Some(
+                    EvidenceHandleId::from_stored(evidence_handle)
+                        .map_err(|message| ShiroError::StoreCorrupt { message })?,
+                )
+            },
             doc_id,
             segment_id,
             bm25_score: bm25_score.map(|s| s as f32),
@@ -1307,8 +2475,10 @@ impl Store {
             reranker_rank: reranker_rank.map(|r| r as usize),
             block_idx: block_idx as usize,
             block_kind,
+            heading_level,
             span_start: span_start as usize,
             span_end: span_end as usize,
+            source_locators,
         })
     }
 
@@ -1401,6 +2571,57 @@ impl Store {
                 })
             },
         )
+    }
+
+    /// Search concept labels, synonyms, definitions, and scheme URIs.
+    pub fn search_concepts(&self, query: &str, limit: usize) -> Result<Vec<Concept>, ShiroError> {
+        let pattern = format!("%{}%", query.trim().to_lowercase());
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT concept_id, scheme_uri, pref_label, alt_labels, definition
+                 FROM concepts
+                 WHERE lower(pref_label) LIKE ?1
+                    OR lower(alt_labels) LIKE ?1
+                    OR lower(COALESCE(definition, '')) LIKE ?1
+                    OR lower(scheme_uri) LIKE ?1
+                 ORDER BY CASE WHEN lower(pref_label) = lower(?2) THEN 0 ELSE 1 END,
+                          pref_label COLLATE NOCASE, concept_id
+                 LIMIT ?3",
+            )
+            .map_err(map_db)?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![pattern, query.trim(), limit as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .map_err(map_db)?;
+        let mut concepts = Vec::new();
+        for row in rows {
+            let (id, scheme_uri, pref_label, alt_labels, definition) = row.map_err(map_db)?;
+            concepts.push(Concept {
+                id: ConceptId::from_stored(id).map_err(|message| ShiroError::StoreCorrupt {
+                    message: message.to_string(),
+                })?,
+                scheme_uri,
+                pref_label,
+                alt_labels: serde_json::from_str(&alt_labels).map_err(|error| {
+                    ShiroError::StoreCorrupt {
+                        message: format!("invalid concept alternate labels: {error}"),
+                    }
+                })?,
+                definition,
+            });
+        }
+        Ok(concepts)
     }
 
     /// List concepts up to `limit`.
@@ -1548,6 +2769,44 @@ impl Store {
         Ok(out)
     }
 
+    /// Get all directed relations touching a concept.
+    pub fn get_concept_relations_any(
+        &self,
+        id: &ConceptId,
+    ) -> Result<Vec<ConceptRelation>, ShiroError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT from_id, to_id, relation FROM concept_relations
+                 WHERE from_id = ?1 OR to_id = ?1
+                 ORDER BY from_id, to_id, relation",
+            )
+            .map_err(map_db)?;
+        let rows = statement
+            .query_map(rusqlite::params![id.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(map_db)?;
+        let mut relations = Vec::new();
+        for row in rows {
+            let (from, to, relation) = row.map_err(map_db)?;
+            relations.push(ConceptRelation {
+                from: ConceptId::from_stored(from).map_err(|message| ShiroError::StoreCorrupt {
+                    message: message.to_string(),
+                })?,
+                to: ConceptId::from_stored(to).map_err(|message| ShiroError::StoreCorrupt {
+                    message: message.to_string(),
+                })?,
+                relation: parse_relation(&relation)?,
+            });
+        }
+        Ok(relations)
+    }
+
     /// Assign a concept to a document.
     pub fn assign_concept_to_doc(
         &self,
@@ -1688,6 +2947,199 @@ impl Store {
                 }
             }
 
+            Ok(())
+        })
+    }
+
+    /// Persist an attributed model-enrichment proposal without changing trusted state.
+    pub fn put_model_enrichment_proposal(
+        &self,
+        proposal: &ModelEnrichmentProposalRecord,
+    ) -> Result<(), ShiroError> {
+        self.conn
+            .execute(
+                "INSERT INTO model_enrichment_proposals (
+                    proposal_id, doc_id, provider, model, actor_id, data_region,
+                    retention_policy, consent_id, payload_json, status,
+                    applied_concepts_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'PROPOSED', '[]')",
+                rusqlite::params![
+                    proposal.proposal_id,
+                    proposal.doc_id.as_str(),
+                    proposal.provider,
+                    proposal.model,
+                    proposal.actor_id,
+                    proposal.data_region,
+                    proposal.retention_policy,
+                    proposal.consent_id,
+                    proposal.payload_json,
+                ],
+            )
+            .map_err(map_db)?;
+        Ok(())
+    }
+
+    /// Load one model-enrichment proposal.
+    pub fn get_model_enrichment_proposal(
+        &self,
+        proposal_id: &str,
+    ) -> Result<ModelEnrichmentProposalRecord, ShiroError> {
+        self.conn
+            .query_row(
+                "SELECT doc_id, provider, model, actor_id, data_region,
+                        retention_policy, consent_id, payload_json, status,
+                        applied_concepts_json
+                 FROM model_enrichment_proposals WHERE proposal_id = ?1",
+                rusqlite::params![proposal_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                    ))
+                },
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => ShiroError::NotFoundMsg {
+                    message: format!("model enrichment proposal not found: {proposal_id}"),
+                },
+                other => map_db(other),
+            })
+            .and_then(
+                |(
+                    doc_id,
+                    provider,
+                    model,
+                    actor_id,
+                    data_region,
+                    retention_policy,
+                    consent_id,
+                    payload_json,
+                    status,
+                    applied_concepts_json,
+                )| {
+                    Ok(ModelEnrichmentProposalRecord {
+                        proposal_id: proposal_id.to_string(),
+                        doc_id: DocId::from_stored(doc_id).map_err(|message| {
+                            ShiroError::StoreCorrupt {
+                                message: message.to_string(),
+                            }
+                        })?,
+                        provider,
+                        model,
+                        actor_id,
+                        data_region,
+                        retention_policy,
+                        consent_id,
+                        payload_json,
+                        status,
+                        applied_concepts_json,
+                    })
+                },
+            )
+    }
+
+    /// Promote proposed concepts and assignments without overwriting existing assignments.
+    pub fn promote_model_enrichment_proposal(
+        &self,
+        proposal_id: &str,
+        assignments: &[ProposedConceptAssignment],
+        resolved_actor_id: &str,
+        approval_id: &str,
+    ) -> Result<Vec<ConceptId>, ShiroError> {
+        self.with_savepoint("promote_model_enrichment", || {
+            let proposal = self.get_model_enrichment_proposal(proposal_id)?;
+            if proposal.status != "PROPOSED" {
+                return Err(ShiroError::InvalidInput {
+                    message: format!(
+                        "proposal {proposal_id} cannot be promoted from {}",
+                        proposal.status
+                    ),
+                });
+            }
+            let source = format!("model_proposal:{proposal_id}");
+            let mut applied = Vec::new();
+            for assignment in assignments {
+                self.put_concept(&assignment.concept)?;
+                let inserted = self
+                    .conn
+                    .execute(
+                        "INSERT OR IGNORE INTO doc_concepts (
+                            doc_id, concept_id, confidence, source
+                         ) VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![
+                            proposal.doc_id.as_str(),
+                            assignment.concept.id.as_str(),
+                            assignment.confidence as f64,
+                            source,
+                        ],
+                    )
+                    .map_err(map_db)?;
+                if inserted == 1 {
+                    applied.push(assignment.concept.id.clone());
+                }
+            }
+            let applied_json =
+                serde_json::to_string(&applied.iter().map(ConceptId::as_str).collect::<Vec<_>>())
+                    .map_err(|error| ShiroError::StoreCorrupt {
+                    message: format!("failed to serialize promoted concepts: {error}"),
+                })?;
+            self.conn
+                .execute(
+                    "UPDATE model_enrichment_proposals
+                     SET status = 'PROMOTED', applied_concepts_json = ?1,
+                         resolved_actor_id = ?2, approval_id = ?3,
+                         resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE proposal_id = ?4",
+                    rusqlite::params![applied_json, resolved_actor_id, approval_id, proposal_id],
+                )
+                .map_err(map_db)?;
+            Ok(applied)
+        })
+    }
+
+    /// Reject a proposed or promoted model enrichment and reverse its assignments.
+    pub fn reject_model_enrichment_proposal(
+        &self,
+        proposal_id: &str,
+        resolved_actor_id: &str,
+        approval_id: &str,
+    ) -> Result<(), ShiroError> {
+        self.with_savepoint("reject_model_enrichment", || {
+            let proposal = self.get_model_enrichment_proposal(proposal_id)?;
+            if proposal.status == "REJECTED" {
+                return Ok(());
+            }
+            let applied: Vec<String> = serde_json::from_str(&proposal.applied_concepts_json)
+                .map_err(|error| ShiroError::StoreCorrupt {
+                    message: format!("invalid promoted concept list: {error}"),
+                })?;
+            let source = format!("model_proposal:{proposal_id}");
+            for concept_id in applied {
+                self.conn
+                    .execute(
+                        "DELETE FROM doc_concepts
+                         WHERE doc_id = ?1 AND concept_id = ?2 AND source = ?3",
+                        rusqlite::params![proposal.doc_id.as_str(), concept_id, source],
+                    )
+                    .map_err(map_db)?;
+            }
+            self.conn
+                .execute(
+                    "UPDATE model_enrichment_proposals
+                     SET status = 'REJECTED', resolved_actor_id = ?1, approval_id = ?2,
+                         resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE proposal_id = ?3",
+                    rusqlite::params![resolved_actor_id, approval_id, proposal_id],
+                )
+                .map_err(map_db)?;
             Ok(())
         })
     }
@@ -1859,6 +3311,294 @@ impl Store {
         Ok(())
     }
 
+    /// Reserve a never-reused generation identifier before building artifacts.
+    ///
+    /// Failed builds remain in the generation audit table, so the next attempt
+    /// advances rather than reusing a filesystem location that may be partial.
+    pub fn reserve_generation(
+        &self,
+        kind: &str,
+        document_count: usize,
+        segment_count: usize,
+        created_at: &str,
+    ) -> Result<GenerationId, ShiroError> {
+        let next: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(gen_id), 0) + 1 FROM generations WHERE kind = ?1",
+                rusqlite::params![kind],
+                |row| row.get(0),
+            )
+            .map_err(map_db)?;
+        let generation = GenerationId::new(next as u64);
+        self.record_generation(
+            kind,
+            &IndexGeneration {
+                gen_id: generation,
+                created_at: created_at.to_string(),
+                doc_count: document_count,
+                segment_count,
+            },
+        )?;
+        Ok(generation)
+    }
+
+    /// Update document and segment counts for a previously reserved index generation.
+    pub fn update_reserved_generation_counts(
+        &self,
+        kind: &str,
+        generation: GenerationId,
+        document_count: usize,
+        segment_count: usize,
+    ) -> Result<(), ShiroError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE generations SET doc_count = ?1, segment_count = ?2
+                 WHERE kind = ?3 AND gen_id = ?4",
+                rusqlite::params![
+                    document_count as i64,
+                    segment_count as i64,
+                    kind,
+                    generation.as_u64() as i64,
+                ],
+            )
+            .map_err(map_db)?;
+        if updated != 1 {
+            return Err(ShiroError::StoreCorrupt {
+                message: format!(
+                    "reserved generation missing while updating counts: {kind}/{}",
+                    generation.as_u64()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Keep canonical staging and corpus activation invisible until one atomic commit.
+    pub fn with_atomic_corpus_publication<T>(
+        &self,
+        publish: impl FnOnce() -> Result<T, ShiroError>,
+    ) -> Result<T, ShiroError> {
+        self.with_savepoint("atomic_corpus_publication", publish)
+    }
+
+    /// Atomically activate one complete corpus manifest and all its index pointers.
+    pub fn activate_corpus_manifest(&self, manifest: &CorpusManifest) -> Result<(), ShiroError> {
+        if manifest.vector_generation.is_some() != manifest.vector_digest.is_some() {
+            return Err(ShiroError::InvalidInput {
+                message:
+                    "vector generation and digest must either both be present or both be absent"
+                        .to_string(),
+            });
+        }
+
+        self.with_savepoint("activate_corpus_manifest", || {
+            self.conn
+                .execute(
+                    "INSERT INTO corpus_manifests (
+                        manifest_id, corpus_digest, document_count, segment_count,
+                        fts_generation, fts_digest, vector_generation, vector_digest,
+                        embedding_fingerprint_hash, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    rusqlite::params![
+                        manifest.manifest_id,
+                        manifest.corpus_digest,
+                        manifest.document_count as i64,
+                        manifest.segment_count as i64,
+                        manifest.fts_generation.as_u64() as i64,
+                        manifest.fts_digest,
+                        manifest
+                            .vector_generation
+                            .map(|generation| generation.as_u64() as i64),
+                        manifest.vector_digest,
+                        manifest.embedding_fingerprint_hash,
+                        manifest.created_at,
+                    ],
+                )
+                .map_err(map_db)?;
+            self.conn
+                .execute(
+                    "UPDATE active_generations SET gen_id = ?1 WHERE kind = 'fts'",
+                    rusqlite::params![manifest.fts_generation.as_u64() as i64],
+                )
+                .map_err(map_db)?;
+            self.conn
+                .execute(
+                    "UPDATE active_generations SET gen_id = ?1 WHERE kind = 'vector'",
+                    rusqlite::params![manifest
+                        .vector_generation
+                        .unwrap_or(GenerationId::ZERO)
+                        .as_u64() as i64],
+                )
+                .map_err(map_db)?;
+            self.conn
+                .execute(
+                    "INSERT INTO active_corpus_manifest (singleton, manifest_id)
+                     VALUES (1, ?1)
+                     ON CONFLICT(singleton) DO UPDATE SET manifest_id = excluded.manifest_id",
+                    rusqlite::params![manifest.manifest_id],
+                )
+                .map_err(map_db)?;
+            Ok(())
+        })
+    }
+
+    /// Atomically activate a complete manifest and publish staged documents as READY.
+    pub fn activate_corpus_manifest_and_ready(
+        &self,
+        manifest: &CorpusManifest,
+        document_ids: &[DocId],
+    ) -> Result<(), ShiroError> {
+        self.with_savepoint("activate_manifest_and_ready", || {
+            self.activate_corpus_manifest(manifest)?;
+            for document_id in document_ids {
+                self.set_state(document_id, DocState::Ready)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// List every index generation named by any retained corpus manifest.
+    pub fn corpus_manifest_generation_references(
+        &self,
+    ) -> Result<CorpusManifestGenerationReferences, ShiroError> {
+        let mut fts_statement = self
+            .conn
+            .prepare("SELECT DISTINCT fts_generation FROM corpus_manifests ORDER BY fts_generation")
+            .map_err(map_db)?;
+        let fts_generations = fts_statement
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(map_db)?
+            .map(|generation| {
+                generation
+                    .map(|value| GenerationId::new(value as u64))
+                    .map_err(map_db)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut vector_statement = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT vector_generation FROM corpus_manifests
+                 WHERE vector_generation IS NOT NULL ORDER BY vector_generation",
+            )
+            .map_err(map_db)?;
+        let vector_generations = vector_statement
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(map_db)?
+            .map(|generation| {
+                generation
+                    .map(|value| GenerationId::new(value as u64))
+                    .map_err(map_db)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(CorpusManifestGenerationReferences {
+            fts_generations,
+            vector_generations,
+        })
+    }
+
+    /// Return the newest immutable vector manifest compatible with a fingerprint.
+    pub fn latest_vector_manifest(
+        &self,
+        fingerprint_hash: &str,
+    ) -> Result<Option<CorpusManifest>, ShiroError> {
+        self.conn
+            .query_row(
+                "SELECT manifest_id, corpus_digest, document_count, segment_count,
+                        fts_generation, fts_digest, vector_generation, vector_digest,
+                        embedding_fingerprint_hash, created_at
+                 FROM corpus_manifests
+                 WHERE vector_generation IS NOT NULL
+                   AND vector_digest IS NOT NULL
+                   AND embedding_fingerprint_hash = ?1
+                 ORDER BY vector_generation DESC LIMIT 1",
+                rusqlite::params![fingerprint_hash],
+                |row| {
+                    Ok(CorpusManifest {
+                        manifest_id: row.get(0)?,
+                        corpus_digest: row.get(1)?,
+                        document_count: row.get::<_, i64>(2)? as usize,
+                        segment_count: row.get::<_, i64>(3)? as usize,
+                        fts_generation: GenerationId::new(row.get::<_, i64>(4)? as u64),
+                        fts_digest: row.get(5)?,
+                        vector_generation: Some(GenerationId::new(row.get::<_, i64>(6)? as u64)),
+                        vector_digest: Some(row.get(7)?),
+                        embedding_fingerprint_hash: Some(row.get(8)?),
+                        created_at: row.get(9)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(map_db)
+    }
+
+    /// Deactivate vectors before mutating the active FTS generation in place.
+    ///
+    /// Incremental FTS writes are scope-safe because SQLite READY state remains
+    /// authoritative, but their artifact digest is intentionally marked mutable
+    /// until the next full immutable publication.
+    pub fn begin_incremental_fts_publication(&self) -> Result<(), ShiroError> {
+        let fts_generation = self.active_generation("fts")?;
+        let created_at = {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            nanos.to_string()
+        };
+        let manifest_id = format!(
+            "corpus_mutable_{}",
+            blake3::hash(created_at.as_bytes()).to_hex()
+        );
+        self.activate_corpus_manifest(&CorpusManifest {
+            manifest_id,
+            corpus_digest: String::new(),
+            document_count: 0,
+            segment_count: 0,
+            fts_generation,
+            fts_digest: String::new(),
+            vector_generation: None,
+            vector_digest: None,
+            embedding_fingerprint_hash: None,
+            created_at,
+        })
+    }
+
+    /// Resolve the active common corpus manifest, if this workspace has one.
+    pub fn active_corpus_manifest(&self) -> Result<Option<CorpusManifest>, ShiroError> {
+        self.conn
+            .query_row(
+                "SELECT m.manifest_id, m.corpus_digest, m.document_count, m.segment_count,
+                        m.fts_generation, m.fts_digest, m.vector_generation, m.vector_digest,
+                        m.embedding_fingerprint_hash, m.created_at
+                 FROM active_corpus_manifest a
+                 JOIN corpus_manifests m ON m.manifest_id = a.manifest_id
+                 WHERE a.singleton = 1",
+                [],
+                |row| {
+                    let vector_generation: Option<i64> = row.get(6)?;
+                    Ok(CorpusManifest {
+                        manifest_id: row.get(0)?,
+                        corpus_digest: row.get(1)?,
+                        document_count: row.get::<_, i64>(2)? as usize,
+                        segment_count: row.get::<_, i64>(3)? as usize,
+                        fts_generation: GenerationId::new(row.get::<_, i64>(4)? as u64),
+                        fts_digest: row.get(5)?,
+                        vector_generation: vector_generation
+                            .map(|generation| GenerationId::new(generation as u64)),
+                        vector_digest: row.get(7)?,
+                        embedding_fingerprint_hash: row.get(8)?,
+                        created_at: row.get(9)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(map_db)
+    }
+
     // ── Fingerprint ────────────────────────────────────────────────────
 
     /// Read the processing fingerprint for a document.
@@ -1973,6 +3713,160 @@ impl Store {
             )
             .map_err(map_db)?;
         Ok(count as usize)
+    }
+
+    // ── Source artifacts and immutable provenance ──────────────────────
+
+    fn append_provenance(
+        &self,
+        doc_id: &DocId,
+        entity_type: &str,
+        entity_id: &str,
+        provenance: &WriteProvenance,
+    ) -> Result<(), ShiroError> {
+        self.conn
+            .execute(
+                "INSERT INTO provenance_records (doc_id, entity_type, entity_id, actor_kind, actor_id, operation, content_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    doc_id.as_str(),
+                    entity_type,
+                    entity_id,
+                    provenance.actor_kind.as_str(),
+                    provenance.actor_id,
+                    provenance.operation,
+                    provenance.content_hash,
+                ],
+            )
+            .map_err(map_db)?;
+        Ok(())
+    }
+
+    fn record_source_artifact(
+        &self,
+        doc_id: &DocId,
+        content_hash: &str,
+        source_uri: &str,
+        byte_count: usize,
+        provenance: &WriteProvenance,
+    ) -> Result<(), ShiroError> {
+        let inserted = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO source_artifacts (doc_id, content_hash, source_uri, byte_count, trust_zone)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    doc_id.as_str(),
+                    content_hash,
+                    source_uri,
+                    byte_count as i64,
+                    TrustZone::Canonical.as_str(),
+                ],
+            )
+            .map_err(map_db)?;
+        if inserted > 0 {
+            let source_artifact_id = self.conn.last_insert_rowid().to_string();
+            self.append_provenance(doc_id, "source_artifact", &source_artifact_id, provenance)?;
+        }
+        Ok(())
+    }
+
+    /// Return URL acquisition evidence for a document in append order.
+    pub fn get_url_acquisitions(
+        &self,
+        doc_id: &DocId,
+    ) -> Result<Vec<UrlAcquisitionRecord>, ShiroError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT requested_url, final_url, redirects_json, content_type,
+                        signature, byte_count, content_hash
+                 FROM url_acquisitions WHERE doc_id = ?1 ORDER BY acquisition_id",
+            )
+            .map_err(map_db)?;
+        let rows = statement
+            .query_map(rusqlite::params![doc_id.as_str()], |row| {
+                Ok(UrlAcquisitionRecord {
+                    requested_url: row.get(0)?,
+                    final_url: row.get(1)?,
+                    redirects_json: row.get(2)?,
+                    content_type: row.get(3)?,
+                    signature: row.get(4)?,
+                    byte_count: row.get::<_, i64>(5)? as usize,
+                    content_hash: row.get(6)?,
+                })
+            })
+            .map_err(map_db)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(map_db)
+    }
+
+    /// Append actor/run/approval provenance for one authorized MCP mutation.
+    pub fn record_mcp_mutation(
+        &self,
+        run_id: &str,
+        actor_id: &str,
+        approval_id: &str,
+        operation: &str,
+        params_digest: &str,
+        outcome: &str,
+    ) -> Result<(), ShiroError> {
+        self.conn
+            .execute(
+                "INSERT INTO mcp_mutation_audit (
+                    run_id, actor_id, approval_id, operation, params_digest, outcome
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    run_id,
+                    actor_id,
+                    approval_id,
+                    operation,
+                    params_digest,
+                    outcome
+                ],
+            )
+            .map_err(map_db)?;
+        Ok(())
+    }
+
+    /// Return immutable write provenance for a document in append order.
+    pub fn get_document_provenance(
+        &self,
+        doc_id: &DocId,
+    ) -> Result<Vec<ProvenanceRecord>, ShiroError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT provenance_id, actor_kind, actor_id, operation, content_hash, created_at
+                 FROM provenance_records WHERE doc_id = ?1 ORDER BY provenance_id",
+            )
+            .map_err(map_db)?;
+        let rows = stmt
+            .query_map(rusqlite::params![doc_id.as_str()], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(map_db)?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let (provenance_id, actor_kind, actor_id, operation, content_hash, created_at) =
+                row.map_err(map_db)?;
+            records.push(ProvenanceRecord {
+                provenance_id,
+                actor_kind: parse_provenance_actor_kind(&actor_kind)?,
+                actor_id,
+                operation,
+                content_hash,
+                created_at,
+            });
+        }
+        Ok(records)
     }
 
     // ── Stats / utilities ──────────────────────────────────────────────
@@ -2292,6 +4186,7 @@ mod tests {
                 index: 0,
                 span: Span::new(0, 12).unwrap(),
                 body: "segment test".to_string(),
+                retrieval_text: "segment test".to_string(),
             },
             Segment {
                 id: SegmentId::new(&doc.id, 1),
@@ -2299,6 +4194,7 @@ mod tests {
                 index: 1,
                 span: Span::new(13, 25).unwrap(),
                 body: "content here".to_string(),
+                retrieval_text: "content here".to_string(),
             },
         ];
 
@@ -2319,6 +4215,7 @@ mod tests {
             index: 0,
             span: Span::new(0, 25).unwrap(),
             body: "segment test content here".to_string(),
+            retrieval_text: "segment test content here".to_string(),
         }];
         store.put_segments(&new_segments).unwrap();
 
@@ -2355,6 +4252,7 @@ mod tests {
             index: 0,
             span: Span::new(0, 14).unwrap(),
             body: "savepoint test".to_string(),
+            retrieval_text: "savepoint test".to_string(),
         }];
         store.put_segments(&segments).unwrap();
         let got = store.get_segments(&doc.id).unwrap();
@@ -2390,6 +4288,7 @@ mod tests {
             index: 0,
             span: Span::new(0, existing.canonical_text.len()).unwrap(),
             body: existing.canonical_text.clone(),
+            retrieval_text: existing.canonical_text.clone(),
         };
         store
             .put_segments(std::slice::from_ref(&existing_segment))
@@ -2402,13 +4301,18 @@ mod tests {
             index: 0,
             span: Span::new(0, target.canonical_text.len()).unwrap(),
             body: target.canonical_text.clone(),
+            retrieval_text: target.canonical_text.clone(),
         };
         let fingerprint = ProcessingFingerprint::new("test", 1, 1);
+        let provenance =
+            WriteProvenance::local_user("test_ingestion", target.metadata.source_hash.clone());
 
         let result = store.stage_document_processing(
             &target,
             &fingerprint,
             std::slice::from_ref(&conflicting_segment),
+            target.canonical_text.as_bytes(),
+            &provenance,
         );
 
         assert!(result.is_err(), "conflicting segment ID must fail staging");
@@ -2416,6 +4320,11 @@ mod tests {
             !store.exists(&target.id).unwrap(),
             "document, graph, fingerprint, and segments must roll back together"
         );
+        assert!(!store.blob_exists(&target.metadata.source_hash).unwrap());
+        assert!(store
+            .get_document_provenance(&target.id)
+            .unwrap()
+            .is_empty());
         assert_eq!(store.get_segments(&existing.id).unwrap().len(), 1);
     }
 
@@ -2461,6 +4370,49 @@ mod tests {
     }
 
     #[test]
+    fn schema_v7_migrates_immutable_search_snapshot_columns() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = camino::Utf8PathBuf::try_from(dir.path().to_path_buf()).unwrap();
+        let db_path = path.join("v7.db");
+        let connection = rusqlite::Connection::open(db_path.as_std_path()).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO schema_meta (key, value) VALUES ('schema_version', '7');
+                 CREATE TABLE search_results (
+                    result_id TEXT PRIMARY KEY,
+                    query TEXT NOT NULL,
+                    doc_id TEXT NOT NULL,
+                    segment_id TEXT NOT NULL,
+                    bm25_score REAL,
+                    bm25_rank INTEGER,
+                    vector_score REAL,
+                    vector_rank INTEGER,
+                    fused_score REAL,
+                    fused_rank INTEGER,
+                    fts_gen INTEGER,
+                    vec_gen INTEGER,
+                    query_digest TEXT,
+                    reranker_score REAL,
+                    reranker_rank INTEGER,
+                    block_idx INTEGER NOT NULL DEFAULT 0,
+                    block_kind TEXT NOT NULL DEFAULT 'PARAGRAPH',
+                    span_start INTEGER NOT NULL DEFAULT 0,
+                    span_end INTEGER NOT NULL DEFAULT 0
+                 );",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = Store::open(&db_path).unwrap();
+        store
+            .conn
+            .prepare("SELECT search_snapshot_id, retrieval_policy_json FROM search_results LIMIT 0")
+            .unwrap();
+        assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
     fn test_migration_framework() {
         let (store, _f) = tmp_store();
         assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
@@ -2500,6 +4452,7 @@ mod tests {
             index: 0,
             span: Span::new(0, 18).unwrap(),
             body: "purge test content".to_string(),
+            retrieval_text: "purge test content".to_string(),
         }];
         store.put_segments(&segments).unwrap();
         assert_eq!(store.get_segments(&doc.id).unwrap().len(), 1);
@@ -3049,6 +5002,61 @@ mod tests {
     }
 
     #[test]
+    fn corpus_manifest_activation_updates_both_pointers_atomically() {
+        let (store, _file) = tmp_store();
+        let fts = store
+            .reserve_generation("fts", 1, 2, "2025-01-01T00:00:00Z")
+            .unwrap();
+        let vector = store
+            .reserve_generation("vector", 1, 2, "2025-01-01T00:00:00Z")
+            .unwrap();
+        let manifest = CorpusManifest {
+            manifest_id: "corpus_first".to_string(),
+            corpus_digest: "corpus".to_string(),
+            document_count: 1,
+            segment_count: 2,
+            fts_generation: fts,
+            fts_digest: "fts".to_string(),
+            vector_generation: Some(vector),
+            vector_digest: Some("vector".to_string()),
+            embedding_fingerprint_hash: Some("fingerprint".to_string()),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+        };
+        store.activate_corpus_manifest(&manifest).unwrap();
+        assert_eq!(store.active_generation("fts").unwrap(), fts);
+        assert_eq!(store.active_generation("vector").unwrap(), vector);
+        assert_eq!(
+            store.corpus_manifest_generation_references().unwrap(),
+            CorpusManifestGenerationReferences {
+                fts_generations: vec![fts],
+                vector_generations: vec![vector],
+            }
+        );
+
+        let mut conflicting = manifest.clone();
+        conflicting.fts_generation = store
+            .reserve_generation("fts", 1, 2, "2025-01-02T00:00:00Z")
+            .unwrap();
+        assert!(store.activate_corpus_manifest(&conflicting).is_err());
+        assert_eq!(store.active_generation("fts").unwrap(), fts);
+        assert_eq!(store.active_generation("vector").unwrap(), vector);
+        assert_eq!(store.active_corpus_manifest().unwrap(), Some(manifest));
+    }
+
+    #[test]
+    fn reserved_generation_identifiers_are_not_reused() {
+        let (store, _file) = tmp_store();
+        let first = store
+            .reserve_generation("fts", 0, 0, "2025-01-01T00:00:00Z")
+            .unwrap();
+        let second = store
+            .reserve_generation("fts", 0, 0, "2025-01-01T00:00:01Z")
+            .unwrap();
+        assert_eq!(second, first.next());
+        assert_eq!(store.active_generation("fts").unwrap(), GenerationId::ZERO);
+    }
+
+    #[test]
     fn test_fingerprint_crud() {
         let (store, _f) = tmp_store();
         let doc = test_doc("fingerprint doc");
@@ -3201,13 +5209,23 @@ mod tests {
                         canonical_text: "Hello".to_string(),
                         rendered_text: None,
                         kind: BlockKind::Heading,
+                        heading_level: Some(DocumentHeadingLevel::new(1).unwrap()),
                         span: Span::new(0, 5).unwrap(),
+                        source_locators: vec![SourceLocator::new(
+                            2,
+                            Some(SourceRegion::new(1.0, 2.0, 3.0, 4.0).unwrap()),
+                            Some(CoordinateOrigin::TopLeft),
+                            Some(PageDimensions::new(612.0, 792.0).unwrap()),
+                        )
+                        .unwrap()],
                     },
                     Block {
                         canonical_text: " world".to_string(),
                         rendered_text: Some("world".to_string()),
                         kind: BlockKind::Paragraph,
+                        heading_level: None,
                         span: Span::new(5, 11).unwrap(),
+                        source_locators: Vec::new(),
                     },
                 ],
                 edges: vec![Edge {
@@ -3236,9 +5254,21 @@ mod tests {
         // Verify block content
         assert_eq!(graph.blocks[0].canonical_text, "Hello");
         assert_eq!(graph.blocks[0].kind, BlockKind::Heading);
+        assert_eq!(
+            graph.blocks[0]
+                .heading_level
+                .map(DocumentHeadingLevel::as_u32),
+            Some(1)
+        );
         assert_eq!(graph.blocks[0].span.start(), 0);
         assert_eq!(graph.blocks[0].span.end(), 5);
         assert!(graph.blocks[0].rendered_text.is_none());
+        assert_eq!(graph.blocks[0].source_locators.len(), 1);
+        let locator = &graph.blocks[0].source_locators[0];
+        assert_eq!(locator.page_number(), 2);
+        assert_eq!(locator.coordinate_origin(), Some(CoordinateOrigin::TopLeft));
+        assert_eq!(locator.region().unwrap().x0(), 1.0);
+        assert_eq!(locator.page_dimensions().unwrap().width(), 612.0);
 
         assert_eq!(graph.blocks[1].canonical_text, " world");
         assert_eq!(graph.blocks[1].kind, BlockKind::Paragraph);
@@ -3251,6 +5281,56 @@ mod tests {
 
         // Verify reading order
         assert_eq!(graph.reading_order, vec![BlockIdx(0), BlockIdx(1)]);
+    }
+
+    #[test]
+    fn evidence_handles_survive_span_changes_and_report_explicit_supersession() {
+        let (store, _file) = tmp_store();
+        let doc = test_doc_with_graph("Hello world");
+        store.put_document(&doc, DocState::Staged).unwrap();
+        let original = evidence_handle_for_block(&doc.id, &doc.blocks, 0).unwrap();
+        assert_eq!(
+            store.get_evidence_handle(&original).unwrap().status,
+            "ACTIVE"
+        );
+
+        let mut moved = doc.blocks.clone();
+        moved.blocks[0].span = Span::new(1, 6).unwrap();
+        moved.blocks[1].span = Span::new(6, 11).unwrap();
+        store.put_block_graph(&doc.id, &moved).unwrap();
+        assert_eq!(
+            store.get_evidence_handle(&original).unwrap().status,
+            "ACTIVE"
+        );
+
+        let mut changed = moved;
+        changed.blocks[0].canonical_text = "Hallo".to_string();
+        let successor = evidence_handle_for_block(&doc.id, &changed, 0).unwrap();
+        store.put_block_graph(&doc.id, &changed).unwrap();
+        let superseded = store.get_evidence_handle(&original).unwrap();
+        assert_eq!(superseded.status, "SUPERSEDED");
+        assert_eq!(superseded.superseded_by, Some(successor.clone()));
+        assert_eq!(
+            store.get_evidence_handle(&successor).unwrap().status,
+            "ACTIVE"
+        );
+    }
+
+    #[test]
+    fn partial_persisted_source_locator_is_store_corruption() {
+        let (store, _file) = tmp_store();
+        let doc = test_doc_with_graph("Hello world");
+        store.put_document(&doc, DocState::Staged).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE block_source_locators SET region_x1 = NULL WHERE doc_id = ?1",
+                rusqlite::params![doc.id.as_str()],
+            )
+            .unwrap();
+
+        let error = store.get_block_graph(&doc.id).unwrap_err();
+        assert!(matches!(error, ShiroError::StoreCorrupt { .. }));
     }
 
     #[test]
@@ -3321,7 +5401,9 @@ mod tests {
                     canonical_text: "x".to_string(),
                     rendered_text: None,
                     kind,
+                    heading_level: None,
                     span: Span::new(i, i + 1).unwrap(),
+                    source_locators: Vec::new(),
                 })
                 .collect(),
             edges: vec![],
@@ -3362,6 +5444,7 @@ mod tests {
             Relation::CaptionOf,
             Relation::FootnoteOf,
             Relation::RefersTo,
+            Relation::SectionContains,
         ];
 
         let content = "abcde";
@@ -3372,13 +5455,17 @@ mod tests {
                     canonical_text: "a".to_string(),
                     rendered_text: None,
                     kind: BlockKind::Paragraph,
+                    heading_level: None,
                     span: Span::new(0, 1).unwrap(),
+                    source_locators: Vec::new(),
                 },
                 Block {
                     canonical_text: "b".to_string(),
                     rendered_text: None,
                     kind: BlockKind::Paragraph,
+                    heading_level: None,
                     span: Span::new(1, 2).unwrap(),
+                    source_locators: Vec::new(),
                 },
             ],
             edges: relations
@@ -3447,6 +5534,8 @@ mod tests {
         // Save a search result with reranker fields.
         let row = SearchResultRow {
             result_id: "res_test123".to_string(),
+            evidence_handle: EvidenceHandleId::from_stored(format!("blk_{}", "a".repeat(64)))
+                .unwrap(),
             doc_id: doc_id.clone(),
             segment_id: seg_id,
             bm25_score: Some(1.5),
@@ -3458,22 +5547,38 @@ mod tests {
             reranker_score: Some(0.95),
             reranker_rank: Some(1),
             block_idx: 3,
-            block_kind: "PARAGRAPH".to_string(),
+            block_kind: "HEADING".to_string(),
+            heading_level: Some(2),
             span_start: 10,
             span_end: 20,
+            source_locators: vec![SourceLocator::new(4, None, None, None).unwrap()],
         };
-        store
-            .save_search_results("test query", "abc123", 1, 0, &[row])
-            .unwrap();
+        let snapshot = SearchSnapshotMetadata {
+            search_snapshot_id: "run_test",
+            retrieval_policy_json: "{}",
+            query: "test query",
+            query_digest: "abc123",
+            fts_generation: 1,
+            vector_generation: 0,
+        };
+        store.save_search_results(&snapshot, &[row]).unwrap();
 
         // Retrieve and verify.
         let detail = store.get_search_result("res_test123").unwrap();
+        assert_eq!(
+            detail.evidence_handle.as_ref().unwrap().as_str(),
+            format!("blk_{}", "a".repeat(64))
+        );
         assert_eq!(detail.reranker_score, Some(0.95));
         assert_eq!(detail.reranker_rank, Some(1));
         assert_eq!(detail.block_idx, 3);
-        assert_eq!(detail.block_kind, "PARAGRAPH");
+        assert_eq!(detail.block_kind, "HEADING");
+        assert_eq!(detail.heading_level, Some(2));
         assert_eq!(detail.span_start, 10);
         assert_eq!(detail.span_end, 20);
+        assert_eq!(detail.source_locators[0].page_number(), 4);
+        assert_eq!(detail.search_snapshot_id, "run_test");
+        assert_eq!(detail.retrieval_policy_json, "{}");
     }
 
     #[test]
@@ -3488,6 +5593,8 @@ mod tests {
 
         let row = SearchResultRow {
             result_id: "res_test456".to_string(),
+            evidence_handle: EvidenceHandleId::from_stored(format!("blk_{}", "b".repeat(64)))
+                .unwrap(),
             doc_id: doc_id.clone(),
             segment_id: seg_id,
             bm25_score: Some(1.0),
@@ -3500,12 +5607,20 @@ mod tests {
             reranker_rank: None,
             block_idx: 0,
             block_kind: "HEADING".to_string(),
+            heading_level: None,
             span_start: 0,
             span_end: 4,
+            source_locators: Vec::new(),
         };
-        store
-            .save_search_results("test query 2", "def456", 1, 0, &[row])
-            .unwrap();
+        let snapshot = SearchSnapshotMetadata {
+            search_snapshot_id: "run_test_2",
+            retrieval_policy_json: "{}",
+            query: "test query 2",
+            query_digest: "def456",
+            fts_generation: 1,
+            vector_generation: 0,
+        };
+        store.save_search_results(&snapshot, &[row]).unwrap();
 
         let detail = store.get_search_result("res_test456").unwrap();
         assert_eq!(detail.reranker_score, None);

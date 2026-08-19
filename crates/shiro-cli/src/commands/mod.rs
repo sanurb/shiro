@@ -2,7 +2,9 @@ use shiro_core::ports::Parser;
 use shiro_core::{DocId, ShiroError};
 use shiro_store::Store;
 
+pub mod acquire;
 pub mod add;
+pub mod benchmark;
 pub mod capabilities;
 pub mod completions;
 pub mod config;

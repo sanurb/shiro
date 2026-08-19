@@ -39,6 +39,24 @@ impl fmt::Display for GenerationId {
     }
 }
 
+/// One atomically activated corpus view shared by all derived indices.
+///
+/// Index generation identifiers may differ when one derived index is rebuilt,
+/// but every reader resolves them through this single manifest identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorpusManifest {
+    pub manifest_id: String,
+    pub corpus_digest: String,
+    pub document_count: usize,
+    pub segment_count: usize,
+    pub fts_generation: GenerationId,
+    pub fts_digest: String,
+    pub vector_generation: Option<GenerationId>,
+    pub vector_digest: Option<String>,
+    pub embedding_fingerprint_hash: Option<String>,
+    pub created_at: String,
+}
+
 /// Snapshot metadata for a single index generation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexGeneration {
@@ -91,6 +109,25 @@ mod tests {
         let json = serde_json::to_string(&g).unwrap();
         let back: GenerationId = serde_json::from_str(&json).unwrap();
         assert_eq!(g, back);
+    }
+
+    #[test]
+    fn corpus_manifest_roundtrip() {
+        let manifest = CorpusManifest {
+            manifest_id: "corpus_example".to_string(),
+            corpus_digest: "corpus-digest".to_string(),
+            document_count: 2,
+            segment_count: 3,
+            fts_generation: GenerationId::new(7),
+            fts_digest: "fts-digest".to_string(),
+            vector_generation: Some(GenerationId::new(9)),
+            vector_digest: Some("vector-digest".to_string()),
+            embedding_fingerprint_hash: Some("fingerprint".to_string()),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+        };
+        let json = serde_json::to_string(&manifest).unwrap();
+        let restored: CorpusManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, manifest);
     }
 
     #[test]

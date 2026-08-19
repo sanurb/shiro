@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use shiro_core::ir::{BlockGraph, Segment};
-use shiro_core::{DocId, ShiroError};
+use shiro_core::{evidence_handle_for_block, DocId, EvidenceHandleId, ShiroError, SourceLocator};
 use shiro_store::{SearchResultDetail, Store};
 
 use crate::RRF_K;
@@ -15,19 +15,25 @@ use crate::RRF_K;
 /// A block in the reading-order context around an EntryPoint.
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ContextBlock {
+    pub evidence_handle: EvidenceHandleId,
     pub block_idx: usize,
     pub kind: String,
+    pub heading_level: Option<u32>,
     pub span_start: usize,
     pub span_end: usize,
     pub text: String,
+    pub source_locators: Vec<SourceLocator>,
 }
 
 /// The canonical public position and context derived from a segment hit.
 pub(crate) struct MaterializedEntryPoint {
+    pub evidence_handle: EvidenceHandleId,
     pub block_idx: usize,
     pub block_kind: String,
+    pub heading_level: Option<u32>,
     pub span_start: usize,
     pub span_end: usize,
+    pub source_locators: Vec<SourceLocator>,
     pub context_window: Vec<ContextBlock>,
 }
 
@@ -68,16 +74,27 @@ pub(crate) fn materialize_entry_point(
     let block = &graph.blocks[block_idx];
     let (span_start, span_end) = block_relative_segment_span(block, segment);
     let context_window = if expand && max_blocks > 0 && max_chars > 0 {
-        build_context_window(&graph, block_idx, max_blocks, max_chars)
+        build_context_window(doc_id, &graph, block_idx, max_blocks, max_chars)
     } else {
         Vec::new()
     };
 
+    let evidence_handle =
+        evidence_handle_for_block(doc_id, &graph, block_idx).ok_or_else(|| {
+            ShiroError::SearchFailed {
+                message: format!("EntryPoint evidence handle unavailable for block {block_idx}"),
+            }
+        })?;
     Ok(MaterializedEntryPoint {
+        evidence_handle,
         block_idx,
         block_kind: block_kind_name(&block.kind),
+        heading_level: block
+            .heading_level
+            .map(shiro_core::ir::DocumentHeadingLevel::as_u32),
         span_start,
         span_end,
+        source_locators: block.source_locators.clone(),
         context_window,
     })
 }
@@ -87,6 +104,17 @@ pub(crate) fn build_retrieval_trace(detail: &SearchResultDetail) -> RetrievalTra
     let mut pipeline = Vec::new();
     let mut stages = Vec::new();
     let mut fusion_contributions = serde_json::Map::new();
+
+    if !detail.search_snapshot_id.is_empty() {
+        let policy = serde_json::from_str::<serde_json::Value>(&detail.retrieval_policy_json)
+            .unwrap_or_else(|_| serde_json::json!({ "unparsed": detail.retrieval_policy_json }));
+        pipeline.push("retrieval_policy".to_string());
+        stages.push(serde_json::json!({
+            "name": "retrieval_policy",
+            "search_snapshot_id": detail.search_snapshot_id,
+            "policy": policy,
+        }));
+    }
 
     if let Some(rank) = detail.bm25_rank {
         pipeline.push("fts_bm25".to_string());
@@ -144,6 +172,7 @@ pub(crate) fn build_retrieval_trace(detail: &SearchResultDetail) -> RetrievalTra
         pipeline,
         stages,
         fusion: serde_json::json!({
+            "search_snapshot_id": detail.search_snapshot_id,
             "method": "rrf",
             "k": RRF_K as u64,
             "contributions": fusion_contributions,
@@ -209,6 +238,7 @@ fn block_relative_segment_span(block: &shiro_core::ir::Block, segment: &Segment)
 }
 
 fn build_context_window(
+    doc_id: &DocId,
     graph: &BlockGraph,
     hit_block_idx: usize,
     max_blocks: usize,
@@ -262,15 +292,20 @@ fn build_context_window(
     positions
         .into_iter()
         .filter_map(|position| graph.reading_order.get(position))
-        .map(|index| {
+        .filter_map(|index| {
             let block = &graph.blocks[index.0];
-            ContextBlock {
+            Some(ContextBlock {
+                evidence_handle: evidence_handle_for_block(doc_id, graph, index.0)?,
                 block_idx: index.0,
                 kind: block_kind_name(&block.kind),
+                heading_level: block
+                    .heading_level
+                    .map(shiro_core::ir::DocumentHeadingLevel::as_u32),
                 span_start: block.span.start(),
                 span_end: block.span.end(),
                 text: block.canonical_text.clone(),
-            }
+                source_locators: block.source_locators.clone(),
+            })
         })
         .collect()
 }
@@ -282,7 +317,7 @@ fn block_kind_name(kind: &shiro_core::ir::BlockKind) -> String {
 #[cfg(test)]
 mod tests {
     use shiro_core::ir::{Block, BlockIdx, BlockKind};
-    use shiro_core::{SegmentId, Span};
+    use shiro_core::{DocumentHeadingLevel, SegmentId, Span};
 
     use super::*;
 
@@ -291,15 +326,19 @@ mod tests {
             blocks: vec![
                 Block {
                     kind: BlockKind::Heading,
+                    heading_level: Some(DocumentHeadingLevel::new(1).unwrap()),
                     span: Span::new(0, 5).expect("heading span"),
                     canonical_text: "Title".to_string(),
                     rendered_text: None,
+                    source_locators: vec![SourceLocator::new(1, None, None, None).unwrap()],
                 },
                 Block {
                     kind: BlockKind::Paragraph,
+                    heading_level: None,
                     span: Span::new(6, 17).expect("paragraph span"),
                     canonical_text: "hello world".to_string(),
                     rendered_text: None,
+                    source_locators: vec![SourceLocator::new(2, None, None, None).unwrap()],
                 },
             ],
             edges: Vec::new(),
@@ -316,6 +355,7 @@ mod tests {
             index: 0,
             span: Span::new(4, 10).expect("segment span"),
             body: "e\nhell".to_string(),
+            retrieval_text: "e\nhell".to_string(),
         };
 
         let graph = test_graph();
@@ -328,9 +368,11 @@ mod tests {
 
     #[test]
     fn context_window_stays_in_reading_order() {
-        let context = build_context_window(&test_graph(), 1, 2, 100);
+        let doc_id = DocId::from_content(b"Title\nhello world");
+        let context = build_context_window(&doc_id, &test_graph(), 1, 2, 100);
         assert_eq!(context.len(), 2);
         assert_eq!(context[0].block_idx, 0);
+        assert_eq!(context[0].source_locators[0].page_number(), 1);
         assert_eq!(context[1].block_idx, 1);
     }
 }

@@ -1,7 +1,6 @@
 //! `remove` — tombstone or purge a document.
 
 use serde::{Deserialize, Serialize};
-use shiro_core::manifest::DocState;
 use shiro_core::ShiroError;
 use shiro_index::FtsIndex;
 use shiro_store::Store;
@@ -29,8 +28,10 @@ pub fn execute(
     let (_doc, state) = store.get_document(&doc_id)?;
     let previous_state = state.as_str().to_string();
 
-    // Tombstone the document.
-    store.set_state(&doc_id, DocState::Deleted)?;
+    // Tombstoning changes the authoritative corpus. Deactivate the previous
+    // vector view before the state change so no hybrid read can mix versions.
+    store.begin_incremental_fts_publication()?;
+    store.tombstone_document_evidence(&doc_id)?;
     tracing::info!(doc_id = %doc_id, "tombstoned document");
 
     if input.purge {

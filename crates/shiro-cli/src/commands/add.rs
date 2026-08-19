@@ -5,16 +5,16 @@ use std::collections::BTreeMap;
 use crate::commands::select_parser;
 use crate::envelope::{CmdOutput, NextAction, ParamMeta};
 use shiro_core::{ShiroError, ShiroHome};
-use shiro_sdk::{AddInput, Engine};
+use shiro_sdk::AddInput;
 
 pub fn run(home: &ShiroHome, path: &str, parser_name: &str) -> Result<CmdOutput, ShiroError> {
-    let engine = Engine::open(home.clone())?;
+    let mut engine = crate::runtime::open_engine(home, crate::runtime::RuntimeProfile::Vector)?;
     let parser = select_parser(parser_name, Some(path))?;
 
     let input = AddInput {
         path: path.to_string(),
     };
-    let output = engine.add(parser.as_ref(), &input)?;
+    let output = engine.add_incremental(parser.as_ref(), &input, 32)?;
 
     let result = serde_json::json!({
         "doc_id": output.doc_id,
@@ -22,6 +22,7 @@ pub fn run(home: &ShiroHome, path: &str, parser_name: &str) -> Result<CmdOutput,
         "title": output.title,
         "segments": output.segments,
         "changed": output.changed,
+        "incremental_publication": output.incremental_publication,
     });
 
     Ok(CmdOutput {

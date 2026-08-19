@@ -48,11 +48,13 @@ Workspace crates and architectural role:
 - SQLite is canonical state.
 - Search indices (BM25/vector) are derived and rebuildable.
 - Derived data must be promotable atomically and recoverable from canonical records.
+- Incremental hybrid publication commits canonical staging, READY eligibility, and matching FTS/vector generation pointers in one SQLite transaction after immutable artifacts validate.
 
 ### Representation Boundary
 
-- Document Graph IR is the canonical structural representation.
+- Document Graph IR is the canonical structural representation; heading depth and section containment remain separate from reading order.
 - Segments are an operational retrieval view derived from canonical representation.
+- Segment `body` and byte spans remain source-faithful; versioned, bounded `retrieval_text` adds deterministic title and heading-path context for BM25, embeddings, and reranking.
 - Retrieval APIs expose stable retrieval primitives rather than storage internals.
 
 ### External Adapter Boundary
@@ -78,6 +80,10 @@ The following are architectural constraints, not optional behavior:
 - Embedding identity is explicit and versioned; mixed incompatible vector identities are rejected.
 - Generation-based publish is the activation model for indices.
 - Retrieval fusion uses deterministic ordering and deterministic tie-breaking.
+- Public block evidence uses stable `blk_` handles; segment IDs remain operational and private.
+- Superseded evidence handles are reported explicitly and are never silently redirected.
+- External network content is bounded and provenance-bearing; generated enrichment remains proposed until explicit promotion.
+- MCP writes require host, actor, and approval authority with run-scoped audit provenance.
 - All command responses are JSON envelopes on stdout (except shell completion script output).
 - Write operations use single-writer locking; read paths remain lock-free.
 
@@ -122,3 +128,7 @@ Accepted ADRs:
 - ADR-027: Benchmarking Is a Release Gate
 - ADR-029: Configuration Is Typed, Versioned, and Migrated
 - ADR-031: npm Distribution Strategy
+- ADR-035: Source Locators Are Canonical Provenance
+- ADR-036: Stable Evidence Handles and Explicit Supersession
+- ADR-037: Incremental Publication Reuses Vectors, Not Mutable Manifests
+- ADR-038: External Content and Model Output Enter Through Policy Gates

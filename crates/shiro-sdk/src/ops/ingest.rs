@@ -9,7 +9,9 @@ use shiro_core::{ErrorCode, ShiroError};
 use shiro_index::FtsIndex;
 use shiro_store::Store;
 
-use super::document_ingestion::{publish_staged_documents, stage_document_bytes};
+use super::document_ingestion::{
+    publish_staged_documents, stage_document_bytes, StagedDocumentIngestion,
+};
 
 // ── Inputs ──────────────────────────────────────────────────────────────────
 
@@ -79,6 +81,18 @@ pub fn execute(
     input: &IngestInput,
     on_event: Option<&dyn Fn(&IngestEvent)>,
 ) -> Result<IngestOutput, ShiroError> {
+    let mut publish =
+        |staged: &[&StagedDocumentIngestion]| publish_staged_documents(store, fts, staged);
+    execute_with_publisher(store, parser, input, on_event, &mut publish)
+}
+
+pub(crate) fn execute_with_publisher(
+    store: &Store,
+    parser: &dyn Parser,
+    input: &IngestInput,
+    on_event: Option<&dyn Fn(&IngestEvent)>,
+    publish: &mut dyn FnMut(&[&StagedDocumentIngestion]) -> Result<(), ShiroError>,
+) -> Result<IngestOutput, ShiroError> {
     let emit = |evt: &IngestEvent| {
         if let Some(cb) = on_event {
             cb(evt);
@@ -129,7 +143,7 @@ pub fn execute(
     }
 
     let staged_refs: Vec<_> = staged.iter().map(|(_, document)| document).collect();
-    match publish_staged_documents(store, fts, &staged_refs) {
+    match publish(&staged_refs) {
         Ok(()) => {
             for (file_path, document) in &staged {
                 emit(&IngestEvent::Indexed {

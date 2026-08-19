@@ -10,6 +10,7 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 
+use crate::ports::RerankCandidateLimit;
 use crate::ShiroError;
 
 /// Current on-disk configuration schema version.
@@ -64,6 +65,17 @@ impl ShiroHome {
         self.root.join("tantivy")
     }
 
+    /// Immutable directory for one activated FTS generation.
+    ///
+    /// Generation zero keeps the legacy path for existing workspaces.
+    pub fn tantivy_generation_dir(&self, generation: u64) -> Utf8PathBuf {
+        if generation == 0 {
+            self.tantivy_dir()
+        } else {
+            self.root.join(format!("tantivy_gen_{generation}"))
+        }
+    }
+
     /// Path to the staging tantivy directory for generational rebuilds.
     pub fn staging_tantivy_dir(&self) -> Utf8PathBuf {
         self.root.join("tantivy_staging")
@@ -79,6 +91,21 @@ impl ShiroHome {
 
     pub fn vector_dir(&self) -> Utf8PathBuf {
         self.root.join("vector")
+    }
+
+    /// Immutable directory for one activated vector generation.
+    ///
+    /// Generation zero keeps the legacy path for existing workspaces.
+    pub fn vector_generation_dir(&self, generation: u64) -> Utf8PathBuf {
+        if generation == 0 {
+            self.vector_dir()
+        } else {
+            self.root.join(format!("vector_gen_{generation}"))
+        }
+    }
+
+    pub fn vector_data_path(&self, generation: u64) -> Utf8PathBuf {
+        self.vector_generation_dir(generation).join("flat.jsonl")
     }
 
     pub fn staging_vector_dir(&self) -> Utf8PathBuf {
@@ -323,7 +350,7 @@ pub const CONFIG_KEYS: &[ConfigKeyMeta] = &[
         key: "rerank.top_k",
         kind: ConfigFieldKind::Usize,
         sensitive: false,
-        description: "Number of results to rerank",
+        description: "Number of fused candidates to rerank (1-200, default 50)",
     },
 ];
 
@@ -471,10 +498,12 @@ pub fn set_config_value(config: &mut ShiroConfig, key: &str, raw: &str) -> Resul
                 .model = Some(raw.to_string());
         }
         "rerank.top_k" => {
+            let candidate_count = parse_config_number(raw, meta.kind)?;
+            RerankCandidateLimit::new(candidate_count)?;
             config
                 .rerank
                 .get_or_insert_with(RerankConfig::default)
-                .top_k = Some(parse_config_number(raw, meta.kind)?);
+                .top_k = Some(candidate_count);
         }
         _ => {
             return Err(ShiroError::InvalidInput {
@@ -531,11 +560,22 @@ pub fn parse_config(path: &Utf8Path, content: &str) -> Result<ShiroConfig, Shiro
             message: format!("parse {path}: {error}"),
         })?;
     let migrated = migrate_config_value(path, value)?;
-    migrated
+    let config = migrated
         .try_into::<ShiroConfig>()
         .map_err(|error| ShiroError::Config {
             message: format!("validate {path}: {error}"),
-        })
+        })?;
+    validate_shiro_config(path, &config)?;
+    Ok(config)
+}
+
+fn validate_shiro_config(path: &Utf8Path, config: &ShiroConfig) -> Result<(), ShiroError> {
+    if let Some(candidate_count) = config.rerank.as_ref().and_then(|rerank| rerank.top_k) {
+        RerankCandidateLimit::new(candidate_count).map_err(|error| ShiroError::Config {
+            message: format!("validate {path}: {error}"),
+        })?;
+    }
+    Ok(())
 }
 
 /// Atomically write the typed config to `config.toml`.
@@ -634,6 +674,14 @@ mod tests {
         let home = ShiroHome::new(Utf8PathBuf::from("/tmp/test-shiro"));
         assert_eq!(home.db_path().as_str(), "/tmp/test-shiro/shiro.db");
         assert_eq!(home.tantivy_dir().as_str(), "/tmp/test-shiro/tantivy");
+        assert_eq!(
+            home.tantivy_generation_dir(3).as_str(),
+            "/tmp/test-shiro/tantivy_gen_3"
+        );
+        assert_eq!(
+            home.vector_data_path(4).as_str(),
+            "/tmp/test-shiro/vector_gen_4/flat.jsonl"
+        );
         assert_eq!(home.config_path().as_str(), "/tmp/test-shiro/config.toml");
     }
 
@@ -648,6 +696,7 @@ mod tests {
         let cfg = ShiroConfig::default();
         assert_eq!(cfg.version, CURRENT_CONFIG_VERSION);
         assert_eq!(cfg.search, None);
+        assert_eq!(cfg.ingest, None);
         assert_eq!(cfg.embed, None);
     }
 

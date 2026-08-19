@@ -20,6 +20,8 @@ pub struct AddOutput {
     pub title: Option<String>,
     pub segments: usize,
     pub changed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incremental_publication: Option<super::corpus_publication::IncrementalPublicationOutput>,
 }
 
 pub fn execute(
@@ -37,5 +39,6 @@ pub fn execute(
         title: result.title,
         segments: result.segments.len(),
         changed: result.changed,
+        incremental_publication: None,
     })
 }

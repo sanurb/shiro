@@ -5,7 +5,7 @@
 use camino::Utf8PathBuf;
 use shiro_core::config::{load_config, EmbedConfig, RerankConfig, ShiroConfig};
 use shiro_core::ports::Embedder;
-use shiro_core::{ShiroError, ShiroHome};
+use shiro_core::{RerankCandidateLimit, ShiroError, ShiroHome};
 use shiro_embed::{HttpEmbedder, HttpEmbedderConfig};
 use shiro_fastembed::{
     FastEmbedEmbedder, FastEmbedEmbedderConfig, FastEmbedReranker, FastEmbedRerankerConfig,
@@ -155,11 +155,17 @@ fn configure_reranker(mut engine: Engine, config: &RerankConfig) -> Result<Engin
     match config.provider.as_deref().unwrap_or("fastembed") {
         "fastembed" => {
             let model = config.model.as_deref().unwrap_or("BGERerankerBase");
+            let candidate_limit = config
+                .top_k
+                .map(RerankCandidateLimit::new)
+                .transpose()?
+                .unwrap_or_default();
             let reranker = FastEmbedReranker::try_new(FastEmbedRerankerConfig {
                 model: model.to_string(),
                 cache_dir: None,
                 show_download_progress: false,
-            })?;
+            })?
+            .with_rerank_candidate_limit(candidate_limit);
             engine = engine.with_reranker(Box::new(reranker));
             Ok(engine)
         }
@@ -174,13 +180,41 @@ fn open_vector_index(
     dimensions: usize,
     fingerprint: &shiro_core::EmbeddingFingerprint,
 ) -> Result<FlatIndex, ShiroError> {
-    let data_path = home.vector_dir().join("flat.jsonl");
-    match FlatIndex::open_compatible(dimensions, data_path.clone(), fingerprint) {
+    let fingerprint = shiro_sdk::retrieval_embedding_fingerprint(fingerprint);
+    let store = shiro_store::Store::open(&home.db_path())?;
+    let generation = store.active_generation("vector")?.as_u64();
+    if let Some(manifest) = store.active_corpus_manifest()? {
+        if let (Some(expected_generation), Some(expected_digest)) =
+            (manifest.vector_generation, manifest.vector_digest)
+        {
+            if expected_generation.as_u64() != generation {
+                return Err(ShiroError::IndexBuildVec {
+                    message: "active vector pointer does not match the corpus manifest".to_string(),
+                });
+            }
+            let actual_digest =
+                shiro_index::artifact_digest(&home.vector_generation_dir(generation))?;
+            if actual_digest != expected_digest {
+                return Err(ShiroError::IndexBuildVec {
+                    message: format!(
+                        "active vector generation {generation} failed manifest digest verification"
+                    ),
+                });
+            }
+        }
+    }
+    let data_path = home.vector_data_path(generation);
+    match FlatIndex::open_generation_compatible(
+        dimensions,
+        data_path.clone(),
+        generation,
+        &fingerprint,
+    ) {
         Ok(index) => Ok(index),
         Err(ShiroError::FingerprintMismatch { .. }) => {
             // Preserve the incompatible index so the provider-agnostic SDK can
             // reject vector-capable operations while explicit BM25 still works.
-            FlatIndex::open(dimensions, data_path)
+            FlatIndex::open_generation(dimensions, data_path, generation)
         }
         Err(error) => Err(error),
     }

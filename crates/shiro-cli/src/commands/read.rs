@@ -9,11 +9,17 @@ use shiro_store::Store;
 
 pub use shiro_sdk::ReadMode;
 
-pub fn run(home: &ShiroHome, id_or_title: &str, mode: ReadMode) -> Result<CmdOutput, ShiroError> {
+pub fn run(
+    home: &ShiroHome,
+    id_or_title: &str,
+    mode: ReadMode,
+    page: Option<u32>,
+) -> Result<CmdOutput, ShiroError> {
     let store = Store::open(&home.db_path())?;
     let input = ReadInput {
         id: id_or_title.to_string(),
         mode,
+        page,
     };
     let output = read::execute(&store, &input)?;
 
@@ -22,6 +28,7 @@ pub fn run(home: &ShiroHome, id_or_title: &str, mode: ReadMode) -> Result<CmdOut
         "doc_id": output.doc_id,
         "title": output.title,
         "state": output.state,
+        "evidence_resolution": output.evidence_resolution,
     });
 
     match &output.content {

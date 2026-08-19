@@ -3076,6 +3076,8 @@ dependencies = [
  "shiro-store",
  "tempfile",
  "tracing",
+ "ureq",
+ "url",
 ]
 
 [[package]]

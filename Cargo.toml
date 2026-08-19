@@ -46,6 +46,7 @@ tempfile = "3"
 pulldown-cmark = "0.12"
 pdf-extract = "0.7"
 ureq = { version = "2", features = ["json"] }
+url = "2"
 
 # internal crates
 shiro-core = { path = "crates/shiro-core", version = "0.5.0" }

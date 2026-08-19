@@ -41,6 +41,8 @@ pub struct ParamSpec {
 pub struct SpecSearchResult {
     /// The matched operation spec.
     pub spec: &'static OpSpec,
+    /// Authority class used by MCP host policy.
+    pub authority: &'static str,
     /// Relevance score (higher = better match). Deterministic for same query.
     pub score: u32,
 }
@@ -48,6 +50,33 @@ pub struct SpecSearchResult {
 // ---------------------------------------------------------------------------
 // Static parameter specs
 // ---------------------------------------------------------------------------
+
+static ACQUIRE_PARAMS: &[ParamSpec] = &[
+    ParamSpec {
+        name: "url",
+        description: "HTTPS URL for a PDF, Markdown, or UTF-8 text source",
+        r#type: "string",
+        required: true,
+    },
+    ParamSpec {
+        name: "parser",
+        description: "Parser selection: auto, plaintext, markdown, or pdf",
+        r#type: "string",
+        required: false,
+    },
+    ParamSpec {
+        name: "max_bytes",
+        description: "Maximum response bytes",
+        r#type: "u64",
+        required: false,
+    },
+    ParamSpec {
+        name: "timeout_ms",
+        description: "End-to-end acquisition timeout",
+        r#type: "u64",
+        required: false,
+    },
+];
 
 static ADD_PARAMS: &[ParamSpec] = &[ParamSpec {
     name: "path",
@@ -90,14 +119,79 @@ static SEARCH_PARAMS: &[ParamSpec] = &[
         r#type: "bool",
         required: false,
     },
+    ParamSpec {
+        name: "tags",
+        description: "Tag filters (OR within tags, AND with other filter fields)",
+        r#type: "string[]",
+        required: false,
+    },
+    ParamSpec {
+        name: "concept_ids",
+        description: "Concept ID filters (OR within concepts, AND across fields)",
+        r#type: "string[]",
+        required: false,
+    },
+    ParamSpec {
+        name: "document_ids",
+        description: "Document ID filters (OR within documents, AND across fields)",
+        r#type: "string[]",
+        required: false,
+    },
 ];
 
-static READ_PARAMS: &[ParamSpec] = &[ParamSpec {
-    name: "id",
-    description: "Document ID or title prefix to read",
-    r#type: "string",
-    required: true,
-}];
+static READ_PARAMS: &[ParamSpec] = &[
+    ParamSpec {
+        name: "id",
+        description: "Document ID, stable evidence handle, or title prefix to read",
+        r#type: "string",
+        required: true,
+    },
+    ParamSpec {
+        name: "mode",
+        description: "Read mode: text, blocks, or outline",
+        r#type: "string",
+        required: false,
+    },
+    ParamSpec {
+        name: "page",
+        description: "One-based source page to read as canonical blocks",
+        r#type: "u64",
+        required: false,
+    },
+];
+
+static SEARCH_PACK_PARAMS: &[ParamSpec] = &[
+    ParamSpec {
+        name: "queries",
+        description: "Query objects with unique query_id and text fields",
+        r#type: "object[]",
+        required: true,
+    },
+    ParamSpec {
+        name: "mode",
+        description: "Search mode: hybrid, bm25, or vector",
+        r#type: "string",
+        required: true,
+    },
+    ParamSpec {
+        name: "per_query_limit",
+        description: "Maximum ranked candidates per query",
+        r#type: "u64",
+        required: true,
+    },
+    ParamSpec {
+        name: "global_limit",
+        description: "Maximum deduplicated evidence handles",
+        r#type: "u64",
+        required: true,
+    },
+    ParamSpec {
+        name: "include_content",
+        description: "Include snippets and context blocks (default false)",
+        r#type: "boolean",
+        required: true,
+    },
+];
 
 static EXPLAIN_PARAMS: &[ParamSpec] = &[ParamSpec {
     name: "result_id",
@@ -106,12 +200,143 @@ static EXPLAIN_PARAMS: &[ParamSpec] = &[ParamSpec {
     required: true,
 }];
 
-static LIST_PARAMS: &[ParamSpec] = &[ParamSpec {
-    name: "limit",
-    description: "Maximum documents to list (default: 100)",
-    r#type: "u64",
-    required: false,
-}];
+static LIST_PARAMS: &[ParamSpec] = &[
+    ParamSpec {
+        name: "limit",
+        description: "Maximum documents to list (default: 100)",
+        r#type: "u64",
+        required: false,
+    },
+    ParamSpec {
+        name: "tags",
+        description: "Tag filters (OR within tags, AND with concepts)",
+        r#type: "string[]",
+        required: false,
+    },
+    ParamSpec {
+        name: "concept_ids",
+        description: "Concept ID filters (OR within concepts, AND with tags)",
+        r#type: "string[]",
+        required: false,
+    },
+];
+
+static MODEL_ENRICHMENT_PROPOSE_PARAMS: &[ParamSpec] = &[
+    ParamSpec {
+        name: "doc_id",
+        description: "READY document to enrich",
+        r#type: "string",
+        required: true,
+    },
+    ParamSpec {
+        name: "provider",
+        description: "Attributed model provider",
+        r#type: "string",
+        required: true,
+    },
+    ParamSpec {
+        name: "consent_id",
+        description: "Explicit consent or policy reference",
+        r#type: "string",
+        required: true,
+    },
+    ParamSpec {
+        name: "concepts",
+        description: "Proposed concepts with mandatory text labels",
+        r#type: "object[]",
+        required: true,
+    },
+];
+
+static MODEL_ENRICHMENT_RESOLVE_PARAMS: &[ParamSpec] = &[
+    ParamSpec {
+        name: "proposal_id",
+        description: "Proposal to promote or reject",
+        r#type: "string",
+        required: true,
+    },
+    ParamSpec {
+        name: "action",
+        description: "Resolution action: promote or reject",
+        r#type: "string",
+        required: true,
+    },
+    ParamSpec {
+        name: "resolved_actor_id",
+        description: "Human or policy actor authorizing resolution",
+        r#type: "string",
+        required: true,
+    },
+    ParamSpec {
+        name: "approval_id",
+        description: "Approval reference",
+        r#type: "string",
+        required: true,
+    },
+];
+
+static TAXONOMY_SEARCH_PARAMS: &[ParamSpec] = &[
+    ParamSpec {
+        name: "query",
+        description: "Label, synonym, definition, or scheme text",
+        r#type: "string",
+        required: true,
+    },
+    ParamSpec {
+        name: "limit",
+        description: "Maximum matching concepts",
+        r#type: "u64",
+        required: true,
+    },
+];
+
+static TAXONOMY_BROWSE_PARAMS: &[ParamSpec] = &[
+    ParamSpec {
+        name: "root_concept_id",
+        description: "Optional concept root; omitted lists concepts",
+        r#type: "string",
+        required: false,
+    },
+    ParamSpec {
+        name: "max_depth",
+        description: "Maximum relation depth",
+        r#type: "u64",
+        required: true,
+    },
+    ParamSpec {
+        name: "max_nodes",
+        description: "Maximum returned concepts",
+        r#type: "u64",
+        required: true,
+    },
+];
+
+static REPROCESS_PARAMS: &[ParamSpec] = &[
+    ParamSpec {
+        name: "document_ids",
+        description: "Optional document IDs; empty selects all READY documents",
+        r#type: "string[]",
+        required: false,
+    },
+    ParamSpec {
+        name: "target",
+        description: "Reprocessing target: parse, derived, or all",
+        r#type: "string",
+        required: true,
+    },
+    ParamSpec {
+        name: "execute",
+        description: "Execute the bounded plan; false returns a dry run",
+        r#type: "boolean",
+        required: false,
+    },
+    ParamSpec {
+        name: "resume_manifest_id",
+        description: "Require this verified active rollback manifest before execution",
+        r#type: "string",
+        required: false,
+    },
+];
 
 static REMOVE_PARAMS: &[ParamSpec] = &[ParamSpec {
     name: "id",
@@ -136,6 +361,15 @@ static DOCTOR_PARAMS: &[ParamSpec] = &[];
 
 /// All available SDK operations, sorted by name.
 pub static OPS: &[OpSpec] = &[
+    OpSpec {
+        name: "acquire_url",
+        description: "Safely acquire a bounded remote PDF or UTF-8 text source with provenance",
+        params: ACQUIRE_PARAMS,
+        returns: "AcquireUrlOutput { doc_id, final_url, redirects, signature, content_hash }",
+        input_schema_ref: "AcquireUrlInput",
+        output_schema_ref: "AcquireUrlOutput",
+        example: r#"{"type":"call","op":"acquire_url","params":{"url":"https://example.com/paper.pdf","parser":"auto"}}"#,
+    },
     OpSpec {
         name: "add",
         description: "Add a single file (Markdown or PDF) to the knowledge base",
@@ -192,6 +426,24 @@ pub static OPS: &[OpSpec] = &[
         example: r#"{"type":"let","name":"docs","call":{"op":"list","params":{"limit":20}}}"#,
     },
     OpSpec {
+        name: "model_enrichment_propose",
+        description: "Store attributed model concepts as isolated reversible proposals",
+        params: MODEL_ENRICHMENT_PROPOSE_PARAMS,
+        returns: "ModelEnrichmentProposalOutput { proposal_id, status, trust_zone }",
+        input_schema_ref: "ModelEnrichmentProposalInput",
+        output_schema_ref: "ModelEnrichmentProposalOutput",
+        example: r#"{"type":"call","op":"model_enrichment_propose","params":{"doc_id":"doc_...","provider":"provider","model":"model","actor_id":"agent","data_region":"local","retention_policy":"none","consent_id":"approval","concepts":[{"scheme_uri":"urn:topics","pref_label":"Topic","confidence":0.9}]}}"#,
+    },
+    OpSpec {
+        name: "model_enrichment_resolve",
+        description: "Explicitly promote or reject and reverse a model-enrichment proposal",
+        params: MODEL_ENRICHMENT_RESOLVE_PARAMS,
+        returns: "ModelEnrichmentResolutionOutput { proposal_id, status, applied_concept_ids }",
+        input_schema_ref: "ModelEnrichmentResolutionInput",
+        output_schema_ref: "ModelEnrichmentResolutionOutput",
+        example: r#"{"type":"call","op":"model_enrichment_resolve","params":{"proposal_id":"proposal_...","action":"promote","resolved_actor_id":"local_user","approval_id":"approval"}}"#,
+    },
+    OpSpec {
         name: "read",
         description: "Read the full content or segments of a document",
         params: READ_PARAMS,
@@ -219,6 +471,15 @@ pub static OPS: &[OpSpec] = &[
         example: r#"{"type":"call","op":"remove","params":{"id":"doc_abc123"}}"#,
     },
     OpSpec {
+        name: "reprocess",
+        description: "Plan or execute scoped bounded reprocessing from persisted source artifacts",
+        params: REPROCESS_PARAMS,
+        returns: "ReprocessOutput { status, plan, publication }",
+        input_schema_ref: "ReprocessInput",
+        output_schema_ref: "ReprocessOutput",
+        example: r#"{"type":"call","op":"reprocess","params":{"document_ids":[],"target":"derived","execute":false}}"#,
+    },
+    OpSpec {
         name: "search",
         description: "Search documents using BM25 full-text search with optional context expansion",
         params: SEARCH_PARAMS,
@@ -226,6 +487,33 @@ pub static OPS: &[OpSpec] = &[
         input_schema_ref: "SearchInput",
         output_schema_ref: "SearchOutput",
         example: r#"{"type":"let","name":"results","call":{"op":"search","params":{"query":"error handling","limit":5}}}"#,
+    },
+    OpSpec {
+        name: "search_pack",
+        description: "Run multiple queries and deduplicate results by stable evidence handle",
+        params: SEARCH_PACK_PARAMS,
+        returns: "SearchPackOutput { query_count, unique_evidence_count, mode, hits[] }",
+        input_schema_ref: "SearchPackInput",
+        output_schema_ref: "SearchPackOutput",
+        example: r#"{"type":"call","op":"search_pack","params":{"queries":[{"query_id":"q1","text":"error handling"}],"mode":"bm25","per_query_limit":5,"global_limit":10,"include_content":false,"max_blocks":12,"max_chars":8000,"rerank":false}}"#,
+    },
+    OpSpec {
+        name: "taxonomy_browse",
+        description: "Browse a bounded SKOS relation graph with text fallback for every concept",
+        params: TAXONOMY_BROWSE_PARAMS,
+        returns: "TaxonomyBrowseOutput { root_concept_id, truncated, concepts, relations }",
+        input_schema_ref: "TaxonomyBrowseInput",
+        output_schema_ref: "TaxonomyBrowseOutput",
+        example: r#"{"type":"call","op":"taxonomy_browse","params":{"max_depth":2,"max_nodes":50}}"#,
+    },
+    OpSpec {
+        name: "taxonomy_search",
+        description: "Search taxonomy labels, synonyms, definitions, and schemes",
+        params: TAXONOMY_SEARCH_PARAMS,
+        returns: "TaxonomySearchOutput { concepts }",
+        input_schema_ref: "TaxonomySearchInput",
+        output_schema_ref: "TaxonomySearchOutput",
+        example: r#"{"type":"call","op":"taxonomy_search","params":{"query":"retrieval","limit":20}}"#,
     },
 ];
 
@@ -249,6 +537,7 @@ pub fn search_specs(query: &str, limit: usize) -> Vec<SpecSearchResult> {
             if score > 0 || terms.is_empty() {
                 Some(SpecSearchResult {
                     spec: op,
+                    authority: operation_authority(op.name),
                     score: if terms.is_empty() { 1 } else { score },
                 })
             } else {
@@ -266,6 +555,22 @@ pub fn search_specs(query: &str, limit: usize) -> Vec<SpecSearchResult> {
 
     results.truncate(limit);
     results
+}
+
+/// Return the authority class for one operation.
+pub fn operation_authority(operation: &str) -> &'static str {
+    match operation {
+        "acquire_url"
+        | "add"
+        | "ingest"
+        | "remove"
+        | "enrich"
+        | "model_enrichment_propose"
+        | "model_enrichment_resolve"
+        | "reindex"
+        | "reprocess" => "write",
+        _ => "read",
+    }
 }
 
 /// Score an operation against search terms.
@@ -329,12 +634,28 @@ pub fn generate_schemas() -> serde_json::Value {
         };
     }
 
+    add_schema!(crate::ops::acquire::AcquireUrlInput);
+    add_schema!(crate::ops::acquire::AcquireUrlOutput);
     add_schema!(crate::ops::add::AddInput);
     add_schema!(crate::ops::add::AddOutput);
+    add_schema!(crate::ops::benchmark::BenchmarkManifest);
+    add_schema!(crate::ops::benchmark::BenchmarkOutput);
     add_schema!(crate::ops::ingest::IngestInput);
     add_schema!(crate::ops::ingest::IngestOutput);
     add_schema!(crate::ops::search::SearchInput);
     add_schema!(crate::ops::search::SearchOutput);
+    add_schema!(crate::ops::search_pack::SearchPackInput);
+    add_schema!(crate::ops::search_pack::SearchPackOutput);
+    add_schema!(crate::ops::reprocess::ReprocessInput);
+    add_schema!(crate::ops::reprocess::ReprocessOutput);
+    add_schema!(crate::ops::taxonomy::TaxonomyBrowseInput);
+    add_schema!(crate::ops::taxonomy::TaxonomyBrowseOutput);
+    add_schema!(crate::ops::taxonomy::TaxonomySearchInput);
+    add_schema!(crate::ops::taxonomy::TaxonomySearchOutput);
+    add_schema!(crate::ops::model_enrichment::ModelEnrichmentProposalInput);
+    add_schema!(crate::ops::model_enrichment::ModelEnrichmentProposalOutput);
+    add_schema!(crate::ops::model_enrichment::ModelEnrichmentResolutionInput);
+    add_schema!(crate::ops::model_enrichment::ModelEnrichmentResolutionOutput);
     add_schema!(crate::ops::read::ReadInput);
     add_schema!(crate::ops::read::ReadOutput);
     add_schema!(crate::ops::explain::ExplainInput);
@@ -393,7 +714,7 @@ mod tests {
 
     #[test]
     fn op_count_matches_sdk_surface() {
-        assert_eq!(OPS.len(), 10, "expected 10 SDK operations");
+        assert_eq!(OPS.len(), 17, "expected 17 SDK operations");
     }
 
     #[test]

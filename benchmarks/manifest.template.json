@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "corpus_id": "REPLACE_WITH_REVIEWED_CORPUS_ID",
+  "corpus_version": "REPLACE_WITH_IMMUTABLE_VERSION",
+  "documents": [
+    {
+      "doc_id": "doc_REPLACE_WITH_STORED_DOCUMENT_ID",
+      "source_uri": "REPLACE_WITH_SOURCE_URI",
+      "source_hash": "REPLACE_WITH_BLAKE3_SOURCE_HASH",
+      "license": "REPLACE_WITH_REVIEWED_LICENSE_OR_PERMISSION"
+    }
+  ],
+  "queries": [
+    {
+      "query_id": "q_REPLACE_WITH_STABLE_ID",
+      "text": "REPLACE_WITH_REAL_WORKLOAD_QUERY",
+      "judgments": [
+        {
+          "doc_id": "doc_REPLACE_WITH_STORED_DOCUMENT_ID",
+          "relevance": 0,
+          "source_locator": "REPLACE_WITH_CANONICAL_BLOCK_OR_PAGE_EVIDENCE",
+          "assessor_ids": [
+            "REPLACE_WITH_PSEUDONYMOUS_ASSESSOR_ID"
+          ],
+          "adjudicated": false
+        }
+      ]
+    }
+  ],
+  "hardware_profile": {
+    "profile_id": "REPLACE_WITH_REPRESENTATIVE_PROFILE_ID",
+    "cpu_model": "REPLACE_WITH_EXACT_CPU_MODEL",
+    "logical_cores": 0,
+    "memory_bytes": 0,
+    "os": "REPLACE_WITH_OBSERVED_OS",
+    "architecture": "REPLACE_WITH_OBSERVED_ARCHITECTURE"
+  },
+  "pipelines": [
+    "bm25",
+    "vector",
+    "hybrid",
+    "hybrid_rerank"
+  ],
+  "thresholds": {
+    "min_candidate_recall_at_50": 0.0,
+    "min_ndcg_at_10": 0.0,
+    "min_mrr_at_10": 0.0,
+    "max_search_p95_ms": 0.0,
+    "min_paired_ndcg_delta_ci95_lower": null
+  }
+}

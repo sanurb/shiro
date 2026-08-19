@@ -73,6 +73,46 @@ pub fn run_list(home: &ShiroHome, limit: usize) -> Result<CmdOutput, ShiroError>
     })
 }
 
+pub fn run_search(home: &ShiroHome, query: &str, limit: usize) -> Result<CmdOutput, ShiroError> {
+    let engine = shiro_sdk::Engine::open(home.clone())?;
+    let output = engine.taxonomy_search(&shiro_sdk::TaxonomySearchInput {
+        query: query.to_string(),
+        limit,
+    })?;
+    Ok(CmdOutput {
+        result: serde_json::to_value(output).map_err(|error| ShiroError::StoreCorrupt {
+            message: format!("failed to serialize taxonomy search: {error}"),
+        })?,
+        next_actions: vec![NextAction::simple(
+            "shiro taxonomy browse --root <concept_id>",
+            "Browse a matching concept",
+        )],
+    })
+}
+
+pub fn run_browse(
+    home: &ShiroHome,
+    root: Option<&str>,
+    max_depth: usize,
+    max_nodes: usize,
+) -> Result<CmdOutput, ShiroError> {
+    let engine = shiro_sdk::Engine::open(home.clone())?;
+    let output = engine.taxonomy_browse(&shiro_sdk::TaxonomyBrowseInput {
+        root_concept_id: root.map(str::to_string),
+        max_depth,
+        max_nodes,
+    })?;
+    Ok(CmdOutput {
+        result: serde_json::to_value(output).map_err(|error| ShiroError::StoreCorrupt {
+            message: format!("failed to serialize taxonomy browse: {error}"),
+        })?,
+        next_actions: vec![NextAction::simple(
+            "shiro taxonomy search <query>",
+            "Search concept text",
+        )],
+    })
+}
+
 pub fn run_relations(home: &ShiroHome, concept_id: &str) -> Result<CmdOutput, ShiroError> {
     let store = Store::open(&home.db_path())?;
     let cid = ConceptId::from_stored(concept_id).map_err(|e| ShiroError::InvalidInput {

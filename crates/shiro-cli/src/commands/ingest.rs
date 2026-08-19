@@ -3,7 +3,7 @@
 use crate::commands::select_parser;
 use crate::envelope::{CmdOutput, NextAction};
 use shiro_core::{ShiroError, ShiroHome};
-use shiro_sdk::{Engine, IngestEvent, IngestInput};
+use shiro_sdk::{IngestEvent, IngestInput};
 
 pub fn run(
     home: &ShiroHome,
@@ -12,7 +12,7 @@ pub fn run(
     follow: bool,
     parser_name: &str,
 ) -> Result<CmdOutput, ShiroError> {
-    let engine = Engine::open(home.clone())?;
+    let mut engine = crate::runtime::open_engine(home, crate::runtime::RuntimeProfile::Vector)?;
     let parser = select_parser(parser_name, None)?;
 
     let input = IngestInput {
